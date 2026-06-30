@@ -146,6 +146,21 @@ function SmartForwardMessagesModalInner({
             };
           })
         );
+        const didForwardInWeb = await (
+          window as typeof window & {
+            SignalWebRuntime?: {
+              forwardMessages?: (
+                conversationIds: ReadonlyArray<string>,
+                drafts: ReadonlyArray<MessageForwardDraft>
+              ) => Promise<boolean> | boolean;
+            };
+          }
+        ).SignalWebRuntime?.forwardMessages?.(conversationIds, finalDrafts);
+        if (didForwardInWeb) {
+          closeModal();
+          forwardMessagesProps?.onForward?.();
+          return;
+        }
 
         const didForwardSuccessfully = await maybeForwardMessages(
           messages,

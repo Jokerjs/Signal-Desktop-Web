@@ -149,10 +149,6 @@ $inline-emoji-container-name: inline-emoji;
   color: hsl(from currentColor h s l / 100%);
 }
 
-.FunInlineEmoji__Small--Hidden {
-  display: none;
-}
-
 .FunInlineEmoji__Image {
   visibility: hidden;
   position: absolute;
@@ -191,6 +187,10 @@ $inline-emoji-container-name: inline-emoji;
   }
 }
 
+.FunInlineEmoji__Small.FunInlineEmoji__Small--Hidden {
+  display: none;
+}
+
 .FunInlineEmoji__Jumbo {
   display: none;
   @container #{$inline-emoji-container-name} (width > 32px) {
@@ -202,4 +202,30 @@ $inline-emoji-container-name: inline-emoji;
   @container #{$inline-emoji-container-name} (width > 64px) {
     display: inherit;
   }
+}
+
+.FunInlineEmoji.FunInlineEmoji--WebImageLoaded .FunInlineEmoji__Small,
+.FunInlineEmoji.FunInlineEmoji--WebImageLoaded
+  .FunInlineEmoji__Small.FunInlineEmoji__Small--Hidden {
+  display: none;
+}
+
+.FunInlineEmoji__Jumbo.FunInlineEmoji__Jumbo--WebImage,
+.FunInlineEmoji.FunInlineEmoji--WebImageLoaded .FunInlineEmoji__Jumbo {
+  display: inline-block;
+  width: 100%;
+  height: 100%;
+  vertical-align: top;
+}
+
+.FunInlineEmoji.FunInlineEmoji--WebImageLoaded .FunInlineEmoji__Image,
+.FunInlineEmoji.FunInlineEmoji--WebImageLoaded
+  .FunInlineEmoji__Image.FunInlineEmoji__Image--loaded {
+  display: block;
+  visibility: visible;
+  position: static;
+  top: auto;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }

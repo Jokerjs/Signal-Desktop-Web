@@ -101,9 +101,9 @@ export function extractVoiceNoteForPlayback(
   if (!attachment || !Attachment.isAudio(message.attachments)) {
     return;
   }
-  const voiceNoteUrl = attachment.path
-    ? getLocalAttachmentUrl(attachment)
-    : undefined;
+  const voiceNoteUrl =
+    attachment.url ??
+    (attachment.path ? getLocalAttachmentUrl(attachment) : undefined);
 
   return {
     id: message.id,

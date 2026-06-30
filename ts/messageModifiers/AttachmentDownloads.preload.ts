@@ -8,6 +8,7 @@ import type { MessageAttachmentType } from '../types/AttachmentDownload.std.ts';
 import type { AttachmentType } from '../types/Attachment.std.ts';
 import {
   doAttachmentsOnSameMessageMatch,
+  isAudio,
   isDownloaded,
 } from '../util/Attachment.std.ts';
 import {
@@ -43,12 +44,43 @@ export async function markAttachmentAsCorrupted(
   const attachments: ReadonlyArray<AttachmentType> =
     message.get('attachments') || [];
 
+  const isWebVirtualAttachment = attachment.path.startsWith('web:');
   let changed = false;
   const newAttachments = attachments.map(existing => {
     if (existing.path !== attachment.path) {
       return existing;
     }
     changed = true;
+
+    if (isWebVirtualAttachment) {
+      if (isAudio([existing])) {
+        return {
+          ...existing,
+          path: undefined,
+          pending: false,
+          url: undefined,
+        };
+      }
+
+      return {
+        ...existing,
+        backfillError: true,
+        backupCdnNumber: undefined,
+        cdnId: undefined,
+        cdnKey: undefined,
+        cdnNumber: undefined,
+        chunkSize: undefined,
+        digest: undefined,
+        downloadPath: undefined,
+        incrementalMac: undefined,
+        key: undefined,
+        localKey: undefined,
+        path: undefined,
+        pending: false,
+        plaintextHash: undefined,
+        url: undefined,
+      };
+    }
 
     return {
       ...existing,

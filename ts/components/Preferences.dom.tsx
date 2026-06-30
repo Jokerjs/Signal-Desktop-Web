@@ -204,6 +204,7 @@ export type PropsDataType = {
   isHideMenuBarSupported: boolean;
   isKeyTransparencyAvailable: boolean;
   isNotificationAttentionSupported: boolean;
+  isSignalWebRuntime?: boolean;
   isSyncSupported: boolean;
   isSystemTraySupported: boolean;
   isMinimizeToAndStartInSystemTraySupported: boolean;
@@ -481,6 +482,7 @@ export function Preferences({
   isHideMenuBarSupported,
   isKeyTransparencyAvailable,
   isNotificationAttentionSupported,
+  isSignalWebRuntime = false,
   isSyncSupported,
   isSystemTraySupported,
   isMinimizeToAndStartInSystemTraySupported,
@@ -807,6 +809,17 @@ export function Preferences({
     });
   }, [localeSearchOptions, languageSearchInput]);
 
+  useEffect(() => {
+    if (
+      isSignalWebRuntime &&
+      (settingsLocation.page === SettingsPage.Calls ||
+        isBackupPage(settingsLocation.page) ||
+        isDonationsPage(settingsLocation.page))
+    ) {
+      setSettingsLocation({ page: SettingsPage.General });
+    }
+  }, [isSignalWebRuntime, settingsLocation.page, setSettingsLocation]);
+
   let content: JSX.Element | undefined;
 
   if (settingsLocation.page === SettingsPage.Profile) {
@@ -903,24 +916,26 @@ export function Preferences({
             </>
           )}
         </SettingsRow>
-        <SettingsRow title={i18n('icu:permissions')}>
-          <Checkbox
-            checked={hasMediaPermissions}
-            disabled={hasMediaPermissions === undefined}
-            label={i18n('icu:mediaPermissionsDescription')}
-            moduleClassName="Preferences__checkbox"
-            name="mediaPermissions"
-            onChange={onMediaPermissionsChange}
-          />
-          <Checkbox
-            checked={hasMediaCameraPermissions ?? false}
-            disabled={hasMediaCameraPermissions === undefined}
-            label={i18n('icu:mediaCameraPermissionsDescription')}
-            moduleClassName="Preferences__checkbox"
-            name="mediaCameraPermissions"
-            onChange={onMediaCameraPermissionsChange}
-          />
-        </SettingsRow>
+        {!isSignalWebRuntime && (
+          <SettingsRow title={i18n('icu:permissions')}>
+            <Checkbox
+              checked={hasMediaPermissions}
+              disabled={hasMediaPermissions === undefined}
+              label={i18n('icu:mediaPermissionsDescription')}
+              moduleClassName="Preferences__checkbox"
+              name="mediaPermissions"
+              onChange={onMediaPermissionsChange}
+            />
+            <Checkbox
+              checked={hasMediaCameraPermissions ?? false}
+              disabled={hasMediaCameraPermissions === undefined}
+              label={i18n('icu:mediaCameraPermissionsDescription')}
+              moduleClassName="Preferences__checkbox"
+              name="mediaCameraPermissions"
+              onChange={onMediaCameraPermissionsChange}
+            />
+          </SettingsRow>
+        )}
         {isAutoDownloadUpdatesSupported && (
           <SettingsRow title={i18n('icu:Preferences--updates')}>
             <Checkbox
@@ -941,7 +956,7 @@ export function Preferences({
         title={i18n('icu:Preferences__button--general')}
       />
     );
-  } else if (isDonationsPage(settingsLocation.page)) {
+  } else if (!isSignalWebRuntime && isDonationsPage(settingsLocation.page)) {
     content = renderDonationsPane({
       contentsRef: settingsPaneRef,
       settingsLocation,
@@ -1384,7 +1399,10 @@ export function Preferences({
         title={i18n('icu:Preferences__button--chats')}
       />
     );
-  } else if (settingsLocation.page === SettingsPage.Calls) {
+  } else if (
+    !isSignalWebRuntime &&
+    settingsLocation.page === SettingsPage.Calls
+  ) {
     const pageContents = (
       <>
         <SettingsRow title={i18n('icu:calling')}>
@@ -2437,7 +2455,7 @@ export function Preferences({
         title={i18n('icu:Preferences__pnp--page-title')}
       />
     );
-  } else if (isBackupPage(settingsLocation.page)) {
+  } else if (!isSignalWebRuntime && isBackupPage(settingsLocation.page)) {
     let pageTitle: string | undefined;
     if (
       settingsLocation.page === SettingsPage.Backups ||
@@ -2692,20 +2710,22 @@ export function Preferences({
               >
                 {i18n('icu:Preferences__button--chats')}
               </button>
-              <button
-                type="button"
-                className={classNames({
-                  Preferences__button: true,
-                  'Preferences__button--calls': true,
-                  'Preferences__button--selected':
-                    settingsLocation.page === SettingsPage.Calls,
-                })}
-                onClick={() =>
-                  setSettingsLocation({ page: SettingsPage.Calls })
-                }
-              >
-                {i18n('icu:Preferences__button--calls')}
-              </button>
+              {!isSignalWebRuntime && (
+                <button
+                  type="button"
+                  className={classNames({
+                    Preferences__button: true,
+                    'Preferences__button--calls': true,
+                    'Preferences__button--selected':
+                      settingsLocation.page === SettingsPage.Calls,
+                  })}
+                  onClick={() =>
+                    setSettingsLocation({ page: SettingsPage.Calls })
+                  }
+                >
+                  {i18n('icu:Preferences__button--calls')}
+                </button>
+              )}
               <button
                 type="button"
                 className={classNames({
@@ -2750,36 +2770,40 @@ export function Preferences({
               >
                 {i18n('icu:Preferences__button--data-usage')}
               </button>
-              <button
-                type="button"
-                className={classNames({
-                  Preferences__button: true,
-                  'Preferences__button--backups': true,
-                  'Preferences__button--selected': isBackupPage(
-                    settingsLocation.page
-                  ),
-                })}
-                onClick={() =>
-                  setSettingsLocation({ page: SettingsPage.Backups })
-                }
-              >
-                {i18n('icu:Preferences__button--backups')}
-              </button>
-              <button
-                type="button"
-                className={classNames({
-                  Preferences__button: true,
-                  'Preferences__button--donations': true,
-                  'Preferences__button--selected': isDonationsPage(
-                    settingsLocation.page
-                  ),
-                })}
-                onClick={() =>
-                  setSettingsLocation({ page: SettingsPage.Donations })
-                }
-              >
-                {i18n('icu:Preferences__button--donate')}
-              </button>
+              {!isSignalWebRuntime && (
+                <button
+                  type="button"
+                  className={classNames({
+                    Preferences__button: true,
+                    'Preferences__button--backups': true,
+                    'Preferences__button--selected': isBackupPage(
+                      settingsLocation.page
+                    ),
+                  })}
+                  onClick={() =>
+                    setSettingsLocation({ page: SettingsPage.Backups })
+                  }
+                >
+                  {i18n('icu:Preferences__button--backups')}
+                </button>
+              )}
+              {!isSignalWebRuntime && (
+                <button
+                  type="button"
+                  className={classNames({
+                    Preferences__button: true,
+                    'Preferences__button--donations': true,
+                    'Preferences__button--selected': isDonationsPage(
+                      settingsLocation.page
+                    ),
+                  })}
+                  onClick={() =>
+                    setSettingsLocation({ page: SettingsPage.Donations })
+                  }
+                >
+                  {i18n('icu:Preferences__button--donate')}
+                </button>
+              )}
               {isInternalUser ? (
                 <button
                   type="button"

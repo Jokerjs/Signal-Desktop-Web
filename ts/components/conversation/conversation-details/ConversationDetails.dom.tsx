@@ -87,6 +87,7 @@ export type StateProps = {
   canEditGroupInfo: boolean;
   canAddLabel: boolean;
   canAddNewMembers: boolean;
+  canStartCalls?: boolean;
   conversation?: ConversationType;
   hasGroupLink: boolean;
   hasMedia: boolean;
@@ -183,6 +184,7 @@ export function ConversationDetails({
   canEditGroupInfo,
   canAddLabel,
   canAddNewMembers,
+  canStartCalls = true,
   conversation,
   deleteAvatarFromDisk,
   hasGroupLink,
@@ -455,7 +457,7 @@ export function ConversationDetails({
             {i18n('icu:ConversationDetails__HeaderButton--Message')}
           </Button>
         )}
-        {!conversation.isMe && !isSignalConversation && (
+        {canStartCalls && !conversation.isMe && !isSignalConversation && (
           <>
             {!conversation.terminated && (
               <ConversationDetailsCallButton

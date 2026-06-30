@@ -43,6 +43,18 @@ const { useAxoContextMenuOutsideKeyboardTrigger } = AxoContextMenu;
 
 const { noop } = lodash;
 
+type SignalWebRuntime = {
+  reactToMessage?: (
+    id: string,
+    reaction: { emoji: Emoji.Variant; remove: boolean }
+  ) => boolean;
+};
+
+function getSignalWebRuntime(): SignalWebRuntime | undefined {
+  return (window as typeof window & { SignalWebRuntime?: SignalWebRuntime })
+    .SignalWebRuntime;
+}
+
 export type PropsData = {
   canDownload: boolean;
   canCopy: boolean;
@@ -153,6 +165,9 @@ export function TimelineMessage(props: Props): JSX.Element {
   const [reactionPickerRoot, setReactionPickerRoot] = useState<
     HTMLDivElement | undefined
   >(undefined);
+  const [reactionPickerReference, setReactionPickerReference] = useState<
+    HTMLElement | undefined
+  >(undefined);
 
   const isWindowWidthNotNarrow =
     containerWidthBreakpoint !== WidthBreakpoint.Narrow;
@@ -179,6 +194,7 @@ export function TimelineMessage(props: Props): JSX.Element {
       if (reactionPickerRoot) {
         document.body.removeChild(reactionPickerRoot);
         setReactionPickerRoot(undefined);
+        setReactionPickerReference(undefined);
         return;
       }
 
@@ -418,12 +434,14 @@ export function TimelineMessage(props: Props): JSX.Element {
           onDownload={handleDownload}
           onReplyToMessage={canReply ? handleReplyToMessage : null}
           onReact={canReact ? handleReact : null}
+          setReactionPickerReference={setReactionPickerReference}
           renderMessageContextMenu={renderMessageContextMenu}
         />
         {reactionPickerRoot &&
           createPortal(
             <Popper
               placement="top"
+              referenceElement={reactionPickerReference}
               modifiers={[
                 offsetDistanceModifier(4),
                 popperPreventOverflowModifier(),
@@ -437,10 +455,16 @@ export function TimelineMessage(props: Props): JSX.Element {
                   onClose: toggleReactionPicker,
                   onPick: emoji => {
                     toggleReactionPicker(true);
-                    reactToMessage(id, {
+                    const reaction = {
                       emoji,
                       remove: emoji === selectedReaction,
-                    });
+                    };
+                    const didHandleInWeb =
+                      getSignalWebRuntime()?.reactToMessage?.(id, reaction) ===
+                      true;
+                    if (!didHandleInWeb) {
+                      reactToMessage(id, reaction);
+                    }
                   },
                   messageEmojis,
                 })
@@ -460,6 +484,7 @@ export function TimelineMessage(props: Props): JSX.Element {
     handleReplyToMessage,
     handleReact,
     reactionPickerRoot,
+    reactionPickerReference,
     popperPreventOverflowModifier,
     renderReactionPicker,
     selectedReaction,
@@ -493,6 +518,7 @@ type MessageMenuProps = {
   onDownload: (() => void) | null;
   onReplyToMessage: (() => void) | null;
   onReact: (() => void) | null;
+  setReactionPickerReference: (element: HTMLElement) => void;
   renderMessageContextMenu: (
     renderer: AxoMenuBuilder.Renderer,
     children: ReactNode
@@ -506,6 +532,7 @@ function MessageMenu({
   onDownload,
   onReplyToMessage,
   onReact,
+  setReactionPickerReference,
   renderMessageContextMenu,
 }: MessageMenuProps) {
   return (
@@ -531,12 +558,15 @@ function MessageMenu({
                   // oxlint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/interactive-supports-focus
                   <div
                     ref={maybePopperRef}
-                    onClick={(event: MouseEvent) => {
-                      event.stopPropagation();
-                      event.preventDefault();
+	                    onClick={(event: MouseEvent) => {
+	                      event.stopPropagation();
+	                      event.preventDefault();
+	                      if (event.currentTarget instanceof HTMLElement) {
+	                        setReactionPickerReference(event.currentTarget);
+	                      }
 
-                      onReact();
-                    }}
+	                      onReact();
+	                    }}
                     role="button"
                     className="module-message__buttons__react"
                     aria-label={i18n('icu:reactToMessage')}

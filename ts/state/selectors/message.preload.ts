@@ -2217,7 +2217,7 @@ export function getPropsForAttachment(
     ...attachment,
     isVoiceMessage: isVoiceMessage(attachment),
     pending,
-    url: path ? getLocalAttachmentUrl(attachment) : undefined,
+    url: attachment.url ?? (path ? getLocalAttachmentUrl(attachment) : undefined),
     incrementalUrl:
       isIncremental(attachment) &&
       attachment.downloadPath &&
@@ -2226,27 +2226,37 @@ export function getPropsForAttachment(
             disposition: AttachmentDisposition.Download,
           })
         : undefined,
-    thumbnailFromBackup: thumbnailFromBackup?.path
+    thumbnailFromBackup: thumbnailFromBackup
       ? {
           ...thumbnailFromBackup,
-          url: getLocalAttachmentUrl(thumbnailFromBackup),
+          url: thumbnailFromBackup.url ?? (
+            thumbnailFromBackup.path
+              ? getLocalAttachmentUrl(thumbnailFromBackup)
+              : undefined
+          ),
         }
       : undefined,
-    screenshot: screenshot?.path
+    screenshot: screenshot
       ? {
           ...screenshot,
-          url: getLocalAttachmentUrl({
-            // Legacy v1 screenshots
-            size: 0,
+          url: screenshot.url ?? (
+            screenshot.path
+              ? getLocalAttachmentUrl({
+                  // Legacy v1 screenshots
+                  size: 0,
 
-            ...screenshot,
-          }),
+                  ...screenshot,
+                })
+              : undefined
+          ),
         }
       : undefined,
-    thumbnail: thumbnail?.path
+    thumbnail: thumbnail
       ? {
           ...thumbnail,
-          url: getLocalAttachmentUrl(thumbnail),
+          url: thumbnail.url ?? (
+            thumbnail.path ? getLocalAttachmentUrl(thumbnail) : undefined
+          ),
         }
       : undefined,
     isPermanentlyUndownloadable:
@@ -2269,7 +2279,9 @@ function processQuoteAttachment(attachment: QuotedAttachmentType) {
     thumbnail: thumbnail
       ? {
           ...thumbnail,
-          url: thumbnail?.path ? getLocalAttachmentUrl(thumbnail) : undefined,
+          url: thumbnail.url ?? (
+            thumbnail.path ? getLocalAttachmentUrl(thumbnail) : undefined
+          ),
         }
       : undefined,
   };

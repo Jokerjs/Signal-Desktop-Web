@@ -65,7 +65,9 @@ import { itemStorage } from '../textsecure/Storage.preload.ts';
 import { Emoji } from '../axo/emoji.std.ts';
 
 const log = createLogger('getNotificationDataForMessage');
-const { i18n } = window.SignalContext;
+const i18n = ((
+  ...args: Parameters<typeof window.SignalContext.i18n>
+) => window.SignalContext.i18n(...args)) as typeof window.SignalContext.i18n;
 
 function getNameForNumber(e164: string): string {
   const conversation = window.ConversationController.get(e164);

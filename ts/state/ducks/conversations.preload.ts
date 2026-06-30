@@ -2407,6 +2407,18 @@ function kickOffAttachmentDownload(
         `kickOffAttachmentDownload: Message ${options.messageId} missing!`
       );
     }
+    const didHandleWebDownload = await (
+      window as typeof window & {
+        SignalWebRuntime?: {
+          downloadAttachmentsForMessage?: (messageId: string) => Promise<boolean>;
+        };
+      }
+    ).SignalWebRuntime?.downloadAttachmentsForMessage?.(message.id);
+    if (didHandleWebDownload) {
+      dispatch(noopAction('kickOffAttachmentDownload'));
+      return;
+    }
+
     const didUpdateValues = await queueAttachmentDownloads(message, {
       urgency: AttachmentDownloadUrgency.IMMEDIATE,
       isManualDownload: true,
@@ -2464,9 +2476,39 @@ type AttachmentOptions = ReadonlyDeep<{
 
 function markAttachmentAsCorrupted(
   options: AttachmentOptions
-): ThunkAction<void, RootStateType, unknown, NoopActionType> {
+): ThunkAction<
+  void,
+  RootStateType,
+  unknown,
+  MessageChangedActionType | NoopActionType
+> {
   return async dispatch => {
     await doMarkAttachmentAsCorrupted(options.messageId, options.attachment);
+    const message = await getMessageById(options.messageId);
+    if (message) {
+      dispatch(
+        messageChanged(
+          message.id,
+          message.get('conversationId'),
+          message.attributes
+        )
+      );
+    }
+    if (options.attachment.path?.startsWith('web:')) {
+      (
+        window as typeof window & {
+          SignalWebRuntime?: {
+            markAttachmentUnavailable?: (
+              messageId: string,
+              attachmentPath: string
+            ) => void;
+          };
+        }
+      ).SignalWebRuntime?.markAttachmentUnavailable?.(
+        options.messageId,
+        options.attachment.path
+      );
+    }
 
     dispatch(noopAction('markAttachmentAsCorrupted'));
   };
@@ -3570,6 +3612,27 @@ function deleteMessagesForEveryone(
   NoopActionType | ShowToastActionType
 > {
   return async dispatch => {
+    const webRuntime = (window as typeof window & {
+      SignalWebRuntime?: {
+        deleteMessagesForEveryone?: (
+          ids: ReadonlyArray<string>
+        ) => Promise<boolean>;
+      };
+    }).SignalWebRuntime;
+    if (webRuntime?.deleteMessagesForEveryone) {
+      try {
+        if (await webRuntime.deleteMessagesForEveryone(messageIds)) {
+          dispatch(noopAction('deleteMessagesForEveryone'));
+          return;
+        }
+      } catch (error) {
+        log.error(
+          'Error sending web delete-for-everyone',
+          Errors.toLogFormat(error)
+        );
+      }
+    }
+
     let hasError = false;
 
     await Promise.all(
@@ -4608,8 +4671,17 @@ function addMembersToGroup(
       await longRunningTaskWrapper({
         name: 'addMembersToGroup',
         idForLogging,
-        task: () =>
-          modifyGroupV2({
+        task: async () => {
+          const webConversation = conversation as unknown as {
+            addMembersToGroup?: (
+              contactIds: ReadonlyArray<string>
+            ) => Promise<void>;
+          };
+          if (webConversation.addMembersToGroup) {
+            await webConversation.addMembersToGroup(contactIds);
+            return;
+          }
+          await modifyGroupV2({
             name: 'addMembersToGroup',
             conversation,
             usingCredentialsFrom: contactIds
@@ -4617,7 +4689,8 @@ function addMembersToGroup(
               .filter(isNotNil),
             createGroupChange: async () =>
               buildAddMembersChange(conversation.attributes, contactIds),
-          }),
+          });
+        },
       });
       onSuccess?.();
     } catch {
@@ -4658,6 +4731,19 @@ function updateGroupAttributes(
       conversation.attributes;
 
     try {
+      const webConversation = conversation as unknown as {
+        updateGroupAttributes?: (attributes: Readonly<{
+          avatar?: undefined | Uint8Array<ArrayBuffer>;
+          description?: string;
+          title?: string;
+        }>) => Promise<void>;
+      };
+      if (webConversation.updateGroupAttributes) {
+        await webConversation.updateGroupAttributes(attributes);
+        onSuccess?.();
+        return;
+      }
+
       await modifyGroupV2({
         name: 'updateGroupAttributes',
         conversation,
@@ -4730,6 +4816,22 @@ function leaveGroup(
     const conversation = window.ConversationController.get(conversationId);
     if (!conversation) {
       throw new Error('leaveGroup: No conversation found');
+    }
+
+    const webRuntime = (
+      window as typeof window & {
+        SignalWebRuntime?: {
+          leaveGroup?: (conversationId: string) => Promise<boolean>;
+        };
+      }
+    ).SignalWebRuntime;
+    if (
+      typeof conversation.leaveGroupV2 !== 'function' &&
+      webRuntime?.leaveGroup
+    ) {
+      if (await webRuntime.leaveGroup(conversationId)) {
+        return;
+      }
     }
 
     await longRunningTaskWrapper({
@@ -5198,12 +5300,40 @@ function onPinnedMessageAdd(
 
     const pinnedAt = Date.now();
 
-    await conversationJobQueue.add({
-      type: conversationQueueJobEnum.enum.PinMessage,
-      ...target,
-      pinDurationSeconds,
-      pinnedAt,
-    });
+    const didSendWebPinMessage =
+      (await (
+        window as typeof window & {
+          SignalWebRuntime?: {
+            pinMessage?: (
+              conversationId: string,
+              pinMessage: {
+                targetAuthorAci: string;
+                targetSentTimestamp: number;
+                pinDurationSeconds: number | null;
+              },
+              timestamp: number
+            ) => Promise<boolean>;
+          };
+        }
+      ).SignalWebRuntime?.pinMessage?.(
+        target.conversationId,
+        {
+          targetAuthorAci: target.targetAuthorAci,
+          targetSentTimestamp: target.targetSentTimestamp,
+          pinDurationSeconds:
+            pinDurationSeconds == null ? null : Number(pinDurationSeconds),
+        },
+        pinnedAt
+      )) ?? false;
+
+    if (!didSendWebPinMessage) {
+      await conversationJobQueue.add({
+        type: conversationQueueJobEnum.enum.PinMessage,
+        ...target,
+        pinDurationSeconds,
+        pinnedAt,
+      });
+    }
 
     const pinnedMessagesLimit = getPinnedMessagesLimit();
 
@@ -5239,12 +5369,38 @@ function onPinnedMessageRemove(targetMessageId: string): StateThunk {
     if (target == null) {
       throw new Error('onPinnedMessageRemove: Missing target message');
     }
-    await conversationJobQueue.add({
-      type: conversationQueueJobEnum.enum.UnpinMessage,
-      ...target,
-      unpinnedAt: Date.now(),
-      isSyncOnly: false,
-    });
+    const unpinnedAt = Date.now();
+    const didSendWebUnpinMessage =
+      (await (
+        window as typeof window & {
+          SignalWebRuntime?: {
+            unpinMessage?: (
+              conversationId: string,
+              unpinMessage: {
+                targetAuthorAci: string;
+                targetSentTimestamp: number;
+              },
+              timestamp: number
+            ) => Promise<boolean>;
+          };
+        }
+      ).SignalWebRuntime?.unpinMessage?.(
+        target.conversationId,
+        {
+          targetAuthorAci: target.targetAuthorAci,
+          targetSentTimestamp: target.targetSentTimestamp,
+        },
+        unpinnedAt
+      )) ?? false;
+
+    if (!didSendWebUnpinMessage) {
+      await conversationJobQueue.add({
+        type: conversationQueueJobEnum.enum.UnpinMessage,
+        ...target,
+        unpinnedAt,
+        isSyncOnly: false,
+      });
+    }
     await DataWriter.deletePinnedMessageByMessageId(targetMessageId);
     drop(pinnedMessagesCleanupService.trigger('onPinnedMessageRemove'));
     dispatch(onPinnedMessagesChanged(target.conversationId));

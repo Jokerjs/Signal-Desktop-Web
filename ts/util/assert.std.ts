@@ -8,12 +8,9 @@ import * as Errors from '../types/errors.std.ts';
 const log = createLogger('assert');
 
 /**
- * In development, starts the debugger.
+ * Browser builds must not pause execution on desktop soft assertions.
  */
 function devDebugger(): void {
-  if (getEnvironment() === Environment.Development) {
-    debugger; // oxlint-disable-line no-debugger
-  }
 }
 
 /**

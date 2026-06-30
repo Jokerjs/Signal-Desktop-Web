@@ -70,4 +70,14 @@
   &__author {
     @include mixins.font-body-2-medium;
   }
+
+  &__prefix {
+    font-family:
+      'Signal Emoji Small',
+      'Signal Emoji Large',
+      'Apple Color Emoji',
+      'Segoe UI Emoji',
+      'Noto Color Emoji',
+      sans-serif;
+  }
 }

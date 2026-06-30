@@ -1,0 +1,4356 @@
+// Copyright 2026 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { Buffer } from 'node:buffer';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
+import { mkdir, stat } from 'node:fs/promises';
+import https from 'node:https';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+import { Readable } from 'node:stream';
+import {
+  ErrorCode as LibSignalErrorCode,
+  LibSignalErrorBase,
+  SignedPreKeyRecord,
+} from '@signalapp/libsignal-client';
+import type { PrivateKey, PublicKey } from '@signalapp/libsignal-client';
+import { BackupKey } from '@signalapp/libsignal-client/dist/AccountKeys.js';
+import type { AuthenticatedChatConnection } from '@signalapp/libsignal-client/dist/net.js';
+import type {
+  ChatConnection,
+  UnauthenticatedChatConnection,
+} from '@signalapp/libsignal-client/dist/net/Chat.js';
+import {
+  BackupAuthCredentialRequestContext,
+  BackupAuthCredentialResponse,
+  GenericServerPublicParams,
+} from '@signalapp/libsignal-client/zkgroup.js';
+import nodeFetch from 'node-fetch';
+import { setEnvironment, Environment } from '../../environment.std.ts';
+import * as Bytes from '../../Bytes.std.ts';
+import {
+  decryptAttachmentV2ToSink,
+  encryptAttachmentV2ToDisk,
+  safeUnlink,
+} from '../../AttachmentCrypto.node.ts';
+import { SignalService as Proto } from '../../protobuf/index.std.ts';
+import { supportsIncrementalMac } from '../../types/MIME.std.ts';
+import type { MIMEType } from '../../types/MIME.std.ts';
+import { MY_STORY_ID } from '../../types/Stories.std.ts';
+import type { ProvisionDecryptResult } from '../../textsecure/ProvisioningCipher.node.ts';
+import type { AciString, ServiceIdString } from '../../types/ServiceId.std.ts';
+import { toAciObject } from '../../util/ServiceId.node.ts';
+import { normalizeAci } from '../../util/normalizeAci.std.ts';
+import { DAY, DurationInSeconds } from '../../util/durations/index.std.ts';
+import { toDayMillis } from '../../util/timestamp.std.ts';
+import { getUserAgent } from '../../util/getUserAgent.node.ts';
+import { utf16ToEmoji } from '../../util/utf16ToEmoji.node.ts';
+import { Emoji } from '../../axo/emoji.std.ts';
+import { tusUpload, type FetchFunctionType } from '../../util/uploads/tusProtocol.node.ts';
+import { defaultFileReader } from '../../util/uploads/uploads.node.ts';
+import {
+  importEphemeralBackup,
+} from './WebBackupImportBridge.node.ts';
+import { syncStorageContacts } from './WebStorageContactsSync.node.ts';
+import {
+  decryptIncomingSignalEnvelope,
+  getLinkedPayloadProtocolKeyIds,
+  sendAttachmentBackfillRequestSync,
+  sendDirectEditMessage,
+  sendDirectTextMessage,
+  sendGroupReaction,
+  sendGroupTextMessage,
+  sendGroupUpdateMessage,
+  sendDirectReaction,
+  sendMessageRequestResponseSync,
+} from './WebSignalSendBridge.node.ts';
+import {
+  fetchLatestGroupStateConversation,
+  modifyGroupMember,
+  modifyGroupSettings,
+  type WebGroupMemberModifyAction,
+  type WebGroupSettingsModifyAction,
+} from './WebGroupStateSync.node.ts';
+import type {
+  ChatShellState,
+  ContactsBootstrap,
+  MessageStreamEvent,
+  WebAttachment,
+  WebConversation,
+  WebDeleteForEveryone,
+  WebMessage,
+  WebPinMessage,
+  WebUnpinMessage,
+} from '../types.std.ts';
+
+try {
+  setEnvironment(Environment.PackagedApp, false);
+} catch (error) {
+  if (!(error instanceof Error) || error.message !== 'Environment has already been set') {
+    throw error;
+  }
+}
+
+const require = createRequire(import.meta.url);
+const packageJson = require('../../../package.json') as { version: string };
+const jumbomojiManifest = require('../../../build/jumbomoji.json') as Record<
+  string,
+  Array<string>
+>;
+const optionalResources = require('../../../build/optional-resources.json') as Record<
+  string,
+  {
+    digest: string;
+    size: number;
+    url: string;
+  }
+>;
+const productionConfig = require('../../../config/production.json') as {
+  backupServerPublicParams: string;
+  serverUrl: string;
+  storageUrl: string;
+  cdn: Record<string, string>;
+};
+
+function getDefaultCdnUrl(): string {
+  const cdnUrl = productionConfig.cdn['0'];
+  if (!cdnUrl) {
+    throw new Error('CDN 0 is not configured');
+  }
+  return cdnUrl;
+}
+
+const WEB_ATTACHMENT_WORK_DIR = resolve(process.cwd(), '.signal-web', 'attachments');
+const WEB_ATTACHMENT_TMP_DIR = resolve(WEB_ATTACHMENT_WORK_DIR, 'tmp');
+const WEB_EMOJI_CACHE_DIR = resolve(process.cwd(), '.signal-web', 'emoji');
+const WEB_STREAM_EVENT_QUEUE_PATH = resolve(
+  process.cwd(),
+  '.signal-web',
+  'message-stream-events.json'
+);
+const WEB_BACKUP_IMPORT_CACHE_PATH = resolve(
+  process.cwd(),
+  '.signal-web',
+  'backup-import-cache.json'
+);
+const MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT = 500;
+const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
+const emojiToSheet = new Map<string, string>();
+const emojiSheetCache = new Map<string, Map<string, Uint8Array<ArrayBuffer>>>();
+
+for (const [sheet, emojiList] of Object.entries(jumbomojiManifest)) {
+  for (const emoji of emojiList) {
+    if (Emoji.isEmoji(emoji)) {
+      emojiToSheet.set(Emoji.ignorePreferredSkinTone(emoji), sheet);
+    }
+  }
+}
+
+type SessionStatus =
+  | 'starting'
+  | 'qr-ready'
+  | 'linking'
+  | 'ready'
+  | 'error'
+  | 'closed';
+
+type ProvisioningSession = {
+  sessionId: string;
+  status: SessionStatus;
+  deviceName: string;
+  createdAt: number;
+  updatedAt: number;
+  url?: string;
+  error?: string;
+  linkedPayload?: LinkedPayload;
+  disconnect?: () => Promise<void>;
+  events: Array<ProvisioningSessionEvent>;
+};
+
+type LinkedPayload = {
+  account: {
+    aci: string;
+    pni?: string;
+    number: string;
+    phoneNumber: string;
+    title: string;
+  };
+  credentials: {
+    username: string;
+    password: string;
+    deviceId: number;
+    aci: string;
+    pni?: string;
+    number: string;
+  };
+  storageServiceKey: string;
+  profileKeyBase64?: string;
+  masterKeyBase64?: string;
+  accountEntropyPool?: string;
+  ephemeralBackupKeyBase64?: string;
+  mediaRootBackupKeyBase64?: string;
+  backupDownloadPath?: string;
+  aciIdentityKeyPublic?: string;
+  aciIdentityKeyPrivate?: string;
+  pniIdentityKeyPublic?: string;
+  pniIdentityKeyPrivate?: string;
+  aciRegistrationId?: number;
+  pniRegistrationId?: number;
+  aciSignedPreKeyRecordBase64?: string;
+  pniSignedPreKeyRecordBase64?: string;
+  aciPqLastResortPreKeyRecordBase64?: string;
+  pniPqLastResortPreKeyRecordBase64?: string;
+  protocolPersistenceVersion?: 1;
+};
+
+type JsonRecord = Record<string, unknown>;
+type PersistedStreamEventEntry = {
+  id: string;
+  createdAt: number;
+  event: MessageStreamEvent;
+};
+type PersistedStreamEvents = {
+  accounts?: Record<string, Array<PersistedStreamEventEntry>>;
+};
+type PersistedBackupImportEntry = {
+  updatedAt: number;
+  contactsBootstrap: ContactsBootstrap;
+  chatShell: ChatShellState;
+  mediaRootBackupKeyBase64?: string;
+  stats: unknown;
+};
+type PersistedBackupImportCache = {
+  accounts?: Record<string, PersistedBackupImportEntry>;
+};
+
+type ProvisioningSessionEvent = {
+  at: number;
+  type: string;
+  detail?: string;
+};
+
+type MessageStreamSession = {
+  createdAt: number;
+  updatedAt: number;
+  username: string;
+  status: 'connecting' | 'open' | 'closed' | 'error';
+  error?: string;
+  lastReceiveError?: string;
+  lastSendError?: string;
+  backupImportStatus: 'idle' | 'waiting-for-archive' | 'downloading' | 'importing' | 'done' | 'missing' | 'skipped' | 'error';
+  backupImportError?: string;
+  backupImportStats?: unknown;
+  incomingEnvelopeCount: number;
+  decodedMessageCount: number;
+  lastDecodedMessageSummary?: unknown;
+  attachmentBackfillEventCount?: number;
+  lastAttachmentBackfillSummary?: unknown;
+  ignoredEnvelopeCount: number;
+  lastIgnoredEnvelopeReason?: string;
+  lastIgnoredContentSummary?: string;
+  queueEmptyCount: number;
+  sendAttemptCount: number;
+  lastSendAttemptAt?: number;
+  connection?: AuthenticatedChatConnection;
+  linkedPayload?: LinkedPayload;
+  backupPresentationHeaders?: {
+    headers: Record<string, string>;
+    retrievedAtMs: number;
+  };
+  backupMediaSignatureKeyUploaded?: boolean;
+  backupArchiveInfo?: BackupArchiveInfo;
+  backupCdnReadCredentials?: Record<
+    number,
+    { headers: Record<string, string>; retrievedAtMs: number }
+  >;
+  remoteConfig?: {
+    values: Record<string, string>;
+    retrievedAtMs: number;
+  };
+  backupUnauthConnection?: UnauthenticatedChatConnection;
+  writeEvent?: (event: unknown) => void;
+  disconnect: () => Promise<void>;
+};
+
+type BackupArchiveInfo = Readonly<{
+  backupDir: string;
+  mediaDir: string;
+}>;
+
+type BackupMediaLocation = BackupArchiveInfo &
+  Readonly<{
+    cdnNumber: number;
+  }>;
+
+const PORT = Number(process.env.SIGNAL_WEB_PROVISIONING_PORT ?? 3100);
+const HOST = process.env.SIGNAL_WEB_PROVISIONING_HOST ?? '127.0.0.1';
+const LINK_AND_SYNC = process.env.SIGNAL_WEB_LINK_AND_SYNC !== '0';
+const UPSTREAM_API_BASE_URL = process.env.SIGNAL_WEB_UPSTREAM_API_BASE_URL;
+const CDN_BASE_URL = process.env.SIGNAL_WEB_CDN_BASE_URL;
+const ALLOW_INSECURE_CDN_TLS =
+  process.env.SIGNAL_WEB_ALLOW_INSECURE_CDN_TLS !== '0';
+const ALLOW_INSECURE_STORAGE_TLS =
+  process.env.SIGNAL_WEB_ALLOW_INSECURE_STORAGE_TLS !== '0' ||
+  ALLOW_INSECURE_CDN_TLS;
+if (ALLOW_INSECURE_CDN_TLS || ALLOW_INSECURE_STORAGE_TLS) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
+const insecureHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+const insecureNodeFetch: FetchFunctionType = (url, init) =>
+  nodeFetch(url, {
+    ...init,
+    agent: insecureHttpsAgent,
+  });
+const ALLOWED_ORIGINS = new Set(
+  (process.env.SIGNAL_WEB_ALLOWED_ORIGINS ?? 'http://127.0.0.1:3001,http://localhost:3001')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean)
+);
+
+const sessions = new Map<string, ProvisioningSession>();
+const streamSessions = new Map<string, MessageStreamSession>();
+const transferArchiveCooldownUntilByAccount = new Map<string, number>();
+
+let signalModulesPromise: ReturnType<typeof loadSignalModules> | undefined;
+
+function now(): number {
+  return Date.now();
+}
+
+function touch(session: ProvisioningSession): void {
+  session.updatedAt = now();
+}
+
+function recordSessionEvent(
+  session: ProvisioningSession,
+  type: string,
+  detail?: string
+): void {
+  const event: ProvisioningSessionEvent = {
+    at: now(),
+    type,
+    detail,
+  };
+  session.events = [...session.events.slice(-19), event];
+  console.info(
+    `[web-bridge] provisioning ${session.sessionId} ${type}` +
+      (detail ? `: ${detail}` : '')
+  );
+}
+
+function getStreamEventAccountKey(
+  linkedPayload: LinkedPayload | undefined,
+  fallback: string
+): string {
+  return linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci ?? fallback;
+}
+
+function readPersistedStreamEvents(): PersistedStreamEvents {
+  if (!existsSync(WEB_STREAM_EVENT_QUEUE_PATH)) {
+    return {};
+  }
+  return JSON.parse(
+    readFileSync(WEB_STREAM_EVENT_QUEUE_PATH, 'utf8')
+  ) as PersistedStreamEvents;
+}
+
+function writePersistedStreamEvents(data: PersistedStreamEvents): void {
+  mkdirSync(resolve(WEB_STREAM_EVENT_QUEUE_PATH, '..'), { recursive: true });
+  writeFileSync(WEB_STREAM_EVENT_QUEUE_PATH, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+function readPersistedBackupImportCache(): PersistedBackupImportCache {
+  if (!existsSync(WEB_BACKUP_IMPORT_CACHE_PATH)) {
+    return {};
+  }
+  return JSON.parse(
+    readFileSync(WEB_BACKUP_IMPORT_CACHE_PATH, 'utf8')
+  ) as PersistedBackupImportCache;
+}
+
+function writePersistedBackupImportCache(
+  data: PersistedBackupImportCache
+): void {
+  mkdirSync(resolve(WEB_BACKUP_IMPORT_CACHE_PATH, '..'), { recursive: true });
+  writeFileSync(
+    WEB_BACKUP_IMPORT_CACHE_PATH,
+    `${JSON.stringify(data, null, 2)}\n`
+  );
+}
+
+function getPersistedBackupImportEntry(
+  linkedPayload: LinkedPayload | undefined,
+  fallback: string
+): PersistedBackupImportEntry | undefined {
+  const accountKey = getStreamEventAccountKey(linkedPayload, fallback);
+  return readPersistedBackupImportCache().accounts?.[accountKey];
+}
+
+function savePersistedBackupImportEntry({
+  fallback,
+  linkedPayload,
+  value,
+}: {
+  fallback: string;
+  linkedPayload: LinkedPayload | undefined;
+  value: PersistedBackupImportEntry;
+}): void {
+  const accountKey = getStreamEventAccountKey(linkedPayload, fallback);
+  const cache = readPersistedBackupImportCache();
+  writePersistedBackupImportCache({
+    ...cache,
+    accounts: {
+      ...cache.accounts,
+      [accountKey]: value,
+    },
+  });
+}
+
+function emitPersistedBackupImportEntry({
+  entry,
+  linkedPayload,
+  streamSession,
+  writeEvent,
+}: {
+  entry: PersistedBackupImportEntry;
+  linkedPayload: LinkedPayload | undefined;
+  streamSession: MessageStreamSession;
+  writeEvent: (event: unknown) => void;
+}): void {
+  if (entry.mediaRootBackupKeyBase64 && linkedPayload) {
+    streamSession.linkedPayload = {
+      ...linkedPayload,
+      mediaRootBackupKeyBase64: entry.mediaRootBackupKeyBase64,
+    };
+    writeEvent({
+      type: 'linked-session-updated',
+      linkedPayload: streamSession.linkedPayload,
+    });
+  }
+  streamSession.backupImportStats = entry.stats;
+  streamSession.updatedAt = now();
+  writeEvent({ type: 'contacts-bootstrap', data: entry.contactsBootstrap });
+  writeEvent({ type: 'chat-shell', state: entry.chatShell });
+}
+
+function getPersistedStreamEventId(event: MessageStreamEvent): string | undefined {
+  if (event.type === 'message') {
+    return `message:${event.message.id}`;
+  }
+  if (event.type === 'message-status') {
+    return `message-status:${event.id}:${event.status}`;
+  }
+  if (event.type === 'pin-message') {
+    return `pin-message:${event.conversationId}:${event.targetAuthorAci}:${event.targetSentTimestamp}:${event.timestamp}`;
+  }
+  if (event.type === 'unpin-message') {
+    return `unpin-message:${event.conversationId}:${event.targetAuthorAci}:${event.targetSentTimestamp}:${event.timestamp}`;
+  }
+  if (event.type === 'attachment-backfill') {
+    return `attachment-backfill:${event.conversationId}:${event.targetAuthorAci ?? ''}:${event.targetSentTimestamp}:${event.timestamp}`;
+  }
+  if (event.type === 'reaction') {
+    return `reaction:${event.conversationId}:${event.senderAci}:${event.targetAuthorAci}:${event.targetTimestamp}:${event.timestamp}:${event.emoji ?? ''}:${event.remove}`;
+  }
+  if (event.type === 'edit-message') {
+    return `edit-message:${event.conversationId}:${event.senderAci}:${event.targetTimestamp}:${event.message.timestamp}`;
+  }
+  if (event.type === 'delete-message') {
+    return `delete-message:${event.conversationId}:${event.targetAuthorAci ?? event.senderAci}:${event.targetSentTimestamp}:${event.timestamp}`;
+  }
+  if (event.type === 'receipt') {
+    return `receipt:${event.conversationId}:${event.senderAci}:${event.receiptType}:${event.timestamps.join(',')}`;
+  }
+  if (event.type === 'typing') {
+    return `typing:${event.conversationId}:${event.senderAci}:${event.sourceDevice ?? ''}:${event.action}:${event.timestamp}`;
+  }
+  if (event.type === 'poll-vote') {
+    return `poll-vote:${event.conversationId}:${event.senderAci}:${event.targetAuthorAci}:${event.targetTimestamp}:${event.timestamp}`;
+  }
+  if (event.type === 'poll-terminate') {
+    return `poll-terminate:${event.conversationId}:${event.senderAci}:${event.targetAuthorAci}:${event.targetTimestamp}:${event.timestamp}`;
+  }
+  return undefined;
+}
+
+function withStreamEventId(
+  event: MessageStreamEvent,
+  streamEventId: string
+): MessageStreamEvent {
+  return {
+    ...event,
+    streamEventId,
+  };
+}
+
+function persistStreamEvent(
+  accountKey: string,
+  event: MessageStreamEvent
+): MessageStreamEvent {
+  const id = getPersistedStreamEventId(event);
+  if (!id) {
+    return event;
+  }
+
+  const data = readPersistedStreamEvents();
+  data.accounts ??= {};
+  const cutoff = now() - MAX_PERSISTED_STREAM_EVENT_AGE;
+  const existing = (data.accounts[accountKey] ?? []).filter(
+    item => item.createdAt >= cutoff && item.id !== id
+  );
+  existing.push({
+    id,
+    createdAt: now(),
+    event: withStreamEventId(event, id),
+  });
+  data.accounts[accountKey] = existing.slice(
+    -MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT
+  );
+  writePersistedStreamEvents(data);
+  return withStreamEventId(event, id);
+}
+
+function replayPersistedStreamEvents(
+  accountKey: string,
+  writeEvent: (event: unknown) => void
+): void {
+  const items = readPersistedStreamEvents().accounts?.[accountKey] ?? [];
+  const cutoff = now() - MAX_PERSISTED_STREAM_EVENT_AGE;
+  for (const item of items) {
+    if (item.createdAt < cutoff) {
+      continue;
+    }
+    writeEvent(withStreamEventId(item.event, item.id));
+  }
+}
+
+function acknowledgePersistedStreamEvent(
+  accountKey: string,
+  eventId: string
+): void {
+  const data = readPersistedStreamEvents();
+  const items = data.accounts?.[accountKey];
+  if (!items) {
+    return;
+  }
+  const nextItems = items.filter(item => item.id !== eventId);
+  if (nextItems.length === items.length) {
+    return;
+  }
+  data.accounts ??= {};
+  data.accounts[accountKey] = nextItems;
+  writePersistedStreamEvents(data);
+}
+
+function sendCors(req: IncomingMessage, res: ServerResponse): void {
+  const origin = req.headers.origin;
+  if (origin && (ALLOWED_ORIGINS.has(origin) || ALLOWED_ORIGINS.has('*'))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', 'http://127.0.0.1:3001');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+}
+
+function sendJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+  statusCode: number,
+  body: unknown
+): void {
+  sendCors(req, res);
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
+}
+
+function sendText(
+  req: IncomingMessage,
+  res: ServerResponse,
+  statusCode: number,
+  body: string
+): void {
+  sendCors(req, res);
+  res.writeHead(statusCode, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(body);
+}
+
+function sendBytes(
+  req: IncomingMessage,
+  res: ServerResponse,
+  statusCode: number,
+  body: Uint8Array,
+  contentType: string
+): void {
+  sendCors(req, res);
+  res.writeHead(statusCode, {
+    'Cache-Control': 'public, max-age=2592000, immutable',
+    'Content-Length': String(body.byteLength),
+    'Content-Type': contentType,
+  });
+  res.end(body);
+}
+
+function toArrayBufferUint8Array(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  const result = new Uint8Array(new ArrayBuffer(data.byteLength));
+  result.set(data);
+  return result;
+}
+
+function verifyOptionalResourceDigest({
+  data,
+  digest,
+  resourceName,
+}: Readonly<{
+  data: Uint8Array;
+  digest: string;
+  resourceName: string;
+}>): void {
+  const actualDigest = createHash('sha512').update(data).digest('base64');
+  if (actualDigest !== digest) {
+    throw new Error(`${resourceName}: digest mismatch`);
+  }
+}
+
+async function getEmojiSheetProto(sheet: string): Promise<Uint8Array<ArrayBuffer>> {
+  const resourceName = `emoji-sheet-${sheet}.proto`;
+  const resource = optionalResources[resourceName];
+  if (!resource) {
+    throw new Error(`${resourceName}: optional resource not found`);
+  }
+
+  mkdirSync(WEB_EMOJI_CACHE_DIR, { recursive: true });
+  const localPath = resolve(WEB_EMOJI_CACHE_DIR, resourceName);
+  if (existsSync(localPath)) {
+    const cached = readFileSync(localPath);
+    verifyOptionalResourceDigest({
+      data: cached,
+      digest: resource.digest,
+      resourceName,
+    });
+    return toArrayBufferUint8Array(cached);
+  }
+
+  const response = await nodeFetch(resource.url);
+  if (!response.ok) {
+    throw new Error(`${resourceName}: fetch failed with status ${response.status}`);
+  }
+  const data = Buffer.from(await response.arrayBuffer());
+  if (data.byteLength !== resource.size) {
+    throw new Error(`${resourceName}: size mismatch`);
+  }
+  verifyOptionalResourceDigest({
+    data,
+    digest: resource.digest,
+    resourceName,
+  });
+  writeFileSync(localPath, data);
+  return toArrayBufferUint8Array(data);
+}
+
+async function getEmojiSheetImages(
+  sheet: string
+): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
+  const cached = emojiSheetCache.get(sheet);
+  if (cached) {
+    return cached;
+  }
+
+  const proto = await getEmojiSheetProto(sheet);
+  const pack = Proto.JumbomojiPack.decode(proto);
+  const imageMap = new Map<string, Uint8Array<ArrayBuffer>>();
+  for (const item of pack.items) {
+    const key = item.name != null ? utf16ToEmoji(item.name) : '';
+    const image =
+      item.image != null
+        ? toArrayBufferUint8Array(item.image)
+        : new Uint8Array(new ArrayBuffer(0));
+    imageMap.set(key, image);
+  }
+  emojiSheetCache.set(sheet, imageMap);
+  return imageMap;
+}
+
+async function handleEmojiJumbo(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL
+): Promise<void> {
+  const rawEmoji = url.searchParams.get('emoji');
+  if (rawEmoji == null || !Emoji.isEmoji(rawEmoji)) {
+    sendText(req, res, 400, 'Invalid emoji');
+    return;
+  }
+
+  const emoji = Emoji.ignorePreferredSkinTone(rawEmoji);
+  const sheet = emojiToSheet.get(emoji);
+  if (!sheet) {
+    sendText(req, res, 404, 'Emoji not found');
+    return;
+  }
+
+  const imageMap = await getEmojiSheetImages(sheet);
+  const image = imageMap.get(emoji);
+  if (!image || image.byteLength === 0) {
+    sendText(req, res, 404, 'Emoji image not found');
+    return;
+  }
+
+  sendBytes(req, res, 200, image, 'image/webp');
+}
+
+function getSessionResponse(session: ProvisioningSession): JsonRecord {
+  return {
+    sessionId: session.sessionId,
+    status: session.status,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    url: session.url,
+    error: session.error,
+    events: session.events,
+    hasLinkedPayload: Boolean(session.linkedPayload),
+    linkedAccount: session.linkedPayload
+      ? {
+          aci: session.linkedPayload.account.aci,
+          pni: session.linkedPayload.account.pni,
+          number: session.linkedPayload.account.number,
+          deviceId: session.linkedPayload.credentials.deviceId,
+          hasBackupDownloadPath: Boolean(session.linkedPayload.backupDownloadPath),
+          hasMediaRootBackupKey: Boolean(
+            session.linkedPayload.mediaRootBackupKeyBase64
+          ),
+          hasAciRegistrationId:
+            typeof session.linkedPayload.aciRegistrationId === 'number',
+        }
+      : undefined,
+  };
+}
+
+async function readJson(req: IncomingMessage): Promise<JsonRecord> {
+  const chunks = new Array<Buffer>();
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  if (!chunks.length) {
+    return {};
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as JsonRecord;
+}
+
+function getBodyString(body: unknown): string {
+  if (body instanceof Uint8Array) {
+    return Buffer.from(body).toString('utf8');
+  }
+  if (typeof body === 'string') {
+    return body;
+  }
+  return '';
+}
+
+type AttachmentUploadForm = Readonly<{
+  cdn: number;
+  key: string;
+  headers: Record<string, string>;
+  signedUploadLocation: string;
+}>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function getOptionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' ? value : undefined;
+}
+
+function parseWebAttachments(value: unknown): ReadonlyArray<WebAttachment> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(isRecord)
+    .map(item => {
+      const thumbnail = isRecord(item.thumbnail)
+        ? parseWebAttachments([item.thumbnail])[0]
+        : undefined;
+      return {
+        id: getOptionalString(item.id),
+        kind:
+          item.kind === 'file' || item.kind === 'image' || item.kind === 'video'
+            ? item.kind
+            : undefined,
+        cdnId: getOptionalString(item.cdnId),
+        cdnKey: getOptionalString(item.cdnKey),
+        cdnNumber: getOptionalNumber(item.cdnNumber),
+        keyBase64: getOptionalString(item.keyBase64),
+        digestBase64: getOptionalString(item.digestBase64),
+        incrementalMacBase64: getOptionalString(item.incrementalMacBase64),
+        key: getOptionalString(item.key),
+        digest: getOptionalString(item.digest),
+        incrementalMac: getOptionalString(item.incrementalMac),
+        chunkSize: getOptionalNumber(item.chunkSize),
+        size: getOptionalNumber(item.size),
+        contentType: getOptionalString(item.contentType),
+        fileName: getOptionalString(item.fileName),
+        flags: getOptionalNumber(item.flags),
+        width: getOptionalNumber(item.width),
+        height: getOptionalNumber(item.height),
+        duration: getOptionalNumber(item.duration),
+        caption: getOptionalString(item.caption),
+        blurHash: getOptionalString(item.blurHash),
+        uploadTimestamp: getOptionalNumber(item.uploadTimestamp),
+        clientUuid: getOptionalString(item.clientUuid),
+        plaintextHash: getOptionalString(item.plaintextHash),
+        downloadPath: getOptionalString(item.downloadPath),
+        backupCdnNumber: getOptionalNumber(item.backupCdnNumber),
+        localKey: getOptionalString(item.localKey),
+        downloadUrl: getOptionalString(item.downloadUrl),
+        previewUrl: getOptionalString(item.previewUrl),
+        thumbnail,
+        thumbnailUrl: getOptionalString(item.thumbnailUrl),
+        localBlobKey: getOptionalString(item.localBlobKey),
+        url: getOptionalString(item.url),
+        dataBase64: getOptionalString(item.dataBase64),
+        status:
+          item.status === 'pending' ||
+          item.status === 'uploading' ||
+          item.status === 'ready' ||
+          item.status === 'failed' ||
+          item.status === 'sent'
+            ? item.status
+            : undefined,
+        error: getOptionalString(item.error),
+      };
+    });
+}
+
+function parseWebQuote(value: unknown): WebMessage['quote'] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const authorAci = getOptionalString(value.authorAci);
+  if (!authorAci) {
+    return undefined;
+  }
+
+  const attachments = Array.isArray(value.attachments)
+    ? value.attachments.filter(isRecord).map(attachment => {
+        const thumbnail = isRecord(attachment.thumbnail)
+          ? parseWebAttachments([attachment.thumbnail])[0]
+          : undefined;
+        return {
+          contentType:
+            getOptionalString(attachment.contentType) ??
+            'application/octet-stream',
+          fileName: getOptionalString(attachment.fileName),
+          thumbnail,
+        };
+      })
+    : [];
+
+  return {
+    id: typeof value.id === 'number' ? value.id : null,
+    authorAci,
+    attachments,
+    bodyRanges: Array.isArray(value.bodyRanges) ? value.bodyRanges : [],
+    isGiftBadge: value.isGiftBadge === true,
+    isPoll: value.isPoll === true,
+    isViewOnce: value.isViewOnce === true,
+    referencedMessageNotFound: value.referencedMessageNotFound === true,
+    text: getOptionalString(value.text),
+    type: getOptionalNumber(value.type),
+  } as unknown as WebMessage['quote'];
+}
+
+function parseWebPinMessage(value: unknown): WebPinMessage | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const targetAuthorAci = getOptionalString(value.targetAuthorAci);
+  const targetSentTimestamp = getOptionalNumber(value.targetSentTimestamp);
+  const pinDurationSeconds =
+    value.pinDurationSeconds === null
+      ? null
+      : getOptionalNumber(value.pinDurationSeconds);
+
+  if (
+    !targetAuthorAci ||
+    targetSentTimestamp == null ||
+    pinDurationSeconds === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    targetAuthorAci,
+    targetSentTimestamp,
+    pinDurationSeconds,
+  };
+}
+
+function parseWebUnpinMessage(value: unknown): WebUnpinMessage | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const targetAuthorAci = getOptionalString(value.targetAuthorAci);
+  const targetSentTimestamp = getOptionalNumber(value.targetSentTimestamp);
+
+  if (!targetAuthorAci || targetSentTimestamp == null) {
+    return undefined;
+  }
+
+  return {
+    targetAuthorAci,
+    targetSentTimestamp,
+  };
+}
+
+function parseWebDeleteForEveryone(value: unknown): WebDeleteForEveryone | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.targetAuthorAci !== 'string' ||
+    typeof record.targetSentTimestamp !== 'number'
+  ) {
+    return undefined;
+  }
+  return {
+    targetAuthorAci: record.targetAuthorAci,
+    targetSentTimestamp: record.targetSentTimestamp,
+    isAdminDelete:
+      typeof record.isAdminDelete === 'boolean'
+        ? record.isAdminDelete
+        : undefined,
+  };
+}
+
+function errorToLogString(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const cause = error.cause;
+  const causeText =
+    cause instanceof Error
+      ? cause.stack ?? cause.message
+      : cause != null
+        ? String(cause)
+        : undefined;
+  return causeText
+    ? `${error.stack ?? error.message}\nCause: ${causeText}`
+    : error.stack ?? error.message;
+}
+
+function getLinkedPayloadFromStreamBody(body: JsonRecord): LinkedPayload | undefined {
+  const value = body.linkedPayload;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const linkedPayload = value as LinkedPayload;
+  if (typeof linkedPayload.aciRegistrationId === 'number') {
+    return linkedPayload;
+  }
+
+  const protocol = body.protocol;
+  if (!protocol || typeof protocol !== 'object' || Array.isArray(protocol)) {
+    return linkedPayload;
+  }
+  const registrationIds = (protocol as JsonRecord).registrationIds;
+  if (
+    !registrationIds ||
+    typeof registrationIds !== 'object' ||
+    Array.isArray(registrationIds)
+  ) {
+    return linkedPayload;
+  }
+  const aciRegistrationId = (registrationIds as JsonRecord).aci;
+  const pniRegistrationId = (registrationIds as JsonRecord).pni;
+  return {
+    ...linkedPayload,
+    aciRegistrationId:
+      typeof aciRegistrationId === 'number'
+        ? aciRegistrationId
+        : linkedPayload.aciRegistrationId,
+    pniRegistrationId:
+      typeof pniRegistrationId === 'number'
+        ? pniRegistrationId
+        : linkedPayload.pniRegistrationId,
+  };
+}
+
+async function loadSignalModules() {
+  const [
+    libsignal,
+    chatModule,
+    provisioningCipherModule,
+    curve,
+    crypto,
+    bytes,
+    protobuf,
+    serviceId,
+  ] = await Promise.all([
+    import('@signalapp/libsignal-client'),
+    import('@signalapp/libsignal-client/dist/net/Chat.js'),
+    import('../../textsecure/ProvisioningCipher.node.ts'),
+    import('../../Curve.node.ts'),
+    import('../../Crypto.node.ts'),
+    import('../../Bytes.std.ts'),
+    import('../../protobuf/index.std.ts'),
+    import('../../types/ServiceId.std.ts'),
+  ]);
+
+  return {
+    Net: libsignal.Net,
+    Chat: chatModule,
+    ProvisioningCipher: provisioningCipherModule.default,
+    Curve: curve,
+    Crypto: crypto,
+    Bytes: bytes,
+    Proto: protobuf.SignalService,
+    ServiceId: serviceId,
+  };
+}
+
+async function getSignalModules() {
+  signalModulesPromise ??= loadSignalModules();
+  return signalModulesPromise;
+}
+
+function createNet(Net: Awaited<ReturnType<typeof getSignalModules>>['Net']) {
+  return new Net.Net({
+    env:
+      process.env.SIGNAL_WEB_SERVER_ENV === 'staging'
+        ? Net.Environment.Staging
+        : Net.Environment.Production,
+    userAgent: `Signal-Desktop/${packageJson.version} Web`,
+  });
+}
+
+function buildLinkDeviceUrl({
+  uuid,
+  pubKey,
+}: {
+  uuid: string;
+  pubKey: string;
+}): string {
+  const params = new URLSearchParams({
+    uuid,
+    pub_key: pubKey,
+    capabilities: LINK_AND_SYNC ? 'backup5' : '',
+  });
+  return `sgnl://linkdevice?${params.toString()}`;
+}
+
+function serializeSignedPreKey(
+  Bytes: Awaited<ReturnType<typeof getSignalModules>>['Bytes'],
+  preKey:
+    | {
+        keyId: number;
+        publicKey: { serialize: () => Uint8Array<ArrayBuffer> };
+        signature: Uint8Array<ArrayBuffer>;
+      }
+    | undefined
+) {
+  if (!preKey) {
+    return undefined;
+  }
+  return {
+    keyId: preKey.keyId,
+    publicKey: Bytes.toBase64(preKey.publicKey.serialize()),
+    signature: Bytes.toBase64(preKey.signature),
+  };
+}
+
+function createSignedPreKeyRecord({
+  keyId,
+  keyPair,
+  signature,
+}: {
+  keyId: number;
+  keyPair: {
+    publicKey: PublicKey;
+    privateKey: PrivateKey;
+  };
+  signature: Uint8Array<ArrayBuffer>;
+}) {
+  return SignedPreKeyRecord.new(
+    keyId,
+    Date.now(),
+    keyPair.publicKey,
+    keyPair.privateKey,
+    signature
+  );
+}
+
+function encryptDeviceNameBase64({
+  Crypto,
+  Proto,
+  Bytes,
+  deviceName,
+  identityPublic,
+}: {
+  Crypto: Awaited<ReturnType<typeof getSignalModules>>['Crypto'];
+  Proto: Awaited<ReturnType<typeof getSignalModules>>['Proto'];
+  Bytes: Awaited<ReturnType<typeof getSignalModules>>['Bytes'];
+  deviceName: string;
+  identityPublic: PublicKey;
+}): string | undefined {
+  const normalizedDeviceName = deviceName.trim().slice(0, 50);
+  if (!normalizedDeviceName) {
+    return undefined;
+  }
+  const encrypted = Crypto.encryptDeviceName(normalizedDeviceName, identityPublic);
+  return Bytes.toBase64(
+    Proto.DeviceName.encode({
+      ephemeralPublic: encrypted.ephemeralPublic.serialize(),
+      syntheticIv: encrypted.syntheticIv,
+      ciphertext: encrypted.ciphertext,
+    })
+  );
+}
+
+function getNextKeyId(
+  Crypto: Awaited<ReturnType<typeof getSignalModules>>['Crypto']
+): number {
+  return Buffer.from(Crypto.getRandomBytes(4)).readUint32LE(0) & 0xffffff;
+}
+
+async function linkDeviceFromEnvelope({
+  session,
+  envelope,
+}: {
+  session: ProvisioningSession;
+  envelope: ProvisionDecryptResult;
+}): Promise<LinkedPayload> {
+  const { Net, Curve, Crypto, Bytes, Proto } = await getSignalModules();
+
+  if (!envelope.number) {
+    throw new Error('Missing provisioning number');
+  }
+  if (!envelope.provisioningCode) {
+    throw new Error('Missing provisioning code');
+  }
+  if (!envelope.pniKeyPair) {
+    throw new Error('Missing PNI identity key pair');
+  }
+  if (!envelope.profileKey?.length) {
+    throw new Error('Missing profile key');
+  }
+  if (!envelope.masterKey?.length && !envelope.accountEntropyPool) {
+    throw new Error('Missing master key or account entropy pool');
+  }
+
+  const passwordWithPadding = Bytes.toBase64(Crypto.getRandomBytes(16));
+  const password = passwordWithPadding.substring(0, passwordWithPadding.length - 2);
+  const registrationId = Crypto.generateRegistrationId();
+  const pniRegistrationId = Crypto.generateRegistrationId();
+  const aciSignedPreKey = Curve.generateSignedPreKey(
+    envelope.aciKeyPair,
+    getNextKeyId(Crypto)
+  );
+  const pniSignedPreKey = Curve.generateSignedPreKey(
+    envelope.pniKeyPair,
+    getNextKeyId(Crypto)
+  );
+  const aciPqLastResortPreKey = Curve.generateKyberPreKey(
+    envelope.aciKeyPair,
+    getNextKeyId(Crypto)
+  );
+  const pniPqLastResortPreKey = Curve.generateKyberPreKey(
+    envelope.pniKeyPair,
+    getNextKeyId(Crypto)
+  );
+
+  const jsonData = {
+    verificationCode: envelope.provisioningCode,
+    accountAttributes: {
+      fetchesMessages: true,
+      name: encryptDeviceNameBase64({
+        Crypto,
+        Proto,
+        Bytes,
+        deviceName: session.deviceName,
+        identityPublic: envelope.aciKeyPair.publicKey,
+      }),
+      registrationId,
+      pniRegistrationId,
+      capabilities: {
+        attachmentBackfill: true,
+        spqr: true,
+        usernameChangeSyncMessage: true,
+      },
+    },
+    aciSignedPreKey: serializeSignedPreKey(Bytes, {
+      keyId: aciSignedPreKey.keyId,
+      publicKey: aciSignedPreKey.keyPair.publicKey,
+      signature: aciSignedPreKey.signature,
+    }),
+    pniSignedPreKey: serializeSignedPreKey(Bytes, {
+      keyId: pniSignedPreKey.keyId,
+      publicKey: pniSignedPreKey.keyPair.publicKey,
+      signature: pniSignedPreKey.signature,
+    }),
+    aciPqLastResortPreKey: serializeSignedPreKey(Bytes, {
+      keyId: aciPqLastResortPreKey.id(),
+      publicKey: aciPqLastResortPreKey.publicKey(),
+      signature: aciPqLastResortPreKey.signature(),
+    }),
+    pniPqLastResortPreKey: serializeSignedPreKey(Bytes, {
+      keyId: pniPqLastResortPreKey.id(),
+      publicKey: pniPqLastResortPreKey.publicKey(),
+      signature: pniPqLastResortPreKey.signature(),
+    }),
+  };
+
+  const net = createNet(Net);
+  recordSessionEvent(session, 'link-request-start');
+  const chat = await net.connectUnauthenticatedChat(
+    {
+      onConnectionInterrupted() {},
+    },
+    { languages: ['zh-CN', 'en-US'] }
+  );
+
+  try {
+    const response = await chat.fetch({
+      verb: 'PUT',
+      path: '/v1/devices/link',
+      headers: [
+        ['content-type', 'application/json'],
+        [
+          'authorization',
+          `Basic ${Buffer.from(`${envelope.number}:${password}`).toString('base64')}`,
+        ],
+      ],
+      body: Buffer.from(JSON.stringify(jsonData), 'utf8'),
+      timeoutMillis: 60_000,
+    });
+
+    const responseBody = getBodyString(response.body);
+    recordSessionEvent(session, 'link-response', String(response.status));
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(
+        responseBody
+          ? `linkDevice failed with status ${response.status}: ${responseBody}`
+          : `linkDevice failed with status ${response.status}`
+      );
+    }
+
+    const parsed = JSON.parse(responseBody) as {
+      uuid: string;
+      pni: string;
+      deviceId: number;
+    };
+
+    const masterKey =
+      envelope.masterKey ??
+      Crypto.deriveMasterKey(envelope.accountEntropyPool as string);
+    const storageServiceKey = Crypto.deriveStorageServiceKey(masterKey);
+    const linkedAci = parsed.uuid;
+    const linkedPni = parsed.pni.startsWith('PNI:')
+      ? parsed.pni
+      : `PNI:${parsed.pni}`;
+
+    return {
+      account: {
+        aci: linkedAci,
+        pni: linkedPni,
+        number: envelope.number,
+        phoneNumber: envelope.number,
+        title: envelope.number,
+      },
+      credentials: {
+        username: `${linkedAci}.${parsed.deviceId}`,
+        password,
+        deviceId: parsed.deviceId,
+        aci: linkedAci,
+        pni: linkedPni,
+        number: envelope.number,
+      },
+      storageServiceKey: Bytes.toBase64(storageServiceKey),
+      profileKeyBase64: Bytes.toBase64(envelope.profileKey),
+      masterKeyBase64: Bytes.toBase64(masterKey),
+      accountEntropyPool: envelope.accountEntropyPool,
+      ephemeralBackupKeyBase64: envelope.ephemeralBackupKey
+        ? Bytes.toBase64(envelope.ephemeralBackupKey)
+        : undefined,
+      mediaRootBackupKeyBase64: envelope.mediaRootBackupKey
+        ? Bytes.toBase64(envelope.mediaRootBackupKey)
+        : undefined,
+      backupDownloadPath:
+        LINK_AND_SYNC && envelope.ephemeralBackupKey
+          ? `web-backup-${session.sessionId}`
+          : undefined,
+      aciIdentityKeyPublic: Bytes.toBase64(envelope.aciKeyPair.publicKey.serialize()),
+      aciIdentityKeyPrivate: Bytes.toBase64(
+        envelope.aciKeyPair.privateKey.serialize()
+      ),
+      pniIdentityKeyPublic: Bytes.toBase64(envelope.pniKeyPair.publicKey.serialize()),
+      pniIdentityKeyPrivate: Bytes.toBase64(
+        envelope.pniKeyPair.privateKey.serialize()
+      ),
+      aciRegistrationId: registrationId,
+      pniRegistrationId,
+      aciSignedPreKeyRecordBase64: Bytes.toBase64(
+        createSignedPreKeyRecord(aciSignedPreKey).serialize()
+      ),
+      pniSignedPreKeyRecordBase64: Bytes.toBase64(
+        createSignedPreKeyRecord(pniSignedPreKey).serialize()
+      ),
+      aciPqLastResortPreKeyRecordBase64: Bytes.toBase64(
+        aciPqLastResortPreKey.serialize()
+      ),
+      pniPqLastResortPreKeyRecordBase64: Bytes.toBase64(
+        pniPqLastResortPreKey.serialize()
+      ),
+      protocolPersistenceVersion: 1,
+    };
+  } finally {
+    await chat.disconnect().catch(() => undefined);
+  }
+}
+
+async function startProvisioningSession(deviceName: string): Promise<ProvisioningSession> {
+  const { Net, ProvisioningCipher, Bytes, Proto } = await getSignalModules();
+  const session: ProvisioningSession = {
+    sessionId: randomUUID(),
+    status: 'starting',
+    deviceName: deviceName.trim() || 'Signal Web',
+    createdAt: now(),
+    updatedAt: now(),
+    events: [],
+  };
+  sessions.set(session.sessionId, session);
+  recordSessionEvent(session, 'starting');
+
+  const net = createNet(Net);
+  const cipher = new ProvisioningCipher();
+  const abortController = new AbortController();
+  let connection:
+    | {
+        disconnect: () => Promise<void>;
+      }
+    | undefined;
+
+  session.disconnect = async () => {
+    abortController.abort();
+    await connection?.disconnect();
+  };
+
+  net
+    .connectProvisioning(
+      {
+        onReceivedAddress(address, ack) {
+          session.url = buildLinkDeviceUrl({
+            uuid: address,
+            pubKey: Bytes.toBase64(cipher.getPublicKey().serialize()),
+          });
+          session.status = 'qr-ready';
+          touch(session);
+          recordSessionEvent(session, 'qr-ready');
+          ack.send(200);
+        },
+        onReceivedEnvelope(body, ack) {
+          session.status = 'linking';
+          touch(session);
+          recordSessionEvent(session, 'envelope-received');
+          try {
+            const provisionEnvelope = Proto.ProvisionEnvelope.decode(body);
+            const envelope = cipher.decrypt(provisionEnvelope);
+            ack.send(200);
+            recordSessionEvent(session, 'envelope-decrypted');
+            void linkDeviceFromEnvelope({ session, envelope })
+              .then(linkedPayload => {
+                session.linkedPayload = linkedPayload;
+                session.status = 'ready';
+                touch(session);
+                recordSessionEvent(session, 'link-ready');
+              })
+              .catch(error => {
+                session.status = 'error';
+                session.error =
+                  error instanceof Error ? error.stack ?? error.message : String(error);
+                touch(session);
+                recordSessionEvent(
+                  session,
+                  'link-error',
+                  error instanceof Error ? error.message : String(error)
+                );
+              });
+          } catch (error) {
+            ack.send(500);
+            session.status = 'error';
+            session.error =
+              error instanceof Error ? error.stack ?? error.message : String(error);
+            touch(session);
+            recordSessionEvent(
+              session,
+              'envelope-error',
+              error instanceof Error ? error.message : String(error)
+            );
+          }
+        },
+        onConnectionInterrupted(cause) {
+          recordSessionEvent(
+            session,
+            'provisioning-connection-interrupted',
+            cause ? String(cause) : undefined
+          );
+          if (
+            session.status === 'ready' ||
+            session.status === 'error' ||
+            session.status === 'linking'
+          ) {
+            return;
+          }
+          session.status = session.url ? 'closed' : 'error';
+          session.error = cause ? String(cause) : session.error;
+          touch(session);
+        },
+      },
+      { abortSignal: abortController.signal }
+    )
+    .then(result => {
+      connection = result;
+    })
+    .catch(error => {
+      if (abortController.signal.aborted) {
+        return;
+      }
+      session.status = 'error';
+      session.error = error instanceof Error ? error.stack ?? error.message : String(error);
+      touch(session);
+      recordSessionEvent(
+        session,
+        'provisioning-start-error',
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+
+  return session;
+}
+
+async function proxyToUpstream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL
+): Promise<boolean> {
+  if (!UPSTREAM_API_BASE_URL) {
+    return false;
+  }
+
+  const target = new URL(`${url.pathname}${url.search}`, UPSTREAM_API_BASE_URL);
+  const chunks = new Array<Buffer>();
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const response = await fetch(target, {
+    method: req.method,
+    headers: {
+      'content-type': req.headers['content-type'] ?? 'application/json',
+    },
+    body:
+      req.method === 'GET' || req.method === 'HEAD'
+        ? undefined
+        : Buffer.concat(chunks),
+  });
+
+  sendCors(req, res);
+  res.writeHead(response.status, {
+    'Content-Type':
+      response.headers.get('content-type') ?? 'application/octet-stream',
+  });
+  if (response.body) {
+    for await (const chunk of response.body) {
+      res.write(chunk);
+    }
+  }
+  res.end();
+  return true;
+}
+
+async function getTransferArchive(
+  chat: ChatConnection,
+  abortSignal: AbortSignal,
+  cooldownKey: string
+): Promise<
+  | { cdn: number; key: string }
+  | { error: 'RELINK_REQUESTED' | 'CONTINUE_WITHOUT_UPLOAD' | 'RATE_LIMITED' }
+  | undefined
+> {
+  const cooldownUntil = transferArchiveCooldownUntilByAccount.get(cooldownKey);
+  if (cooldownUntil != null && cooldownUntil > now()) {
+    return { error: 'RATE_LIMITED' };
+  }
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (abortSignal.aborted) {
+      return undefined;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const response = await chat.fetch({
+      verb: 'GET',
+      path: '/v1/devices/transfer_archive?timeout=10',
+      headers: [],
+      timeoutMillis: 25_000,
+    });
+    if (response.status === 204) {
+      continue;
+    }
+    const responseBody = getBodyString(response.body);
+    if (response.status === 429) {
+      transferArchiveCooldownUntilByAccount.set(
+        cooldownKey,
+        now() + 10 * 60 * 1000
+      );
+      return { error: 'RATE_LIMITED' };
+    }
+    if (response.status !== 200) {
+      throw new Error(
+        responseBody
+          ? `transfer_archive failed with status ${response.status}: ${responseBody}`
+          : `transfer_archive failed with status ${response.status}`
+      );
+    }
+    const parsed = JSON.parse(responseBody) as
+      | { cdn: number; key: string }
+      | { error: 'RELINK_REQUESTED' | 'CONTINUE_WITHOUT_UPLOAD' | 'RATE_LIMITED' };
+    return parsed;
+  }
+  return undefined;
+}
+
+async function downloadEphemeralBackup({
+  archive,
+  abortSignal,
+}: {
+  archive: { cdn: number; key: string };
+  abortSignal: AbortSignal;
+}): Promise<Buffer> {
+  const baseUrl =
+    productionConfig.cdn[String(archive.cdn)] ?? productionConfig.cdn['0'];
+  if (!baseUrl) {
+    throw new Error(`CDN ${archive.cdn} is not configured`);
+  }
+  const url = new URL(`/attachments/${encodeURIComponent(archive.key)}`, baseUrl);
+  try {
+    const response = await fetch(url, { signal: abortSignal });
+    if (!response.ok) {
+      throw new Error(
+        `ephemeral backup download failed with status ${response.status}: ${await response.text()}`
+      );
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    if (!ALLOW_INSECURE_CDN_TLS) {
+      throw error;
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = https.get(
+      url,
+      { rejectUnauthorized: false },
+      response => {
+        const chunks = new Array<Buffer>();
+        response.on('data', chunk => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.on('end', () => {
+          const body = Buffer.concat(chunks);
+          const statusCode = response.statusCode ?? 0;
+          if (statusCode < 200 || statusCode >= 300) {
+            reject(
+              new Error(
+                `ephemeral backup download failed with status ${statusCode}: ${body.toString('utf8')}`
+              )
+            );
+            return;
+          }
+          resolve(body);
+        });
+      }
+    );
+    request.on('error', reject);
+    abortSignal.addEventListener(
+      'abort',
+      () => {
+        request.destroy(new Error('Aborted'));
+      },
+      { once: true }
+    );
+  });
+}
+
+const BACKUP_CDN_READ_CREDENTIALS_VALID_MS = 12 * 60 * 60 * 1000;
+const BACKUP_MEDIA_AES_KEY_LEN = 32;
+const BACKUP_MEDIA_MAC_KEY_LEN = 32;
+const ATTACHMENT_SESSION_READY_TIMEOUT_MS = 10_000;
+const ATTACHMENT_SESSION_READY_POLL_MS = 100;
+
+type BackupCredentialsResponseBody = Readonly<{
+  credentials?: Readonly<{
+    media?: ReadonlyArray<
+      Readonly<{
+        credential?: string;
+        redemptionTime?: number;
+      }>
+    >;
+  }>;
+}>;
+
+type BackupInfoResponseBody = Readonly<{
+  backupDir?: string;
+  mediaDir?: string;
+}>;
+
+type BackupListMediaResponseBody = Readonly<{
+  backupDir?: string;
+  mediaDir?: string;
+  cursor?: string | null;
+  storedMediaObjects?: ReadonlyArray<
+    Readonly<{
+      cdn?: number;
+      mediaId?: string;
+      objectLength?: number;
+    }>
+  >;
+}>;
+
+type BackupCdnCredentialsResponseBody = Readonly<{
+  headers?: Record<string, string>;
+}>;
+
+type RemoteConfigResponseBody = Readonly<{
+  config?: Record<string, string>;
+}>;
+
+function getBasicAuthorization(credentials: LinkedPayload['credentials']): string {
+  return `Basic ${Buffer.from(
+    `${credentials.username}:${credentials.password}`
+  ).toString('base64')}`;
+}
+
+async function fetchSignalJson<T>({
+  authenticatedCredentials,
+  body,
+  chat,
+  headers,
+  method = 'GET',
+  path,
+}: Readonly<{
+  authenticatedCredentials?: LinkedPayload['credentials'];
+  body?: unknown;
+  chat?: ChatConnection;
+  headers?: Record<string, string>;
+  method?: 'GET' | 'PUT';
+  path: string;
+}>): Promise<T> {
+  const bodyBytes =
+    body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8');
+  const requestHeaders = {
+    ...(bodyBytes
+      ? {
+          'content-type': 'application/json',
+        }
+      : null),
+    ...headers,
+  };
+  if (chat) {
+    const response = await chat.fetch({
+      verb: method,
+      path,
+      headers: Object.entries(requestHeaders),
+      body: bodyBytes,
+      timeoutMillis: 30_000,
+    });
+    const responseBody = getBodyString(response.body);
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(
+        responseBody
+          ? `${path} failed with status ${response.status}: ${responseBody}`
+          : `${path} failed with status ${response.status}`
+      );
+    }
+    return (responseBody ? JSON.parse(responseBody) : undefined) as T;
+  }
+
+  const url = new URL(path, productionConfig.serverUrl);
+  const response = await nodeFetch(url, {
+    headers: {
+      'User-Agent': getUserAgent(packageJson.version),
+      'X-Signal-Agent': 'OWD',
+      ...requestHeaders,
+      ...(authenticatedCredentials
+        ? {
+            Authorization: getBasicAuthorization(authenticatedCredentials),
+          }
+        : null),
+    },
+    body: bodyBytes,
+    method,
+  });
+  const responseBody = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      responseBody
+        ? `${path} failed with status ${response.status}: ${responseBody}`
+        : `${path} failed with status ${response.status}`
+    );
+  }
+  return (responseBody ? JSON.parse(responseBody) : undefined) as T;
+}
+
+function getLatestAttachmentStreamSession(): MessageStreamSession | undefined {
+  return [...streamSessions.values()]
+    .filter(session => session.status === 'open' && session.linkedPayload)
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+}
+
+function getAttachmentStreamSession(sessionId: string | null): MessageStreamSession | undefined {
+  if (sessionId) {
+    return streamSessions.get(sessionId) ?? getLatestAttachmentStreamSession();
+  }
+  return getLatestAttachmentStreamSession();
+}
+
+async function waitForAttachmentStreamSession(
+  sessionId: string | null
+): Promise<MessageStreamSession | undefined> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < ATTACHMENT_SESSION_READY_TIMEOUT_MS) {
+    const streamSession = getAttachmentStreamSession(sessionId);
+    if (!streamSession) {
+      return undefined;
+    }
+    if (streamSession.connection && streamSession.linkedPayload) {
+      return streamSession;
+    }
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, ATTACHMENT_SESSION_READY_POLL_MS);
+    });
+  }
+  return getAttachmentStreamSession(sessionId);
+}
+
+async function getBackupUnauthConnection(
+  streamSession: MessageStreamSession
+): Promise<UnauthenticatedChatConnection> {
+  if (streamSession.backupUnauthConnection) {
+    return streamSession.backupUnauthConnection;
+  }
+  const { Net } = await getSignalModules();
+  const net = createNet(Net);
+  const connection = await net.connectUnauthenticatedChat(
+    {
+      onConnectionInterrupted() {
+        streamSession.backupUnauthConnection = undefined;
+      },
+    },
+    { languages: ['zh-CN', 'en-US'] }
+  );
+  streamSession.backupUnauthConnection = connection;
+  return connection;
+}
+
+function getMediaRootBackupKey(linkedPayload: LinkedPayload): BackupKey {
+  const mediaRootBackupKeyBase64 = linkedPayload.mediaRootBackupKeyBase64;
+  if (!mediaRootBackupKeyBase64) {
+    throw new Error('Linked payload is missing mediaRootBackupKeyBase64');
+  }
+  return new BackupKey(Bytes.fromBase64(mediaRootBackupKeyBase64));
+}
+
+function getBackupMediaId({
+  keyBase64,
+  mediaRootKey,
+  plaintextHash,
+}: Readonly<{
+  keyBase64: string;
+  mediaRootKey: BackupKey;
+  plaintextHash: string;
+}>): { bytes: Uint8Array<ArrayBuffer>; string: string } {
+  const mediaName = Bytes.toHex(
+    Bytes.concatenate([Bytes.fromHex(plaintextHash), Bytes.fromBase64(keyBase64)])
+  );
+  const mediaIdBytes = mediaRootKey.deriveMediaId(mediaName);
+  return {
+    bytes: mediaIdBytes,
+    string: Bytes.toBase64url(mediaIdBytes),
+  };
+}
+
+function deriveBackupMediaOuterEncryptionKeyMaterial(
+  mediaRootKey: BackupKey,
+  mediaId: Uint8Array<ArrayBuffer>
+): {
+  aesKey: Uint8Array<ArrayBuffer>;
+  macKey: Uint8Array<ArrayBuffer>;
+} {
+  const material = mediaRootKey.deriveMediaEncryptionKey(mediaId);
+  return {
+    macKey: material.subarray(0, BACKUP_MEDIA_MAC_KEY_LEN),
+    aesKey: material.subarray(
+      BACKUP_MEDIA_MAC_KEY_LEN,
+      BACKUP_MEDIA_MAC_KEY_LEN + BACKUP_MEDIA_AES_KEY_LEN
+    ),
+  };
+}
+
+async function getBackupPresentationHeaders(
+  streamSession: MessageStreamSession,
+  linkedPayload: LinkedPayload
+): Promise<Record<string, string>> {
+  if (
+    streamSession.backupPresentationHeaders &&
+    streamSession.backupPresentationHeaders.retrievedAtMs >
+      Date.now() - DAY
+  ) {
+    return streamSession.backupPresentationHeaders.headers;
+  }
+
+  const mediaRootKey = getMediaRootBackupKey(linkedPayload);
+  if (!streamSession.connection) {
+    throw new Error('Message runtime session is missing chat connection');
+  }
+  const aci = normalizeAci(
+    linkedPayload.credentials.aci,
+    'getBackupPresentationHeaders.aci'
+  ) as AciString;
+  const requestContext = BackupAuthCredentialRequestContext.create(
+    mediaRootKey.serialize(),
+    aci
+  );
+  const startDayInMs = toDayMillis(Date.now());
+  const endDayInMs = toDayMillis(Date.now() + 6 * DAY);
+  const response = await fetchSignalJson<BackupCredentialsResponseBody>({
+    authenticatedCredentials: linkedPayload.credentials,
+    chat: streamSession.connection,
+    path:
+      `/v1/archives/auth?redemptionStartSeconds=${startDayInMs / 1000}` +
+      `&redemptionEndSeconds=${endDayInMs / 1000}`,
+  });
+  const rawCredential = response.credentials?.media?.find(
+    credential => credential.redemptionTime != null &&
+      credential.redemptionTime * 1000 === startDayInMs
+  );
+  if (!rawCredential?.credential || rawCredential.redemptionTime == null) {
+    throw new Error('Backup media credentials do not include today');
+  }
+
+  const serverPublicParams = new GenericServerPublicParams(
+    Bytes.fromBase64(productionConfig.backupServerPublicParams)
+  );
+  const credential = requestContext.receive(
+    new BackupAuthCredentialResponse(Bytes.fromBase64(rawCredential.credential)),
+    DurationInSeconds.fromSeconds(rawCredential.redemptionTime),
+    serverPublicParams
+  );
+  const presentation = credential.present(serverPublicParams).serialize();
+  const signatureKey = mediaRootKey.deriveEcKey(toAciObject(aci));
+  const signature = signatureKey.sign(presentation);
+  const headers = {
+    'X-Signal-ZK-Auth': Bytes.toBase64(presentation),
+    'X-Signal-ZK-Auth-Signature': Bytes.toBase64(signature),
+  };
+  if (!streamSession.backupMediaSignatureKeyUploaded) {
+    const unauthConnection = await getBackupUnauthConnection(streamSession);
+    await fetchSignalJson<void>({
+      body: {
+        backupIdPublicKey: Bytes.toBase64(
+          signatureKey.getPublicKey().serialize()
+        ),
+      },
+      chat: unauthConnection,
+      headers,
+      method: 'PUT',
+      path: '/v1/archives/keys',
+    });
+    streamSession.backupMediaSignatureKeyUploaded = true;
+  }
+  streamSession.backupPresentationHeaders = {
+    headers,
+    retrievedAtMs: Date.now(),
+  };
+  return headers;
+}
+
+async function getBackupArchiveInfo(
+  streamSession: MessageStreamSession,
+  linkedPayload: LinkedPayload
+): Promise<BackupArchiveInfo> {
+  if (streamSession.backupArchiveInfo) {
+    return streamSession.backupArchiveInfo;
+  }
+  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const unauthConnection = await getBackupUnauthConnection(streamSession);
+  const response = await fetchSignalJson<BackupInfoResponseBody>({
+    chat: unauthConnection,
+    headers,
+    path: '/v1/archives',
+  });
+  if (!response.backupDir || !response.mediaDir) {
+    throw new Error('/v1/archives response is missing backupDir or mediaDir');
+  }
+  streamSession.backupArchiveInfo = {
+    backupDir: response.backupDir,
+    mediaDir: response.mediaDir,
+  };
+  return streamSession.backupArchiveInfo;
+}
+
+async function findBackupMediaLocation({
+  linkedPayload,
+  mediaId,
+  streamSession,
+}: Readonly<{
+  linkedPayload: LinkedPayload;
+  mediaId: string;
+  streamSession: MessageStreamSession;
+}>): Promise<BackupMediaLocation | undefined> {
+  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const unauthConnection = await getBackupUnauthConnection(streamSession);
+  let cursor: string | undefined;
+  do {
+    const params = new URLSearchParams({ limit: '1000' });
+    if (cursor) {
+      params.set('cursor', cursor);
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const response = await fetchSignalJson<BackupListMediaResponseBody>({
+      chat: unauthConnection,
+      headers,
+      path: `/v1/archives/media?${params.toString()}`,
+    });
+    if (response.backupDir && response.mediaDir) {
+      streamSession.backupArchiveInfo = {
+        backupDir: response.backupDir,
+        mediaDir: response.mediaDir,
+      };
+    }
+    const storedObject = response.storedMediaObjects?.find(
+      item => item.mediaId === mediaId
+    );
+    if (
+      storedObject?.cdn != null &&
+      response.backupDir &&
+      response.mediaDir
+    ) {
+      return {
+        backupDir: response.backupDir,
+        mediaDir: response.mediaDir,
+        cdnNumber: storedObject.cdn,
+      };
+    }
+    cursor = response.cursor ?? undefined;
+  } while (cursor);
+  return undefined;
+}
+
+async function getBackupCdnReadHeaders({
+  cdnNumber,
+  linkedPayload,
+  streamSession,
+}: Readonly<{
+  cdnNumber: number;
+  linkedPayload: LinkedPayload;
+  streamSession: MessageStreamSession;
+}>): Promise<Record<string, string>> {
+  const cached = streamSession.backupCdnReadCredentials?.[cdnNumber];
+  if (
+    cached &&
+    cached.retrievedAtMs > Date.now() - BACKUP_CDN_READ_CREDENTIALS_VALID_MS
+  ) {
+    return cached.headers;
+  }
+
+  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const unauthConnection = await getBackupUnauthConnection(streamSession);
+  const response = await fetchSignalJson<BackupCdnCredentialsResponseBody>({
+    chat: unauthConnection,
+    headers,
+    path: `/v1/archives/auth/read?cdn=${cdnNumber}`,
+  });
+  if (!response.headers) {
+    throw new Error('/v1/archives/auth/read response is missing headers');
+  }
+  streamSession.backupCdnReadCredentials = {
+    ...streamSession.backupCdnReadCredentials,
+    [cdnNumber]: {
+      headers: response.headers,
+      retrievedAtMs: Date.now(),
+    },
+  };
+  return response.headers;
+}
+
+async function getRemoteConfigValue({
+  key,
+  streamSession,
+}: Readonly<{
+  key: string;
+  streamSession: MessageStreamSession;
+}>): Promise<string | undefined> {
+  if (
+    !streamSession.remoteConfig ||
+    streamSession.remoteConfig.retrievedAtMs < Date.now() - 2 * 60 * 60 * 1000
+  ) {
+    if (!streamSession.connection) {
+      throw new Error('Message runtime session is missing chat connection');
+    }
+    const response = await fetchSignalJson<RemoteConfigResponseBody>({
+      chat: streamSession.connection,
+      path: '/v2/config',
+    });
+    streamSession.remoteConfig = {
+      values: response.config ?? {},
+      retrievedAtMs: Date.now(),
+    };
+  }
+  return streamSession.remoteConfig.values[key];
+}
+
+async function getFallbackBackupCdnNumber(
+  streamSession: MessageStreamSession
+): Promise<number> {
+  const rawValue = await getRemoteConfigValue({
+    key: 'global.backups.mediaTierFallbackCdnNumber',
+    streamSession,
+  });
+  const cdnNumber = rawValue == null ? NaN : Number.parseInt(rawValue, 10);
+  if (!Number.isInteger(cdnNumber)) {
+    throw new Error('global.backups.mediaTierFallbackCdnNumber must be set');
+  }
+  return cdnNumber;
+}
+
+async function fetchBackupMediaStream({
+  backupDir,
+  cdnNumber,
+  headers,
+  mediaDir,
+  mediaId,
+}: Readonly<{
+  backupDir: string;
+  cdnNumber: number;
+  headers: Record<string, string>;
+  mediaDir: string;
+  mediaId: string;
+}>): Promise<Readable> {
+  const baseUrl =
+    productionConfig.cdn[String(cdnNumber)] ?? productionConfig.cdn['0'];
+  if (!baseUrl) {
+    throw new Error(`CDN ${cdnNumber} is not configured`);
+  }
+  const url = new URL(
+    `/backups/${encodeURIComponent(backupDir)}/${encodeURIComponent(
+      mediaDir
+    )}/${encodeURIComponent(mediaId)}`,
+    baseUrl
+  );
+  const response = await nodeFetch(url, {
+    headers,
+    method: 'GET',
+  });
+  if (!response.ok) {
+    const responseBody = await response.text();
+    throw new Error(
+      responseBody
+        ? `backup media download failed with status ${response.status}: ${responseBody}`
+        : `backup media download failed with status ${response.status}`
+    );
+  }
+  if (!response.body) {
+    throw new Error('backup media download response is missing body');
+  }
+  return response.body as unknown as Readable;
+}
+
+async function importBackupForMessageStream({
+  abortSignal,
+  chat,
+  cooldownKey,
+  linkedPayload,
+  streamSession,
+  writeEvent,
+}: {
+  abortSignal: AbortSignal;
+  chat: ChatConnection;
+  cooldownKey: string;
+  linkedPayload: LinkedPayload | undefined;
+  streamSession: MessageStreamSession;
+  writeEvent: (event: unknown) => void;
+}): Promise<void> {
+  if (!linkedPayload?.ephemeralBackupKeyBase64) {
+    streamSession.backupImportStatus = 'missing';
+    streamSession.backupImportError = 'Linked payload does not include ephemeral backup key';
+    streamSession.updatedAt = now();
+    writeEvent({
+      type: 'error',
+      error: streamSession.backupImportError,
+    });
+    return;
+  }
+
+  try {
+    streamSession.backupImportStatus = 'waiting-for-archive';
+    streamSession.updatedAt = now();
+    writeEvent({ type: 'backup-import-status', status: 'waiting-for-archive' });
+
+    const archive = await getTransferArchive(chat, abortSignal, cooldownKey);
+    if (!archive) {
+      streamSession.backupImportStatus = 'missing';
+      streamSession.backupImportError = 'Timed out waiting for transfer archive';
+      streamSession.updatedAt = now();
+      const cached = getPersistedBackupImportEntry(linkedPayload, cooldownKey);
+      if (cached) {
+        emitPersistedBackupImportEntry({
+          entry: cached,
+          linkedPayload,
+          streamSession,
+          writeEvent,
+        });
+      }
+      writeEvent({
+        type: 'backup-import-status',
+        status: 'missing',
+        error: streamSession.backupImportError,
+      });
+      return;
+    }
+    if ('error' in archive) {
+      streamSession.backupImportStatus = 'missing';
+      streamSession.backupImportError =
+        archive.error === 'RATE_LIMITED'
+          ? 'transfer_archive is rate limited; using existing local chat state'
+          : archive.error;
+      streamSession.updatedAt = now();
+      const cached = getPersistedBackupImportEntry(linkedPayload, cooldownKey);
+      if (cached) {
+        emitPersistedBackupImportEntry({
+          entry: cached,
+          linkedPayload,
+          streamSession,
+          writeEvent,
+        });
+      }
+      writeEvent({
+        type: 'backup-import-status',
+        status: 'missing',
+        error: streamSession.backupImportError,
+      });
+      return;
+    }
+
+    streamSession.backupImportStatus = 'downloading';
+    streamSession.updatedAt = now();
+    writeEvent({ type: 'backup-import-status', status: 'downloading' });
+    const backupBytes = await downloadEphemeralBackup({ archive, abortSignal });
+
+    streamSession.backupImportStatus = 'importing';
+    streamSession.updatedAt = now();
+    writeEvent({
+      type: 'backup-import-status',
+      status: 'importing',
+      bytes: backupBytes.byteLength,
+    });
+    const result = await importEphemeralBackup({
+      createBackupStream: () => Readable.from(backupBytes),
+      linkedPayload,
+    });
+    if (result.mediaRootBackupKeyBase64) {
+      streamSession.linkedPayload = {
+        ...linkedPayload,
+        mediaRootBackupKeyBase64: result.mediaRootBackupKeyBase64,
+      };
+      const provisioningSession = [...sessions.values()].find(session => {
+        const sessionAci =
+          session.linkedPayload?.credentials.aci ??
+          session.linkedPayload?.account.aci;
+        const streamAci =
+          streamSession.linkedPayload?.credentials.aci ??
+          streamSession.linkedPayload?.account.aci;
+        return streamAci != null && sessionAci === streamAci;
+      });
+      if (provisioningSession) {
+        provisioningSession.linkedPayload = streamSession.linkedPayload;
+        touch(provisioningSession);
+      }
+      writeEvent({
+        type: 'linked-session-updated',
+        linkedPayload: streamSession.linkedPayload,
+      });
+    }
+
+    savePersistedBackupImportEntry({
+      fallback: cooldownKey,
+      linkedPayload: streamSession.linkedPayload ?? linkedPayload,
+      value: {
+        updatedAt: now(),
+        contactsBootstrap: result.contactsBootstrap,
+        chatShell: result.chatShell,
+        mediaRootBackupKeyBase64: result.mediaRootBackupKeyBase64,
+        stats: result.stats,
+      },
+    });
+    streamSession.backupImportStatus = 'done';
+    streamSession.backupImportStats = result.stats;
+    streamSession.updatedAt = now();
+    writeEvent({ type: 'contacts-bootstrap', data: result.contactsBootstrap });
+    writeEvent({ type: 'chat-shell', state: result.chatShell });
+    writeEvent({
+      type: 'backup-import-status',
+      status: 'done',
+      stats: result.stats,
+    });
+  } catch (error) {
+    if (abortSignal.aborted) {
+      return;
+    }
+    streamSession.backupImportStatus = 'error';
+    streamSession.backupImportError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    writeEvent({
+      type: 'backup-import-status',
+      status: 'error',
+      error: streamSession.backupImportError,
+    });
+  }
+}
+
+function createGroupConversationFromMessage(
+  message: WebMessage
+): WebConversation | undefined {
+  const { groupV2 } = message;
+  if (!groupV2) {
+    return undefined;
+  }
+  const timestamp = message.receivedAt ?? message.timestamp;
+  return {
+    acceptedMessageRequest: true,
+    conversationType: 'group',
+    groupId: groupV2.id,
+    hasMessages: true,
+    id: message.conversationId,
+    lastUpdated: timestamp,
+    masterKey: groupV2.masterKey,
+    profileSharing: true,
+    publicParams: groupV2.publicParams,
+    revision: groupV2.revision,
+    secretParams: groupV2.secretParams,
+    timestamp,
+    type: 'group',
+  };
+}
+
+async function enrichConversationForGroupMessage({
+  connection,
+  linkedPayload,
+  message,
+}: Readonly<{
+  connection: AuthenticatedChatConnection;
+  linkedPayload: LinkedPayload;
+  message: WebMessage;
+}>): Promise<WebConversation | undefined> {
+  const conversation = createGroupConversationFromMessage(message);
+  if (!conversation) {
+    return undefined;
+  }
+
+  return fetchLatestGroupStateConversation({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    chat: connection,
+    conversation,
+    linkedPayload,
+    storageUrl: productionConfig.storageUrl,
+  });
+}
+
+function maybeConvertInitialGroupMessageToChange({
+  conversation,
+  linkedPayload,
+  message,
+}: Readonly<{
+  conversation: WebConversation | undefined;
+  linkedPayload: LinkedPayload;
+  message: WebMessage;
+}>): WebMessage {
+  if (
+    message.groupV2Change ||
+    !message.groupV2 ||
+    message.body ||
+    (message.attachments?.length ?? 0) > 0 ||
+    !conversation?.membersV2
+  ) {
+    return message;
+  }
+
+  const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  if (!ourAci || !conversation.membersV2.some(member => member.aci === ourAci)) {
+    return message;
+  }
+
+  return {
+    ...message,
+    body: undefined,
+    desktopType: 'group-v2-change',
+    groupV2Change: {
+      from: message.sourceServiceId as ServiceIdString | undefined,
+      details: [
+        {
+          type: 'member-add',
+          aci: ourAci as AciString,
+        },
+      ],
+    },
+  };
+}
+
+async function handleMessageStream(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const username = typeof body.username === 'string' ? body.username : undefined;
+  const password = typeof body.password === 'string' ? body.password : undefined;
+  const linkedPayload = getLinkedPayloadFromStreamBody(body);
+  const importBackup = body.importBackup !== false;
+  if (!username || !password) {
+    sendText(req, res, 401, 'Linked Signal credentials are required');
+    return;
+  }
+
+  const sessionId = randomUUID();
+  const abortController = new AbortController();
+  let connection: AuthenticatedChatConnection | undefined;
+  const streamAci = linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
+
+  for (const [existingSessionId, existingSession] of streamSessions) {
+    const existingAci =
+      existingSession.linkedPayload?.credentials?.aci ??
+      existingSession.linkedPayload?.account.aci;
+    if (
+      existingSession.username === username ||
+      (streamAci != null && existingAci === streamAci)
+    ) {
+      existingSession.status = 'closed';
+      existingSession.updatedAt = now();
+      void existingSession.disconnect().catch(() => undefined);
+      streamSessions.delete(existingSessionId);
+    }
+  }
+
+  const streamSession: MessageStreamSession = {
+    createdAt: now(),
+    updatedAt: now(),
+    username,
+    status: 'connecting',
+    backupImportStatus: 'idle',
+    incomingEnvelopeCount: 0,
+    decodedMessageCount: 0,
+    ignoredEnvelopeCount: 0,
+    queueEmptyCount: 0,
+    sendAttemptCount: 0,
+    linkedPayload,
+    disconnect: async () => {
+      abortController.abort();
+      await connection?.disconnect();
+    },
+  };
+  streamSessions.set(sessionId, streamSession);
+
+  sendCors(req, res);
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Cache-Control': 'no-store',
+    Connection: 'keep-alive',
+  });
+
+  const writeEvent = (event: unknown) => {
+    res.write(`${JSON.stringify(event)}\n`);
+    if (
+      event &&
+      typeof event === 'object' &&
+      'type' in event &&
+      event.type === 'contacts-bootstrap' &&
+      'data' in event
+    ) {
+      res.write(
+        `${JSON.stringify({ type: 'contacts', contacts: event.data })}\n`
+      );
+    }
+  };
+  streamSession.writeEvent = writeEvent;
+  const streamEventAccountKey = getStreamEventAccountKey(linkedPayload, username);
+  const writePersistedEvent = (event: MessageStreamEvent) => {
+    writeEvent(persistStreamEvent(streamEventAccountKey, event));
+  };
+
+  writeEvent({ type: 'session', sessionId });
+  writeEvent({ type: 'ready', sessionId });
+  writeEvent({ type: 'transport-status', status: 'connecting' });
+  const heartbeat = setInterval(() => {
+    writeEvent({ type: 'heartbeat' });
+  }, 25_000);
+
+  const aci = typeof body.aci === 'string' ? body.aci : undefined;
+  const number = typeof body.number === 'string' ? body.number : undefined;
+  if (aci || number) {
+    writeEvent({
+      type: 'contacts-bootstrap',
+      data: {
+        version: 1,
+        generatedAt: now(),
+        account: {
+          aci,
+          phoneNumber: number,
+          title: number,
+        },
+        selectedConversationId: aci ?? 'note-to-self',
+        storyDistributionLists: [
+          {
+            id: MY_STORY_ID,
+            name: '我的动态',
+            allowsReplies: true,
+            isBlockList: true,
+            memberServiceIds: [],
+          },
+        ],
+        pinned: [],
+        conversations: [],
+        archived: [],
+      },
+    });
+  }
+  replayPersistedStreamEvents(streamEventAccountKey, writeEvent);
+
+  try {
+    const { Net } = await getSignalModules();
+    const net = createNet(Net);
+    connection = await net.connectAuthenticatedChat(
+      username,
+      password,
+      false,
+      {
+        onIncomingMessage(envelope, timestamp, ack) {
+          streamSession.incomingEnvelopeCount += 1;
+          streamSession.updatedAt = now();
+          let didAck = false;
+          const sendAck = (statusCode: number) => {
+            if (didAck) {
+              return;
+            }
+            didAck = true;
+            ack.send(statusCode);
+          };
+          if (!linkedPayload) {
+            streamSession.lastReceiveError =
+              'decryptIncomingSignalEnvelope: missing linked payload';
+            writeEvent({
+              type: 'error',
+              error: streamSession.lastReceiveError,
+              timestamp,
+              envelopeSize: envelope.byteLength,
+            });
+            sendAck(500);
+            return;
+          }
+          void decryptIncomingSignalEnvelope({
+            envelopeBytes: envelope,
+            linkedPayload,
+          })
+            .then(async ({
+              contentSummary,
+              ignoredReason,
+              message,
+              pinMessage,
+              reaction,
+              editMessage,
+              deleteMessage,
+              unpinMessage,
+              attachmentBackfill,
+              receipt,
+              typing,
+              pollVote,
+              pollTerminate,
+              storageManifestFetchLatest,
+            }) => {
+              streamSession.lastReceiveError = undefined;
+              streamSession.updatedAt = now();
+              let conversation: WebConversation | undefined;
+              let outputMessage = message;
+              if (message?.groupV2 && connection) {
+                try {
+                  conversation = await enrichConversationForGroupMessage({
+                    connection,
+                    linkedPayload,
+                    message,
+                  });
+                  outputMessage = maybeConvertInitialGroupMessageToChange({
+                    conversation,
+                    linkedPayload,
+                    message,
+                  });
+                } catch (error) {
+                  console.warn(
+                    'message stream failed to enrich group conversation',
+                    error
+                  );
+                }
+              }
+              if (outputMessage) {
+                streamSession.decodedMessageCount += 1;
+                streamSession.lastDecodedMessageSummary = {
+                  id: outputMessage.id,
+                  conversationId: outputMessage.conversationId,
+                  direction: outputMessage.direction,
+                  timestamp: outputMessage.timestamp,
+                  bodyLength: outputMessage.body?.length ?? 0,
+                  sourceServiceId: outputMessage.sourceServiceId,
+                };
+                if (conversation) {
+                  writePersistedEvent({ type: 'conversation', conversation });
+                }
+                writePersistedEvent({ type: 'message', message: outputMessage });
+              }
+              if (pinMessage) {
+                writePersistedEvent(pinMessage);
+              }
+              if (reaction) {
+                writePersistedEvent(reaction);
+              }
+              if (editMessage) {
+                writePersistedEvent(editMessage);
+              }
+              if (deleteMessage) {
+                writePersistedEvent(deleteMessage);
+              }
+              if (unpinMessage) {
+                writePersistedEvent(unpinMessage);
+              }
+              if (attachmentBackfill) {
+                streamSession.attachmentBackfillEventCount =
+                  (streamSession.attachmentBackfillEventCount ?? 0) + 1;
+                streamSession.lastAttachmentBackfillSummary = {
+                  conversationId: attachmentBackfill.conversationId,
+                  targetAuthorAci: attachmentBackfill.targetAuthorAci,
+                  targetSentTimestamp: attachmentBackfill.targetSentTimestamp,
+                  attachmentCount: attachmentBackfill.attachments?.length ?? 0,
+                  attachmentStates: attachmentBackfill.attachments?.map(item => {
+                    if ('status' in item) {
+                      return { status: item.status };
+                    }
+                    return {
+                      contentType: item.attachment.contentType,
+                      cdnId: item.attachment.cdnId,
+                      cdnKey: item.attachment.cdnKey,
+                      cdnNumber: item.attachment.cdnNumber,
+                      size: item.attachment.size,
+                      flags: item.attachment.flags,
+                    };
+                  }),
+                  error: attachmentBackfill.error,
+                  timestamp: attachmentBackfill.timestamp,
+                };
+                writePersistedEvent(attachmentBackfill);
+              }
+              if (receipt) {
+                writePersistedEvent(receipt);
+              }
+              if (typing) {
+                writePersistedEvent(typing);
+              }
+              if (pollVote) {
+                writePersistedEvent(pollVote);
+              }
+              if (pollTerminate) {
+                writePersistedEvent(pollTerminate);
+              }
+              if (storageManifestFetchLatest && connection) {
+                void syncStorageContacts({
+                  allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+                  chat: connection,
+                  cdnUrl: getDefaultCdnUrl(),
+                  linkedPayload,
+                  storageUrl: productionConfig.storageUrl,
+                })
+                  .then(contacts => {
+                    streamSession.updatedAt = now();
+                    writePersistedEvent({
+                      type: 'contacts-bootstrap',
+                      data: contacts,
+                    });
+                  })
+                  .catch(error => {
+                    streamSession.lastReceiveError = errorToLogString(error);
+                    streamSession.updatedAt = now();
+                    writeEvent({
+                      type: 'error',
+                      error: streamSession.lastReceiveError,
+                      timestamp,
+                      envelopeSize: envelope.byteLength,
+                    });
+                  });
+              }
+              const hasModifierEvent = Boolean(
+                pinMessage ||
+                  reaction ||
+                  editMessage ||
+                  deleteMessage ||
+                  unpinMessage ||
+                  attachmentBackfill ||
+                  receipt ||
+                  typing ||
+                  pollVote ||
+                  pollTerminate ||
+                  storageManifestFetchLatest
+              );
+              if (!message && !hasModifierEvent) {
+                streamSession.ignoredEnvelopeCount += 1;
+                streamSession.lastIgnoredEnvelopeReason =
+                  ignoredReason ??
+                  'Decrypted content did not contain a supported message, edit, delete, pin, reaction, receipt, typing, or sent sync message';
+                streamSession.lastIgnoredContentSummary = contentSummary;
+              } else {
+                streamSession.decodedMessageCount +=
+                  hasModifierEvent && !message ? 1 : 0;
+              }
+              sendAck(200);
+            })
+            .catch(error => {
+              if (
+                LibSignalErrorBase.is(
+                  error,
+                  LibSignalErrorCode.DuplicatedMessage
+                )
+              ) {
+                streamSession.ignoredEnvelopeCount += 1;
+                streamSession.lastIgnoredEnvelopeReason =
+                  errorToLogString(error);
+                streamSession.updatedAt = now();
+                sendAck(200);
+                return;
+              }
+              streamSession.lastReceiveError = errorToLogString(error);
+              streamSession.updatedAt = now();
+              writeEvent({
+                type: 'error',
+                error: streamSession.lastReceiveError,
+                timestamp,
+                envelopeSize: envelope.byteLength,
+              });
+              sendAck(500);
+            });
+        },
+        onQueueEmpty() {
+          streamSession.queueEmptyCount += 1;
+          streamSession.updatedAt = now();
+          writeEvent({ type: 'queue-empty' });
+        },
+        onConnectionInterrupted(cause) {
+          streamSession.status = cause ? 'error' : 'closed';
+          streamSession.error = cause ? String(cause) : undefined;
+          streamSession.updatedAt = now();
+          writeEvent({
+            type: 'transport-status',
+            status: cause ? 'error' : 'closed',
+            error: cause ? String(cause) : undefined,
+          });
+        },
+      },
+      {
+        abortSignal: abortController.signal,
+        languages: ['zh-CN', 'en-US'],
+      }
+    );
+    streamSession.connection = connection;
+    streamSession.status = 'open';
+    streamSession.updatedAt = now();
+    writeEvent({ type: 'transport-status', status: 'open' });
+    if (importBackup) {
+      void importBackupForMessageStream({
+        abortSignal: abortController.signal,
+        chat: connection,
+        cooldownKey: streamAci ?? username,
+        linkedPayload,
+        streamSession,
+        writeEvent,
+      });
+    } else {
+      streamSession.backupImportStatus = 'skipped';
+      streamSession.backupImportError = undefined;
+      streamSession.updatedAt = now();
+      writeEvent({ type: 'backup-import-status', status: 'skipped' });
+    }
+  } catch (error) {
+    streamSession.status = 'error';
+    streamSession.error =
+      error instanceof Error ? error.stack ?? error.message : String(error);
+    streamSession.updatedAt = now();
+    writeEvent({
+      type: 'transport-status',
+      status: 'error',
+      error: streamSession.error,
+    });
+    throw error;
+  }
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    abortController.abort();
+    void connection?.disconnect().catch(() => undefined);
+    void streamSession.backupUnauthConnection
+      ?.disconnect()
+      .catch(() => undefined);
+    streamSessions.delete(sessionId);
+  });
+}
+
+async function handleMessageStreamAck(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const eventId = typeof body.eventId === 'string' ? body.eventId : undefined;
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const aci = typeof body.aci === 'string' ? body.aci : undefined;
+  if (!eventId) {
+    sendText(req, res, 400, 'Missing eventId');
+    return;
+  }
+
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  const accountKey =
+    aci ??
+    (streamSession
+      ? getStreamEventAccountKey(streamSession.linkedPayload, streamSession.username)
+      : undefined);
+  if (!accountKey) {
+    sendText(req, res, 400, 'Missing account key');
+    return;
+  }
+
+  acknowledgePersistedStreamEvent(accountKey, eventId);
+  sendJson(req, res, 200, { ok: true });
+}
+
+async function handleSendMessage(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const destinationServiceId =
+    typeof body.destinationServiceId === 'string'
+      ? body.destinationServiceId
+      : undefined;
+  const messageBody = typeof body.body === 'string' ? body.body : undefined;
+  const attachments = parseWebAttachments(body.attachments);
+  const deleteForEveryone = parseWebDeleteForEveryone(body.deleteForEveryone);
+  const pinMessage = parseWebPinMessage(body.pinMessage);
+  const unpinMessage = parseWebUnpinMessage(body.unpinMessage);
+  const quote = parseWebQuote(body.quote);
+  const isViewOnce = body.isViewOnce === true;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+  if (!destinationServiceId) {
+    sendText(req, res, 400, 'Missing destinationServiceId');
+    return;
+  }
+  const checkedDestinationServiceId = destinationServiceId;
+  if (body.unpinMessage !== undefined && !unpinMessage) {
+    sendJson(req, res, 400, {
+      error: 'Invalid unpinMessage',
+      receivedKeys: Object.keys(body),
+    });
+    return;
+  }
+  if (
+    !messageBody?.trim() &&
+    attachments.length === 0 &&
+    !pinMessage &&
+    !unpinMessage &&
+    !deleteForEveryone
+  ) {
+    sendText(req, res, 400, 'Missing body');
+    return;
+  }
+
+  try {
+      const resolvedAttachments = await resolveInlineAttachments({
+        attachments,
+        streamSession,
+      });
+      const message = await sendDirectTextMessage({
+        attachments: resolvedAttachments,
+        body: messageBody ?? '',
+        chat: streamSession.connection,
+        deleteForEveryone,
+        destinationServiceId: checkedDestinationServiceId,
+        isViewOnce,
+        linkedPayload: streamSession.linkedPayload,
+      pinMessage,
+      quote,
+      timestamp,
+      unpinMessage,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, message);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function getAttachmentUploadForm(
+  chat: AuthenticatedChatConnection,
+  uploadSize: number
+): Promise<AttachmentUploadForm> {
+  const raw = await chat.getUploadForm({
+    uploadSize: BigInt(uploadSize),
+  });
+
+  return {
+    cdn: raw.cdn,
+    key: raw.key,
+    headers: Object.fromEntries(raw.headers.entries()),
+    signedUploadLocation: raw.signedUploadUrl.toString(),
+  };
+}
+
+async function putEncryptedAttachment(
+  encryptedPath: string,
+  encryptedSize: number,
+  uploadForm: AttachmentUploadForm
+): Promise<void> {
+  if (uploadForm.cdn === 3) {
+    await tusUpload({
+      endpoint: uploadForm.signedUploadLocation,
+      headers: uploadForm.headers,
+      fileName: uploadForm.key,
+      filePath: encryptedPath,
+      fileSize: encryptedSize,
+      reader: defaultFileReader,
+      ...(ALLOW_INSECURE_CDN_TLS
+        ? {
+            fetchFn: insecureNodeFetch,
+          }
+        : null),
+    });
+    return;
+  }
+
+  const createResponse = await fetch(uploadForm.signedUploadLocation, {
+    method: 'POST',
+    headers: uploadForm.headers,
+  });
+  if (!createResponse.ok) {
+    throw new Error(
+      `putEncryptedAttachment create failed with status ${createResponse.status}: ${await createResponse.text()}`
+    );
+  }
+
+  const uploadLocation = createResponse.headers.get('location');
+  if (!uploadLocation) {
+    throw new Error('putEncryptedAttachment create response missing location');
+  }
+
+  const putResponse = await fetch(uploadLocation, {
+    method: 'PUT',
+    headers: {
+      'Content-Range': `bytes 0-*/${encryptedSize}`,
+    },
+    // oxlint-disable-next-line typescript/no-explicit-any
+    body: createReadStream(encryptedPath) as any,
+    // @ts-expect-error Node fetch requires duplex for streaming request bodies.
+    duplex: 'half',
+  });
+  if (!putResponse.ok) {
+    throw new Error(
+      `putEncryptedAttachment upload failed with status ${putResponse.status}: ${await putResponse.text()}`
+    );
+  }
+}
+
+async function handleUploadAttachment(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const dataBase64 = getOptionalString(body.dataBase64);
+  const contentType =
+    getOptionalString(body.contentType) ?? 'application/octet-stream';
+  const fileName = getOptionalString(body.fileName);
+  const declaredSize = getOptionalNumber(body.size);
+  const sessionId = getOptionalString(body.sessionId);
+  const streamSession = sessionId
+    ? streamSessions.get(sessionId)
+    : [...streamSessions.values()]
+        .filter(session => session.connection)
+        .sort((left, right) => right.createdAt - left.createdAt)[0];
+
+  if (!streamSession?.connection) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!dataBase64) {
+    sendText(req, res, 400, 'Missing dataBase64');
+    return;
+  }
+
+  const plaintext = Buffer.from(dataBase64, 'base64');
+  if (declaredSize != null && declaredSize !== plaintext.byteLength) {
+    sendText(req, res, 400, 'Attachment size does not match dataBase64');
+    return;
+  }
+
+  const attachment = await uploadAttachmentBytes({
+    contentType,
+    fileName,
+    plaintext,
+    streamSession,
+  });
+  sendJson(req, res, 200, attachment);
+}
+
+async function uploadAttachmentBytes({
+  attachment,
+  contentType,
+  fileName,
+  plaintext,
+  streamSession,
+}: Readonly<{
+  attachment?: WebAttachment;
+  contentType: string;
+  fileName?: string;
+  plaintext: Buffer;
+  streamSession: MessageStreamSession;
+}>): Promise<WebAttachment> {
+  const { connection } = streamSession;
+  if (!connection) {
+    throw new Error('Message runtime session not found');
+  }
+  await mkdir(WEB_ATTACHMENT_TMP_DIR, { recursive: true });
+  const keys = randomBytes(64);
+  const plaintextBytes = new Uint8Array(plaintext);
+  let encryptedPath: string | undefined;
+  try {
+    const encrypted = await encryptAttachmentV2ToDisk({
+      getAbsoluteAttachmentPath: relativePath =>
+        resolve(WEB_ATTACHMENT_TMP_DIR, relativePath),
+      keys,
+      needIncrementalMac: supportsIncrementalMac(contentType as MIMEType),
+      plaintext: { data: plaintextBytes },
+    });
+    encryptedPath = resolve(WEB_ATTACHMENT_TMP_DIR, encrypted.path);
+    const encryptedStats = await stat(encryptedPath);
+    const uploadForm = await getAttachmentUploadForm(
+      connection,
+      encrypted.ciphertextSize
+    );
+    await putEncryptedAttachment(
+      encryptedPath,
+      encryptedStats.size,
+      uploadForm
+    );
+
+    return {
+      ...attachment,
+      id: attachment?.id ?? randomUUID(),
+      dataBase64: undefined,
+      path: undefined,
+      url: undefined,
+      cdnKey: uploadForm.key,
+      cdnNumber: uploadForm.cdn,
+      keyBase64: Bytes.toBase64(keys),
+      digestBase64: Bytes.toBase64(encrypted.digest),
+      incrementalMacBase64: encrypted.incrementalMac
+        ? Bytes.toBase64(encrypted.incrementalMac)
+        : undefined,
+      chunkSize: encrypted.chunkSize,
+      size: attachment?.size ?? plaintext.byteLength,
+      contentType,
+      fileName,
+      status: 'ready',
+    };
+  } finally {
+    if (encryptedPath) {
+      await safeUnlink(encryptedPath);
+    }
+  }
+}
+
+async function resolveInlineAttachments({
+  attachments,
+  streamSession,
+}: Readonly<{
+  attachments: ReadonlyArray<WebAttachment>;
+  streamSession: MessageStreamSession;
+}>): Promise<ReadonlyArray<WebAttachment>> {
+  return Promise.all(
+    attachments.map(async attachment => {
+      const [thumbnail] = await resolveInlineAttachments({
+        attachments: attachment.thumbnail ? [attachment.thumbnail] : [],
+        streamSession,
+      });
+      const attachmentWithThumbnail = thumbnail
+        ? {
+            ...attachment,
+            thumbnail,
+          }
+        : attachment;
+      if (!attachmentWithThumbnail.dataBase64) {
+        return attachmentWithThumbnail;
+      }
+      const plaintext = Buffer.from(attachmentWithThumbnail.dataBase64, 'base64');
+      if (
+        attachmentWithThumbnail.size != null &&
+        attachmentWithThumbnail.size !== plaintext.byteLength
+      ) {
+        throw new Error('Inline attachment size does not match dataBase64');
+      }
+      return uploadAttachmentBytes({
+        attachment: attachmentWithThumbnail,
+        contentType: attachmentWithThumbnail.contentType ?? 'application/octet-stream',
+        fileName: attachmentWithThumbnail.fileName,
+        plaintext,
+        streamSession,
+      });
+    })
+  );
+}
+
+function getStreamSessionForProvisioningSession(
+  session: ProvisioningSession
+): MessageStreamSession | undefined {
+  const sessionAci =
+    session.linkedPayload?.credentials.aci ?? session.linkedPayload?.account.aci;
+  const sessionUsername = session.linkedPayload?.credentials.username;
+  return [...streamSessions.values()]
+    .filter(streamSession => {
+      if (streamSession.status !== 'open' || !streamSession.connection) {
+        return false;
+      }
+      const streamAci =
+        streamSession.linkedPayload?.credentials.aci ??
+        streamSession.linkedPayload?.account.aci;
+      return (
+        (sessionUsername != null && streamSession.username === sessionUsername) ||
+        (sessionAci != null && streamAci === sessionAci)
+      );
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+}
+
+async function handleImportTransfer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  session: ProvisioningSession
+): Promise<void> {
+  const streamSession = getStreamSessionForProvisioningSession(session);
+  if (!streamSession?.connection) {
+    sendText(req, res, 409, 'Message runtime session is not connected');
+    return;
+  }
+  if (!streamSession.linkedPayload) {
+    sendText(req, res, 409, 'Linked session is not ready');
+    return;
+  }
+
+  await importBackupForMessageStream({
+    abortSignal: new AbortController().signal,
+    chat: streamSession.connection,
+    cooldownKey:
+      streamSession.linkedPayload.credentials.aci ??
+      streamSession.linkedPayload.account.aci ??
+      streamSession.username,
+    linkedPayload: streamSession.linkedPayload,
+    streamSession,
+    writeEvent:
+      streamSession.writeEvent ??
+      (() => {
+        return undefined;
+      }),
+  });
+
+  if (streamSession.linkedPayload) {
+    session.linkedPayload = streamSession.linkedPayload;
+    touch(session);
+  }
+
+  sendJson(req, res, 200, {
+    sessionId: session.sessionId,
+    messageStreamSessionStatus: streamSession.status,
+    backupImportStatus: streamSession.backupImportStatus,
+    backupImportError: streamSession.backupImportError,
+    backupImportStats: streamSession.backupImportStats,
+    hasMediaRootBackupKey: Boolean(
+      streamSession.linkedPayload?.mediaRootBackupKeyBase64
+    ),
+  });
+}
+
+async function runImportTransferForStreamSession(
+  streamSession: MessageStreamSession
+): Promise<void> {
+  if (!streamSession.connection) {
+    throw new Error('Message runtime session is not connected');
+  }
+  if (!streamSession.linkedPayload) {
+    throw new Error('Linked session is not ready');
+  }
+
+  await importBackupForMessageStream({
+    abortSignal: new AbortController().signal,
+    chat: streamSession.connection,
+    cooldownKey:
+      streamSession.linkedPayload.credentials.aci ??
+      streamSession.linkedPayload.account.aci ??
+      streamSession.username,
+    linkedPayload: streamSession.linkedPayload,
+    streamSession,
+    writeEvent:
+      streamSession.writeEvent ??
+      (() => {
+        return undefined;
+      }),
+  });
+}
+
+async function handleMessageImportTransfer(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = await waitForAttachmentStreamSession(sessionId ?? null);
+  if (!streamSession) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  try {
+    await runImportTransferForStreamSession(streamSession);
+  } catch (error) {
+    sendText(
+      req,
+      res,
+      409,
+      error instanceof Error ? error.message : String(error)
+    );
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    status: streamSession.status,
+    backupImportStatus: streamSession.backupImportStatus,
+    backupImportError: streamSession.backupImportError,
+    backupImportStats: streamSession.backupImportStats,
+    hasMediaRootBackupKey: Boolean(
+      streamSession.linkedPayload?.mediaRootBackupKeyBase64
+    ),
+  });
+}
+
+async function handleSendReaction(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const destinationServiceId =
+    typeof body.destinationServiceId === 'string'
+      ? body.destinationServiceId
+      : undefined;
+  const groupId = typeof body.groupId === 'string' ? body.groupId : undefined;
+  const rawGroupV2 =
+    body.groupV2 && typeof body.groupV2 === 'object'
+      ? (body.groupV2 as { masterKey?: unknown; revision?: unknown })
+      : undefined;
+  const groupV2 =
+    rawGroupV2 &&
+    typeof rawGroupV2.masterKey === 'string' &&
+    typeof rawGroupV2.revision === 'number'
+      ? {
+          masterKey: rawGroupV2.masterKey,
+          revision: rawGroupV2.revision,
+        }
+      : undefined;
+  const recipients = Array.isArray(body.recipients)
+    ? body.recipients.filter(
+        (recipient: unknown): recipient is string => typeof recipient === 'string'
+      )
+    : [];
+  const emoji = typeof body.emoji === 'string' ? body.emoji : undefined;
+  const remove = body.remove === true;
+  const targetAuthorAci =
+    typeof body.targetAuthorAci === 'string' ? body.targetAuthorAci : undefined;
+  const targetTimestamp =
+    typeof body.targetTimestamp === 'number' ? body.targetTimestamp : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  if (!destinationServiceId && !groupId) {
+    sendText(req, res, 400, 'Missing destinationServiceId or groupId');
+    return;
+  }
+  if (groupId && !groupV2) {
+    sendText(req, res, 400, 'Missing groupV2');
+    return;
+  }
+  if (groupId && recipients.length === 0) {
+    sendText(req, res, 400, 'Missing recipients');
+    return;
+  }
+  if (!targetAuthorAci) {
+    sendText(req, res, 400, 'Missing targetAuthorAci');
+    return;
+  }
+  if (typeof targetTimestamp !== 'number') {
+    sendText(req, res, 400, 'Missing targetTimestamp');
+    return;
+  }
+  if (!remove && typeof emoji !== 'string') {
+    sendText(req, res, 400, 'Missing emoji');
+    return;
+  }
+
+  try {
+    if (groupId && groupV2) {
+      await sendGroupReaction({
+        chat: streamSession.connection,
+        emoji,
+        groupId,
+        groupV2,
+        linkedPayload: streamSession.linkedPayload,
+        recipients,
+        remove,
+        targetAuthorAci,
+        targetTimestamp,
+        timestamp,
+      });
+    } else if (destinationServiceId) {
+      await sendDirectReaction({
+        chat: streamSession.connection,
+        destinationServiceId,
+        emoji,
+        linkedPayload: streamSession.linkedPayload,
+        remove,
+        targetAuthorAci,
+        targetTimestamp,
+        timestamp,
+      });
+    }
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, { ok: true, timestamp });
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleAttachmentBackfillRequest(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const conversationId =
+    typeof body.conversationId === 'string' ? body.conversationId : undefined;
+  const conversationType =
+    body.conversationType === 'group' || body.conversationType === 'direct'
+      ? body.conversationType
+      : undefined;
+  const targetAuthorAci =
+    typeof body.targetAuthorAci === 'string' ? body.targetAuthorAci : undefined;
+  const targetSentTimestamp =
+    typeof body.targetSentTimestamp === 'number'
+      ? body.targetSentTimestamp
+      : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+
+  if (!conversationId) {
+    sendText(req, res, 400, 'Missing conversationId');
+    return;
+  }
+  if (!conversationType) {
+    sendText(req, res, 400, 'Missing conversationType');
+    return;
+  }
+  if (!targetAuthorAci) {
+    sendText(req, res, 400, 'Missing targetAuthorAci');
+    return;
+  }
+  if (typeof targetSentTimestamp !== 'number') {
+    sendText(req, res, 400, 'Missing targetSentTimestamp');
+    return;
+  }
+
+  try {
+    const result = await sendAttachmentBackfillRequestSync({
+      chat: streamSession.connection,
+      conversationId,
+      conversationType,
+      linkedPayload: streamSession.linkedPayload,
+      targetAuthorAci,
+      targetSentTimestamp,
+      timestamp,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, result);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleSendEdit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const destinationServiceId =
+    typeof body.destinationServiceId === 'string'
+      ? body.destinationServiceId
+      : undefined;
+  const messageBody = typeof body.body === 'string' ? body.body : undefined;
+  const targetTimestamp =
+    typeof body.targetTimestamp === 'number' ? body.targetTimestamp : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  if (!destinationServiceId) {
+    sendText(req, res, 400, 'Missing destinationServiceId');
+    return;
+  }
+  if (!messageBody?.trim()) {
+    sendText(req, res, 400, 'Missing body');
+    return;
+  }
+  if (typeof targetTimestamp !== 'number') {
+    sendText(req, res, 400, 'Missing targetTimestamp');
+    return;
+  }
+
+  try {
+    const result = await sendDirectEditMessage({
+      body: messageBody,
+      chat: streamSession.connection,
+      destinationServiceId,
+      linkedPayload: streamSession.linkedPayload,
+      targetTimestamp,
+      timestamp,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, result);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleSendGroupMessage(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const groupId = typeof body.groupId === 'string' ? body.groupId : undefined;
+  const messageBody = typeof body.body === 'string' ? body.body : undefined;
+  const attachments = parseWebAttachments(body.attachments);
+  const deleteForEveryone = parseWebDeleteForEveryone(body.deleteForEveryone);
+  const pinMessage = parseWebPinMessage(body.pinMessage);
+  const quote = parseWebQuote(body.quote);
+  const unpinMessage = parseWebUnpinMessage(body.unpinMessage);
+  const isViewOnce = body.isViewOnce === true;
+  const rawGroupV2 =
+    body.groupV2 && typeof body.groupV2 === 'object'
+      ? (body.groupV2 as { masterKey?: unknown; revision?: unknown })
+      : undefined;
+  const groupV2 =
+    rawGroupV2 &&
+    typeof rawGroupV2.masterKey === 'string' &&
+    typeof rawGroupV2.revision === 'number'
+      ? {
+          masterKey: rawGroupV2.masterKey,
+          revision: rawGroupV2.revision,
+        }
+      : undefined;
+  const recipients = Array.isArray(body.recipients)
+    ? body.recipients.filter(
+        (recipient: unknown): recipient is string => typeof recipient === 'string'
+      )
+    : [];
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  if (!groupId) {
+    sendText(req, res, 400, 'Missing groupId');
+    return;
+  }
+  if (!groupV2) {
+    sendText(req, res, 400, 'Missing groupV2');
+    return;
+  }
+  if (
+    !messageBody?.trim() &&
+    attachments.length === 0 &&
+    !deleteForEveryone &&
+    !pinMessage &&
+    !unpinMessage
+  ) {
+    sendText(req, res, 400, 'Missing body');
+    return;
+  }
+  if (recipients.length === 0) {
+    sendText(req, res, 400, 'Missing recipients');
+    return;
+  }
+
+  try {
+    const resolvedAttachments = await resolveInlineAttachments({
+      attachments,
+      streamSession,
+    });
+    const message = await sendGroupTextMessage({
+      attachments: resolvedAttachments,
+      body: messageBody ?? '',
+      chat: streamSession.connection,
+      deleteForEveryone,
+      groupId,
+      groupV2,
+      isViewOnce,
+      linkedPayload: streamSession.linkedPayload,
+      pinMessage,
+      quote,
+      recipients,
+      timestamp,
+      unpinMessage,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, message);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+function parseWebGroupMemberModifyAction(
+  value: unknown
+): WebGroupMemberModifyAction | undefined {
+  if (
+    value === 'add' ||
+    value === 'make-admin' ||
+    value === 'make-member' ||
+    value === 'remove'
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function parseWebGroupSettingsModifyAction(
+  value: unknown
+): WebGroupSettingsModifyAction | undefined {
+  if (
+    value === 'access-control-add-from-invite-link' ||
+    value === 'access-control-attributes' ||
+    value === 'access-control-members' ||
+    value === 'access-control-member-label' ||
+    value === 'announcements-only' ||
+    value === 'description' ||
+    value === 'title'
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function parseWebGroupConversation(value: unknown): WebConversation | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.masterKey !== 'string' ||
+    typeof record.publicParams !== 'string' ||
+    typeof record.secretParams !== 'string'
+  ) {
+    return undefined;
+  }
+  return record as WebConversation;
+}
+
+function parseWebConversation(value: unknown): WebConversation | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.id !== 'string') {
+    return undefined;
+  }
+  return record as WebConversation;
+}
+
+async function handleModifyGroupMember(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const action = parseWebGroupMemberModifyAction(body.action);
+  const conversation = parseWebGroupConversation(body.conversation);
+  const targetConversation = parseWebConversation(body.targetConversation);
+  const targetServiceId =
+    typeof body.targetServiceId === 'string' ? body.targetServiceId : undefined;
+  const recipients = Array.isArray(body.recipients)
+    ? body.recipients.filter(
+        (recipient: unknown): recipient is string => typeof recipient === 'string'
+      )
+    : [];
+
+  if (!action) {
+    sendText(req, res, 400, 'Missing action');
+    return;
+  }
+  if (!conversation) {
+    sendText(req, res, 400, 'Missing conversation');
+    return;
+  }
+  if (typeof conversation.revision !== 'number') {
+    sendText(req, res, 400, 'Missing conversation revision');
+    return;
+  }
+  if (!targetServiceId) {
+    sendText(req, res, 400, 'Missing targetServiceId');
+    return;
+  }
+  if (action === 'add' && !targetConversation) {
+    sendText(req, res, 400, 'Missing targetConversation');
+    return;
+  }
+  if (recipients.length === 0) {
+    sendText(req, res, 400, 'Missing recipients');
+    return;
+  }
+  const { masterKey } = conversation;
+  if (!masterKey) {
+    sendText(req, res, 400, 'Missing conversation masterKey');
+    return;
+  }
+
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  try {
+    const result = await modifyGroupMember({
+      action,
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      chat: streamSession.connection,
+      conversation,
+      linkedPayload: streamSession.linkedPayload,
+      storageUrl: productionConfig.storageUrl,
+      targetConversation,
+      targetServiceId: targetServiceId as ServiceIdString,
+    });
+    try {
+      await sendGroupUpdateMessage({
+        chat: streamSession.connection,
+        groupChangeBase64: result.groupChangeBase64,
+        groupId: String(conversation.groupId ?? conversation.id),
+        groupV2: {
+          masterKey,
+          revision: result.revision,
+        },
+        linkedPayload: streamSession.linkedPayload,
+        recipients,
+        timestamp: now(),
+      });
+    } catch (error) {
+      console.warn(
+        'handleGroupMember: group state updated, but failed to send group update message',
+        errorToLogString(error)
+      );
+    }
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, result);
+  } catch (error) {
+    if (
+      action === 'add' &&
+      error instanceof Error &&
+      error.message.includes('adding member already in group')
+    ) {
+      streamSession.lastSendError = undefined;
+      streamSession.updatedAt = now();
+      sendJson(req, res, 200, {
+        groupChangeBase64: '',
+        revision: conversation.revision,
+      });
+      return;
+    }
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleModifyGroupSettings(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const action = parseWebGroupSettingsModifyAction(body.action);
+  const conversation = parseWebGroupConversation(body.conversation);
+  const recipients = Array.isArray(body.recipients)
+    ? body.recipients.filter(
+        (recipient: unknown): recipient is string => typeof recipient === 'string'
+      )
+    : [];
+  const { value } = body;
+
+  if (!action) {
+    sendText(req, res, 400, 'Missing action');
+    return;
+  }
+  if (!conversation) {
+    sendText(req, res, 400, 'Missing conversation');
+    return;
+  }
+  if (typeof conversation.revision !== 'number') {
+    sendText(req, res, 400, 'Missing conversation revision');
+    return;
+  }
+  if (
+    typeof value !== 'boolean' &&
+    typeof value !== 'number' &&
+    typeof value !== 'string'
+  ) {
+    sendText(req, res, 400, 'Missing value');
+    return;
+  }
+  if (recipients.length === 0) {
+    sendText(req, res, 400, 'Missing recipients');
+    return;
+  }
+  const { masterKey } = conversation;
+  if (!masterKey) {
+    sendText(req, res, 400, 'Missing conversation masterKey');
+    return;
+  }
+
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  try {
+    const result = await modifyGroupSettings({
+      action,
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      chat: streamSession.connection,
+      conversation,
+      linkedPayload: streamSession.linkedPayload,
+      storageUrl: productionConfig.storageUrl,
+      value,
+    });
+    try {
+      await sendGroupUpdateMessage({
+        chat: streamSession.connection,
+        groupChangeBase64: result.groupChangeBase64,
+        groupId: String(conversation.groupId ?? conversation.id),
+        groupV2: {
+          masterKey,
+          revision: result.revision,
+        },
+        linkedPayload: streamSession.linkedPayload,
+        recipients,
+        timestamp: now(),
+      });
+    } catch (error) {
+      console.warn(
+        'handleGroupSettings: group state updated, but failed to send group update message',
+        errorToLogString(error)
+      );
+    }
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, result);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleMessageRequestResponse(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const threadAci =
+    typeof body.threadAci === 'string' ? body.threadAci : undefined;
+  const responseType = typeof body.type === 'number' ? body.type : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+  if (!threadAci) {
+    sendText(req, res, 400, 'Missing threadAci');
+    return;
+  }
+  if (typeof responseType !== 'number') {
+    sendText(req, res, 400, 'Missing type');
+    return;
+  }
+
+  try {
+    const result = await sendMessageRequestResponseSync({
+      chat: streamSession.connection,
+      linkedPayload: streamSession.linkedPayload,
+      threadAci,
+      timestamp,
+      type: responseType,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    sendJson(req, res, 200, result);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    console.warn(
+      'handleMessageRequestResponse: local response applied, but sync failed',
+      error
+    );
+    sendJson(req, res, 200, {
+      threadAci,
+      timestamp,
+      type: responseType,
+      syncError: errorToLogString(error),
+    });
+  }
+}
+
+async function handleContactsSync(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (streamSession?.connection && streamSession.linkedPayload) {
+    const contacts = await syncStorageContacts({
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      chat: streamSession.connection,
+      cdnUrl: getDefaultCdnUrl(),
+      linkedPayload: streamSession.linkedPayload,
+      storageUrl: productionConfig.storageUrl,
+    });
+    sendJson(req, res, 200, contacts);
+    return;
+  }
+
+  const username = typeof body.username === 'string' ? body.username : undefined;
+  const password = typeof body.password === 'string' ? body.password : undefined;
+  const storageServiceKey =
+    typeof body.storageServiceKey === 'string'
+      ? body.storageServiceKey
+      : undefined;
+  const aci = typeof body.aci === 'string' ? body.aci : undefined;
+  const pni = typeof body.pni === 'string' ? body.pni : undefined;
+  const number = typeof body.number === 'string' ? body.number : undefined;
+  if (!username || !password || !storageServiceKey || !aci || !number) {
+    sendText(
+      req,
+      res,
+      404,
+      'Message runtime session not found, and direct credentials are incomplete'
+    );
+    return;
+  }
+  const deviceId = Number(username.split('.')[1]);
+  if (!Number.isInteger(deviceId)) {
+    sendText(req, res, 400, 'Invalid username device id');
+    return;
+  }
+
+  const { Net } = await getSignalModules();
+  const net = createNet(Net);
+  let connection: AuthenticatedChatConnection | undefined;
+  try {
+    connection = await net.connectAuthenticatedChat(
+      username,
+      password,
+      false,
+      {
+        onIncomingMessage(_envelope, _timestamp, ack) {
+          ack.send(200);
+        },
+        onQueueEmpty() {},
+        onConnectionInterrupted() {},
+      },
+      {
+        languages: ['zh-CN', 'en-US'],
+      }
+    );
+    const contacts = await syncStorageContacts({
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      chat: connection,
+      cdnUrl: getDefaultCdnUrl(),
+      linkedPayload: {
+        account: {
+          aci,
+          pni,
+          number,
+          phoneNumber: number,
+          title: number,
+        },
+        credentials: {
+          username,
+          password,
+          deviceId,
+          aci,
+          pni,
+          number,
+        },
+        storageServiceKey,
+      },
+      storageUrl: productionConfig.storageUrl,
+    });
+    sendJson(req, res, 200, contacts);
+  } finally {
+    await connection?.disconnect();
+  }
+}
+
+async function handleAttachment(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL
+): Promise<void> {
+  const cdnKey = url.searchParams.get('cdnKey');
+  const cdnId = url.searchParams.get('cdnId');
+  const transitKey = cdnKey ?? cdnId;
+  const cdnNumber = url.searchParams.get('cdnNumber') ?? '0';
+  const contentType = url.searchParams.get('contentType') ?? 'application/octet-stream';
+  const fileName = url.searchParams.get('fileName');
+  const keyBase64 = url.searchParams.get('keyBase64');
+  const digestBase64 = url.searchParams.get('digestBase64');
+  const plaintextHash = url.searchParams.get('plaintextHash');
+  const incrementalMacBase64 = url.searchParams.get('incrementalMacBase64');
+  const chunkSizeParam = url.searchParams.get('chunkSize');
+  const chunkSize = chunkSizeParam != null ? Number(chunkSizeParam) : undefined;
+  const sizeParam = url.searchParams.get('size');
+  const size = sizeParam != null ? Number(sizeParam) : undefined;
+  const backupCdnNumberParam = url.searchParams.get('backupCdnNumber');
+  const backupCdnNumber =
+    backupCdnNumberParam != null ? Number(backupCdnNumberParam) : undefined;
+  const sessionId = url.searchParams.get('sessionId');
+  const backupFields =
+    keyBase64 && plaintextHash && size != null
+      ? {
+          keyBase64,
+          plaintextHash,
+          size,
+        }
+      : undefined;
+  async function writeBackupTierAttachment(): Promise<void> {
+    if (!backupFields) {
+      sendText(
+        req,
+        res,
+        400,
+        'Missing cdnKey or cdnId and backup media fields'
+      );
+      return;
+    }
+    const streamSession = await waitForAttachmentStreamSession(sessionId);
+    if (!streamSession?.linkedPayload) {
+      if (transitKey) {
+        throw new Error('Message runtime session not found');
+      }
+      sendText(req, res, 404, 'Message runtime session not found');
+      return;
+    }
+    if (!streamSession.connection) {
+      if (transitKey) {
+        throw new Error('Message runtime session is not connected');
+      }
+      sendText(req, res, 503, 'Message runtime session is not connected');
+      return;
+    }
+
+    const mediaRootKey = getMediaRootBackupKey(streamSession.linkedPayload);
+    const mediaId = getBackupMediaId({
+      keyBase64: backupFields.keyBase64,
+      mediaRootKey,
+      plaintextHash: backupFields.plaintextHash,
+    });
+    const archiveInfo = await getBackupArchiveInfo(
+      streamSession,
+      streamSession.linkedPayload
+    );
+    const location =
+      backupCdnNumber != null
+        ? {
+            ...archiveInfo,
+            cdnNumber: backupCdnNumber,
+          }
+        : await findBackupMediaLocation({
+            linkedPayload: streamSession.linkedPayload,
+            mediaId: mediaId.string,
+            streamSession,
+          });
+    const resolvedLocation =
+      location ??
+      {
+        ...archiveInfo,
+        cdnNumber: await getFallbackBackupCdnNumber(streamSession),
+      };
+
+    const backupReadHeaders = await getBackupCdnReadHeaders({
+      cdnNumber: resolvedLocation.cdnNumber,
+      linkedPayload: streamSession.linkedPayload,
+      streamSession,
+    });
+    const backupMediaStream = await fetchBackupMediaStream({
+      backupDir: resolvedLocation.backupDir,
+      cdnNumber: resolvedLocation.cdnNumber,
+      headers: backupReadHeaders,
+      mediaDir: resolvedLocation.mediaDir,
+      mediaId: mediaId.string,
+    });
+
+    sendCors(req, res);
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': String(backupFields.size),
+      ...(fileName
+        ? {
+            'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+          }
+        : null),
+      'Cache-Control': 'public, max-age=3600',
+    });
+    await decryptAttachmentV2ToSink(
+      {
+        ciphertextStream: backupMediaStream,
+        idForLogging: mediaId.string,
+        integrityCheck: {
+          type: 'plaintext',
+          plaintextHash: Bytes.fromHex(backupFields.plaintextHash),
+        },
+        keysBase64: backupFields.keyBase64,
+        outerEncryption: deriveBackupMediaOuterEncryptionKeyMaterial(
+          mediaRootKey,
+          mediaId.bytes
+        ),
+        size: backupFields.size,
+        theirChunkSize: chunkSize,
+        theirIncrementalMac: incrementalMacBase64
+          ? Bytes.fromBase64(incrementalMacBase64)
+          : undefined,
+        type: 'standard',
+      },
+      res
+    );
+    res.end();
+    return;
+  }
+
+  async function writeTransitTierAttachment(): Promise<void> {
+    if (!transitKey) {
+      sendText(
+        req,
+        res,
+        400,
+        'Missing cdnKey or cdnId and backup media fields'
+      );
+      return;
+    }
+
+    const baseUrl = CDN_BASE_URL ?? productionConfig.cdn[cdnNumber] ?? productionConfig.cdn['0'];
+    if (!baseUrl) {
+      sendText(req, res, 501, 'CDN base URL is not configured');
+      return;
+    }
+
+    const attachmentUrl = new URL(`/attachments/${encodeURIComponent(transitKey)}`, baseUrl);
+    const response = await fetch(attachmentUrl);
+    if (!response.ok) {
+      sendText(req, res, response.status, await response.text());
+      return;
+    }
+
+    sendCors(req, res);
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      ...(size != null
+        ? {
+            'Content-Length': String(size),
+          }
+        : null),
+      ...(fileName
+        ? {
+            'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+          }
+        : null),
+      'Cache-Control': 'public, max-age=3600',
+    });
+    if (!response.body) {
+      res.end();
+      return;
+    }
+
+    if (keyBase64 && (digestBase64 || plaintextHash) && size != null) {
+      await decryptAttachmentV2ToSink(
+        {
+          ciphertextStream: Readable.fromWeb(response.body as never),
+          idForLogging: transitKey,
+          integrityCheck: digestBase64
+            ? {
+                type: 'encrypted',
+                digest: Bytes.fromBase64(digestBase64),
+              }
+            : {
+                type: 'plaintext',
+                plaintextHash: Bytes.fromHex(plaintextHash ?? ''),
+              },
+          keysBase64: keyBase64,
+          size,
+          theirChunkSize: chunkSize,
+          theirIncrementalMac: incrementalMacBase64
+            ? Bytes.fromBase64(incrementalMacBase64)
+            : undefined,
+          type: 'standard',
+        },
+        res
+      );
+      res.end();
+      return;
+    }
+
+    for await (const chunk of Readable.fromWeb(response.body as never)) {
+      res.write(chunk);
+    }
+    res.end();
+  }
+
+  if (backupFields) {
+    try {
+      await writeBackupTierAttachment();
+      return;
+    } catch (error) {
+      console.warn(
+        'handleAttachment: backup tier download failed, trying transit tier',
+        errorToLogString(error)
+      );
+      if (!transitKey) {
+        throw error;
+      }
+    }
+  }
+
+  await writeTransitTierAttachment();
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  sendCors(req, res);
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+
+  if (req.method === 'GET' && url.pathname === '/emoji/jumbo') {
+    await handleEmojiJumbo(req, res, url);
+    return;
+  }
+
+  if (
+    url.pathname.startsWith('/messages/') &&
+    url.pathname !== '/messages/attachment/upload' &&
+    UPSTREAM_API_BASE_URL
+  ) {
+    if (await proxyToUpstream(req, res, url)) {
+      return;
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/provisioning/sessions') {
+    const body = await readJson(req);
+    const deviceName =
+      typeof body.deviceName === 'string' ? body.deviceName : 'Signal Web';
+    const session = await startProvisioningSession(deviceName);
+    sendJson(req, res, 200, getSessionResponse(session));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/provisioning/sessions') {
+    sendJson(
+      req,
+      res,
+      200,
+      [...sessions.values()]
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .map(getSessionResponse)
+    );
+    return;
+  }
+
+  const provisioningImportTransferMatch =
+    /^\/provisioning\/sessions\/([^/]+)\/import-transfer$/.exec(url.pathname);
+  if (req.method === 'POST' && provisioningImportTransferMatch) {
+    const matchedSessionId = provisioningImportTransferMatch[1];
+    if (!matchedSessionId) {
+      sendText(req, res, 404, 'Provisioning session not found');
+      return;
+    }
+    const session = sessions.get(matchedSessionId);
+    if (!session) {
+      sendText(req, res, 404, 'Provisioning session not found');
+      return;
+    }
+    await handleImportTransfer(req, res, session);
+    return;
+  }
+
+  const provisioningMatch = /^\/provisioning\/sessions\/([^/]+)(?:\/linked-session)?$/.exec(
+    url.pathname
+  );
+  if (req.method === 'GET' && provisioningMatch) {
+    const matchedSessionId = provisioningMatch[1];
+    if (!matchedSessionId) {
+      sendText(req, res, 404, 'Provisioning session not found');
+      return;
+    }
+    const session = sessions.get(matchedSessionId);
+    if (!session) {
+      sendText(req, res, 404, 'Provisioning session not found');
+      return;
+    }
+    if (url.pathname.endsWith('/linked-session')) {
+      if (!session.linkedPayload) {
+        sendText(req, res, 409, 'Linked session is not ready');
+        return;
+      }
+      sendJson(req, res, 200, session.linkedPayload);
+      return;
+    }
+    sendJson(req, res, 200, getSessionResponse(session));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/stream') {
+    await handleMessageStream(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/stream/ack') {
+    await handleMessageStreamAck(req, res);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/messages/sessions') {
+    sendJson(
+      req,
+      res,
+      200,
+      [...streamSessions.entries()].map(([sessionId, session]) => ({
+        sessionId,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        status: session.status,
+        error: session.error,
+        lastReceiveError: session.lastReceiveError,
+        lastSendError: session.lastSendError,
+        backupImportStatus: session.backupImportStatus,
+        backupImportError: session.backupImportError,
+        backupImportStats: session.backupImportStats,
+        incomingEnvelopeCount: session.incomingEnvelopeCount,
+        decodedMessageCount: session.decodedMessageCount,
+        lastDecodedMessageSummary: session.lastDecodedMessageSummary,
+        attachmentBackfillEventCount: session.attachmentBackfillEventCount,
+        lastAttachmentBackfillSummary: session.lastAttachmentBackfillSummary,
+        ignoredEnvelopeCount: session.ignoredEnvelopeCount,
+        lastIgnoredEnvelopeReason: session.lastIgnoredEnvelopeReason,
+        lastIgnoredContentSummary: session.lastIgnoredContentSummary,
+        queueEmptyCount: session.queueEmptyCount,
+        sendAttemptCount: session.sendAttemptCount,
+        lastSendAttemptAt: session.lastSendAttemptAt,
+        protocolKeyIds: getLinkedPayloadProtocolKeyIds(session.linkedPayload),
+        hasMediaRootBackupKey: Boolean(
+          session.linkedPayload?.mediaRootBackupKeyBase64
+        ),
+        hasAciRegistrationId:
+          typeof session.linkedPayload?.aciRegistrationId === 'number',
+      }))
+    );
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/import-transfer') {
+    await handleMessageImportTransfer(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/send') {
+    await handleSendMessage(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/attachment/upload') {
+    await handleUploadAttachment(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/attachment/backfill') {
+    await handleAttachmentBackfillRequest(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/reaction') {
+    await handleSendReaction(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/edit') {
+    await handleSendEdit(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/send-group') {
+    await handleSendGroupMessage(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/groups/member') {
+    await handleModifyGroupMember(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/groups/settings') {
+    await handleModifyGroupSettings(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/messages/message-request-response'
+  ) {
+    await handleMessageRequestResponse(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/contacts/sync') {
+    await handleContactsSync(req, res);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/messages/attachment') {
+    await handleAttachment(req, res, url);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    sendJson(req, res, 200, { ok: true });
+    return;
+  }
+
+  sendText(req, res, 404, 'Not found');
+}
+
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch(error => {
+    console.error(error);
+    if (!res.headersSent) {
+      sendText(
+        req,
+        res,
+        500,
+        error instanceof Error ? error.stack ?? error.message : String(error)
+      );
+    } else {
+      res.end();
+    }
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Signal Web bridge listening on http://${HOST}:${PORT}`);
+});

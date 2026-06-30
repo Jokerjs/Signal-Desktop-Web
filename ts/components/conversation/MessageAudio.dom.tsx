@@ -181,7 +181,7 @@ export function MessageAudio(props: Props): JSX.Element {
 
   const { duration, hasPeaks, peaks } = useComputePeaks({
     audioUrl,
-    activeDuration: active?.duration,
+    activeDuration: active?.duration ?? attachment.duration,
     barCount: BAR_COUNT,
     onCorrupted,
   });

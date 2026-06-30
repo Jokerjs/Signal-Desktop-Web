@@ -91,12 +91,14 @@ export async function getQuoteAttachment(
           contentType: isGIFQuote ? IMAGE_GIF : contentType,
           fileName,
           thumbnail:
-            thumbnail && thumbnail.path
-              ? {
-                  ...(await loadAttachmentData(thumbnail)),
-                  url: getLocalAttachmentUrl(thumbnail),
-                }
-              : undefined,
+            thumbnail && thumbnail.url
+              ? thumbnail
+              : thumbnail && thumbnail.path
+                ? {
+                    ...(await loadAttachmentData(thumbnail)),
+                    url: getLocalAttachmentUrl(thumbnail),
+                  }
+                : undefined,
         };
       })
     );
@@ -113,12 +115,14 @@ export async function getQuoteAttachment(
         return {
           contentType,
           thumbnail:
-            image && image.path
-              ? {
-                  ...(await loadAttachmentData(image)),
-                  objectUrl: getLocalAttachmentUrl(image),
-                }
-              : undefined,
+            image && image.url
+              ? image
+              : image && image.path
+                ? {
+                    ...(await loadAttachmentData(image)),
+                    objectUrl: getLocalAttachmentUrl(image),
+                  }
+                : undefined,
         };
       })
     );

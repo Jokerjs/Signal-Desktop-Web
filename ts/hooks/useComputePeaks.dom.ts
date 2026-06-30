@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import lodash from 'lodash';
-import { useEffect, useState } from 'react';
-import { computePeaks } from '../components/VoiceNotesPlaybackContext.dom.tsx';
+import { useEffect, useRef, useState } from 'react';
+import {
+  computePeaks,
+  getCachedPeaks,
+} from '../components/VoiceNotesPlaybackContext.dom.tsx';
 import { createLogger } from '../logging/log.std.ts';
 import type { PeakType } from '../types/Audio.dom.tsx';
 
@@ -15,6 +18,45 @@ type WaveformData = {
   peaks: ReadonlyArray<PeakType>;
   duration: number;
 };
+
+function normalizeDuration(
+  duration: number | undefined,
+  fallbackDuration?: number
+): number {
+  if (duration != null && Number.isFinite(duration) && duration > 0) {
+    return Math.max(duration, 1e-23);
+  }
+
+  if (
+    fallbackDuration != null &&
+    Number.isFinite(fallbackDuration) &&
+    fallbackDuration > 0
+  ) {
+    return Math.max(fallbackDuration, 1e-23);
+  }
+
+  return 1e-23;
+}
+
+function getCachedWaveformData(
+  audioUrl: string | undefined,
+  barCount: number,
+  fallbackDuration?: number
+): WaveformData | undefined {
+  if (!audioUrl) {
+    return undefined;
+  }
+
+  const cached = getCachedPeaks(audioUrl, barCount);
+  if (!cached) {
+    return undefined;
+  }
+
+  return {
+    duration: normalizeDuration(cached.duration, fallbackDuration),
+    peaks: cached.peaks,
+  };
+}
 
 export function useComputePeaks({
   audioUrl,
@@ -28,13 +70,30 @@ export function useComputePeaks({
   onCorrupted: () => void;
 }): { peaks: ReadonlyArray<PeakType>; hasPeaks: boolean; duration: number } {
   const [waveformData, setWaveformData] = useState<WaveformData | undefined>(
-    undefined
+    () => getCachedWaveformData(audioUrl, barCount, activeDuration)
   );
+  const onCorruptedRef = useRef(onCorrupted);
+  onCorruptedRef.current = onCorrupted;
 
   // This effect loads audio file and computes its RMS peak for displaying the
   // waveform.
   useEffect(() => {
     if (!audioUrl) {
+      return noop;
+    }
+
+    const cached = getCachedWaveformData(audioUrl, barCount, activeDuration);
+    if (cached) {
+      setWaveformData(current => {
+        if (
+          current?.duration === cached.duration &&
+          current.peaks === cached.peaks
+        ) {
+          return current;
+        }
+
+        return cached;
+      });
       return noop;
     }
 
@@ -53,7 +112,7 @@ export function useComputePeaks({
         }
         setWaveformData({
           peaks: newPeaks,
-          duration: Math.max(newDuration, 1e-23),
+          duration: normalizeDuration(newDuration, activeDuration),
         });
       } catch (err) {
         log.error(
@@ -61,14 +120,14 @@ export function useComputePeaks({
           err
         );
 
-        onCorrupted();
+        onCorruptedRef.current();
       }
     })();
 
     return () => {
       canceled = true;
     };
-  }, [audioUrl, barCount, onCorrupted]);
+  }, [activeDuration, audioUrl, barCount]);
 
   let peaks = waveformData?.peaks;
   if (peaks == null) {
@@ -80,7 +139,7 @@ export function useComputePeaks({
   }
 
   return {
-    duration: waveformData?.duration ?? activeDuration ?? 1e-23,
+    duration: normalizeDuration(waveformData?.duration, activeDuration),
     hasPeaks: waveformData !== undefined,
     peaks,
   };

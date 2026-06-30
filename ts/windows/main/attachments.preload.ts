@@ -227,6 +227,40 @@ async function writeWithAttributes(
   }
 }
 
+function shouldUseBrowserDownload(baseDir: string | undefined): boolean {
+  return (
+    baseDir == null &&
+    typeof window !== 'undefined' &&
+    typeof document !== 'undefined' &&
+    typeof URL !== 'undefined' &&
+    typeof Blob !== 'undefined'
+  );
+}
+
+function saveWithBrowserDownload({
+  data,
+  name,
+}: {
+  data: Uint8Array<ArrayBuffer>;
+  name: string;
+}): { fullPath: string; name: string } {
+  const url = URL.createObjectURL(new Blob([data]));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+
+  return {
+    fullPath: name,
+    name,
+  };
+}
+
 export const saveAttachmentToDisk = async ({
   data,
   name,
@@ -240,6 +274,10 @@ export const saveAttachmentToDisk = async ({
    */
   baseDir?: string;
 }): Promise<null | { fullPath: string; name: string }> => {
+  if (shouldUseBrowserDownload(baseDir)) {
+    return saveWithBrowserDownload({ data, name });
+  }
+
   let filePath;
 
   if (!baseDir) {

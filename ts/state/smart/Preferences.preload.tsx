@@ -212,7 +212,11 @@ async function forceKeyTransparencyCheck(): Promise<void> {
   await keyTransparency.selfCheck();
 }
 
-export function SmartPreferences(): JSX.Element | null {
+export function SmartPreferences({
+  isSignalWebRuntime = false,
+}: Readonly<{
+  isSignalWebRuntime?: boolean;
+}>): JSX.Element | null {
   const {
     addCustomColor,
     editCustomColor,
@@ -964,17 +968,22 @@ export function SmartPreferences(): JSX.Element | null {
         i18n={i18n}
         initialSpellCheckSetting={initialSpellCheckSetting}
         isAutoDownloadUpdatesSupported={isAutoDownloadUpdatesSupported}
-        isAutoLaunchSupported={isAutoLaunchSupported}
+        isAutoLaunchSupported={
+          !isSignalWebRuntime && isAutoLaunchSupported
+        }
         isContentProtectionNeeded={isContentProtectionNeeded}
-        isContentProtectionSupported={isContentProtectionSupported}
-        isHideMenuBarSupported={isHideMenuBarSupported}
+        isContentProtectionSupported={
+          !isSignalWebRuntime && isContentProtectionSupported
+        }
+        isHideMenuBarSupported={!isSignalWebRuntime && isHideMenuBarSupported}
         isKeyTransparencyAvailable={isKeyTransparencyAvailable}
         isMinimizeToAndStartInSystemTraySupported={
-          isMinimizeToAndStartInSystemTraySupported
+          !isSignalWebRuntime && isMinimizeToAndStartInSystemTraySupported
         }
         isNotificationAttentionSupported={isNotificationAttentionSupported}
         isSyncSupported={isSyncSupported}
-        isSystemTraySupported={isSystemTraySupported}
+        isSystemTraySupported={!isSignalWebRuntime && isSystemTraySupported}
+        isSignalWebRuntime={isSignalWebRuntime}
         isInternalUser={isInternalUser}
         lastLocalBackup={lastLocalBackup}
         lastSyncTime={lastSyncTime}

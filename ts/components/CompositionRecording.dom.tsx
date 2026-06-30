@@ -57,6 +57,8 @@ export function CompositionRecording({
     return () => hideToast(toast);
   }, [showToast, hideToast]);
 
+  const errorRecordingRef = useRef(errorRecording);
+  errorRecordingRef.current = errorRecording;
   const startTime = useRef(Date.now());
   const [duration, setDuration] = useState(0);
   const drift = useRef(0);
@@ -72,14 +74,14 @@ export function CompositionRecording({
       if (
         DurationInSeconds.fromMillis(newDurationMs) >= DurationInSeconds.HOUR
       ) {
-        errorRecording(ErrorDialogAudioRecorderType.Timeout);
+        errorRecordingRef.current(ErrorDialogAudioRecorderType.Timeout);
       }
     }, SECOND - drift.current);
 
     return () => {
       clearTimeout(timeoutId);
     };
-  }, [duration, errorRecording]);
+  }, [duration]);
 
   let confirmationDialog: JSX.Element | undefined;
   if (errorDialogAudioRecorderType === ErrorDialogAudioRecorderType.Timeout) {

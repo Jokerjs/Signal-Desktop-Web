@@ -65,6 +65,39 @@ type EncryptedWriter = (
   data: Uint8Array<ArrayBuffer>
 ) => Promise<LocalAttachmentV2Type>;
 
+type BrowserReadableAttachment = Partial<AddressableAttachmentType> & {
+  dataBase64?: string;
+  url?: string;
+};
+
+function isBrowserRuntime(): boolean {
+  return Boolean(
+    (globalThis as typeof globalThis & { process?: { browser?: boolean } })
+      .process?.browser
+  );
+}
+
+function base64ToBytes(dataBase64: string): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from(globalThis.atob(dataBase64), char =>
+    char.charCodeAt(0)
+  );
+}
+
+async function readAttachmentFromBrowserUrl(
+  url: string
+): Promise<Uint8Array<ArrayBuffer> | undefined> {
+  if (!/^(blob:|data:|https?:)/.test(url)) {
+    return undefined;
+  }
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch browser attachment: ${response.status}`);
+  }
+
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 function createEncryptedReader(basePath: string): EncryptedReader {
   const fallbackReader = createPlaintextReader(basePath);
   const pathGetter = createAbsolutePathGetter(basePath);
@@ -75,6 +108,19 @@ function createEncryptedReader(basePath: string): EncryptedReader {
     // In-memory
     if (attachment.data != null) {
       return attachment.data;
+    }
+
+    const browserAttachment = attachment as BrowserReadableAttachment;
+    if (isBrowserRuntime()) {
+      if (typeof browserAttachment.dataBase64 === 'string') {
+        return base64ToBytes(browserAttachment.dataBase64);
+      }
+      if (typeof browserAttachment.url === 'string') {
+        const data = await readAttachmentFromBrowserUrl(browserAttachment.url);
+        if (data) {
+          return data;
+        }
+      }
     }
 
     if (attachment.path == null) {

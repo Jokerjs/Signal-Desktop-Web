@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import classNames from 'classnames';
 import type { CSSProperties, JSX } from 'react';
-import { useMemo, useState, useCallback } from 'react';
+import { useMemo, useState, useCallback, useRef } from 'react';
 import MANIFEST from '../../../build/jumbomoji.json';
 import type { FunImageAriaProps } from './types.dom.tsx';
 import { createLogger } from '../../logging/log.std.ts';
 import { Emoji } from '../../axo/emoji.std.ts';
+import { getRenderApiBaseUrl } from '../../web/renderConfig.dom.ts';
 
 const log = createLogger('FunEmoji');
 
@@ -17,6 +18,18 @@ const FUN_STATIC_EMOJI_TEXT_CLASS = 'FunStaticEmoji__Text';
 const KNOWN_JUMBOMOJI = new Set<string>(Object.values(MANIFEST).flat());
 const MIN_JUMBOMOJI_SIZE = 33;
 
+function canLoadEmojiProtocol(): boolean {
+  return (
+    window.location.protocol !== 'http:' && window.location.protocol !== 'https:'
+  );
+}
+
+function getWebEmojiJumboUrl(emoji: Emoji.Variant): string {
+  const url = new URL('/emoji/jumbo', getRenderApiBaseUrl());
+  url.searchParams.set('emoji', emoji);
+  return url.toString();
+}
+
 function getEmojiJumboUrl(
   emoji: Emoji.Variant,
   size: number | undefined
@@ -25,7 +38,9 @@ function getEmojiJumboUrl(
     return null;
   }
   if (KNOWN_JUMBOMOJI.has(emoji)) {
-    return `emoji://jumbo?emoji=${encodeURIComponent(emoji)}`;
+    return canLoadEmojiProtocol()
+      ? `emoji://jumbo?emoji=${encodeURIComponent(emoji)}`
+      : getWebEmojiJumboUrl(emoji);
   }
   return null;
 }
@@ -162,16 +177,27 @@ export type FunInlineEmojiProps = FunImageAriaProps &
 
 export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
   const [isLoaded, setIsLoaded] = useState(false);
-
-  const onLoad = useCallback(() => {
-    setIsLoaded(true);
-  }, []);
-
+  const jumboRef = useRef<HTMLSpanElement | null>(null);
   const jumboImage = useMemo(() => {
     // Note: we don't pass size here because appearance of jumbomoji is decided
     // in css based on the parent svg container size.
     return getEmojiJumboUrl(props.emoji, undefined);
   }, [props.emoji]);
+  const isWebJumboImage = jumboImage != null && !canLoadEmojiProtocol();
+
+  const onLoad = useCallback(() => {
+    if (isWebJumboImage) {
+      setIsLoaded(true);
+      return;
+    }
+
+    const jumbo = jumboRef.current;
+    if (jumbo == null || window.getComputedStyle(jumbo).display === 'none') {
+      return;
+    }
+
+    setIsLoaded(true);
+  }, [isWebJumboImage]);
 
   let img: JSX.Element | undefined;
   if (jumboImage) {
@@ -183,7 +209,7 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
         )}
         aria-hidden
         alt=""
-        loading="lazy"
+        loading={isWebJumboImage ? 'eager' : 'lazy'}
         src={jumboImage}
         onLoad={onLoad}
       />
@@ -192,7 +218,10 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
 
   return (
     <span
-      className={FUN_INLINE_EMOJI_CLASS}
+      className={classNames(
+        FUN_INLINE_EMOJI_CLASS,
+        isWebJumboImage && isLoaded && 'FunInlineEmoji--WebImageLoaded'
+      )}
       aria-label={props['aria-label']}
       // Needed to lookup emoji value in `matchEmojiBlot`
       data-emoji={props.emoji}
@@ -213,7 +242,14 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
         {props.emoji}
       </span>
       {img != null && (
-        <span className="FunInlineEmoji__Jumbo" aria-hidden>
+        <span
+          className={classNames(
+            'FunInlineEmoji__Jumbo',
+            isWebJumboImage && isLoaded && 'FunInlineEmoji__Jumbo--WebImage'
+          )}
+          aria-hidden
+          ref={jumboRef}
+        >
           {img}
         </span>
       )}

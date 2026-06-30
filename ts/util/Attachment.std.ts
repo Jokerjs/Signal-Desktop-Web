@@ -402,8 +402,8 @@ export function hasVideoScreenshot(
 
   return (
     firstAttachment &&
-    firstAttachment.screenshot &&
-    firstAttachment.screenshot.url
+    (firstAttachment.screenshot?.url ||
+      (isVideoAttachment(firstAttachment) ? firstAttachment.url : undefined))
   );
 }
 
@@ -579,6 +579,28 @@ export const isVoiceMessage = (
   return false;
 };
 
+async function readAttachmentUrl(
+  url: string
+): Promise<Uint8Array<ArrayBuffer>> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to read attachment url: ${response.status}`);
+  }
+
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+function shouldReadAttachmentUrl(
+  attachment: Pick<AttachmentType, 'path' | 'url'>
+): attachment is Pick<AttachmentType, 'path'> & { url: string } {
+  return Boolean(
+    attachment.url &&
+      (attachment.path == null ||
+        attachment.path.startsWith('web:') ||
+        attachment.path.startsWith('blob:'))
+  );
+}
+
 export const save = async ({
   attachment,
   index,
@@ -610,7 +632,9 @@ export const save = async ({
   baseDir?: string;
 }): Promise<string | null> => {
   let data: Uint8Array<ArrayBuffer>;
-  if (attachment.path) {
+  if (shouldReadAttachmentUrl(attachment)) {
+    data = await readAttachmentUrl(attachment.url);
+  } else if (attachment.path) {
     data = await readAttachmentData(attachment);
   } else if (attachment.data) {
     data = attachment.data;

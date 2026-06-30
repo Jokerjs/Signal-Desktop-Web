@@ -39,6 +39,13 @@ const computeQueue = new PQueue({
   concurrency: MAX_PARALLEL_COMPUTE,
 });
 
+export function getCachedPeaks(
+  url: string,
+  barCount: number
+): ComputePeaksResult | undefined {
+  return waveformCache.get(`${url}:${barCount}`);
+}
+
 async function getAudioDuration(buffer: ArrayBuffer): Promise<number> {
   const blob = new Blob([buffer]);
   const blobURL = URL.createObjectURL(blob);

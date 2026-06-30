@@ -273,6 +273,7 @@ export const SmartConversationDetails = memo(function SmartConversationDetails({
       canAddLabel={canAddLabel}
       canAddNewMembers={canAddNewMembers}
       canEditGroupInfo={canEditGroupInfo}
+      canStartCalls={Boolean(window.SignalContext.config.sfuUrl)}
       conversation={conversationWithColorAttributes}
       deleteAvatarFromDisk={deleteAvatarFromDisk}
       getPreferredBadge={getPreferredBadge}

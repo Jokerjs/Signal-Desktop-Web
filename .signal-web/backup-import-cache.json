@@ -1,0 +1,1446 @@
+{
+  "accounts": {
+    "535cc856-c419-4de0-a329-d21579ce8bf9": {
+      "updatedAt": 1782725558180,
+      "contactsBootstrap": {
+        "version": 1,
+        "generatedAt": 1782725558180,
+        "account": {
+          "aci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+          "pni": "PNI:eb19c6fe-2152-4167-875e-c8731eb408c5",
+          "number": "+8618595768089",
+          "phoneNumber": "+8618595768089",
+          "title": "+8618595768089"
+        },
+        "selectedConversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+        "storyDistributionLists": [
+          {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "我的动态",
+            "allowsReplies": true,
+            "isBlockList": true,
+            "memberServiceIds": []
+          }
+        ],
+        "pinned": [],
+        "conversations": [
+          {
+            "acceptedMessageRequest": true,
+            "id": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "profileKey": "On71Uz8NS1Rz6JsHyNNuGGM0hhIsfnpyDUssXJpZbZM=",
+            "profileName": "繁",
+            "profileFamilyName": "林",
+            "profileSharing": true,
+            "color": "A120",
+            "title": "繁 林",
+            "titleNoDefault": "繁 林",
+            "searchableTitle": "繁 林",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782725143632,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "[Message request update]"
+            },
+            "lastMessageReceivedAt": 1782725143632,
+            "lastMessageReceivedAtMs": 1782725143632,
+            "lastUpdated": 1782725143632,
+            "messageCount": 1,
+            "timestamp": 1782725143632,
+            "inboxPosition": 1782725143632,
+            "snippet": "[Message request update]"
+          },
+          {
+            "acceptedMessageRequest": true,
+            "id": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "profileKey": "zQgKuRzYoSM/33jpwWXWWOJODSMP6bTNhhl5b+sXxTo=",
+            "profileName": "永乐",
+            "profileSharing": true,
+            "color": "A160",
+            "title": "永乐",
+            "titleNoDefault": "永乐",
+            "searchableTitle": "永乐",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782715450639,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "在呢"
+            },
+            "lastMessageReceivedAt": 1782715450639,
+            "lastMessageReceivedAtMs": 1782716079618,
+            "lastUpdated": 1782715450639,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782715450639,
+            "inboxPosition": 1782715450639,
+            "snippet": "在呢"
+          },
+          {
+            "id": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "masterKey": "3Nr3Kn+dSdDQn/2k1SGNdqcJjo8UVKPpOjzIy1BDSeQ=",
+            "publicParams": "AIlBP7t5R36PNonBMoJsSmgODszZt0MGbUL6IEI4XGn+4kARhXXTSoAQTbWRjjyWTh24vhLy7Ml8jqBQuudQGTckExhIWPXW2QrDpPJEioiWwKzEvRkWqzUeUgVsOOtAMw==",
+            "revision": 3,
+            "secretParams": "ANza9yp/nUnQ0J/9pNUhjXanCY6PFFSj6To8yMtQQ0nkiUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4VfrAIq/u5JzWRaJidEM2cYZYem11L0Mlt0LDLiCqY5fmsTWXL7P0pHgfX2PCLbdKNnWl+fAFnKara3jtDk+MPF25oMZt00ufGEo4kLhscAMCB9GyZY5HuTa4KlpSQoAjiQBGFddNKgBBNtZGOPJZOHbi+EvLsyXyOoFC651AZNw8Ur/Lv6KdoIAm+YN12K9w3CAp37juG5JXBD0tqWEQByBRRmu8n8ea4vuu6vanFiL/SSYFk5h7H80cibX/NDAYkExhIWPXW2QrDpPJEioiWwKzEvRkWqzUeUgVsOOtAMw==",
+            "membersV2": [
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 1
+              },
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A210",
+            "remoteAvatarUrl": "",
+            "title": "林-群1",
+            "titleNoDefault": "林-群1",
+            "searchableTitle": "林-群1",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782703609087,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "[Video]"
+            },
+            "lastMessageReceivedAt": 1782703609087,
+            "lastMessageReceivedAtMs": 1782704135688,
+            "lastUpdated": 1782703609087,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782703609087,
+            "inboxPosition": 1782703609087,
+            "snippet": "[Video]"
+          },
+          {
+            "id": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "masterKey": "5lH4VzgNZxjRjPeYzGQgBVAzhqby6civya9veSYMc/0=",
+            "publicParams": "AMJ4JDh8pAWIFu6dHfMELDzRKe5cWTWnWnCJKxF1iklRcASFmNtJmajKhtan8xcyRgy3XisjIzTqa++vhtbKi0juFvKHmDJl/+Xi3seVHSW7WtKm5KRHsfDVWCVOsUZKdA==",
+            "revision": 1,
+            "secretParams": "AOZR+Fc4DWcY0Yz3mMxkIAVQM4am8unIr8mvb3kmDHP9wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVFkJW5E5yp3jsI+7AGWsTd+vfTrXOSCvh+bsXCHVVBMiurWB7bEJaif/BC/J3wTMJiEc/kwUKOywCLzP7aYnTMPZocQoI9Rw/bfnJge2QWDesHbFC0tHYZ3W8yTbKJjRQdwBIWY20mZqMqG1qfzFzJGDLdeKyMjNOpr76+G1sqLSG9IJQrlaf6usAgZWR44mG8TVRpJN4lV1orR2xeqomQGdTVIa43iLEE8YNWlEe2awh7s7uKEtYE7/sew049goAjuFvKHmDJl/+Xi3seVHSW7WtKm5KRHsfDVWCVOsUZKdA==",
+            "membersV2": [
+              {
+                "aci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A180",
+            "remoteAvatarUrl": "",
+            "title": "群组",
+            "titleNoDefault": "群组",
+            "searchableTitle": "群组",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782548573348,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "你"
+            },
+            "lastMessageReceivedAt": 1782548573348,
+            "lastMessageReceivedAtMs": 1782549284221,
+            "lastUpdated": 1782548573348,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782548573348,
+            "inboxPosition": 1782548573348,
+            "snippet": "你"
+          },
+          {
+            "id": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "phoneNumber": "+8618595768089",
+            "e164": "+8618595768089",
+            "isMe": true,
+            "title": "+8618595768089",
+            "titleNoDefault": "+8618595768089",
+            "searchableTitle": "+8618595768089",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782366776252,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "ssss"
+            },
+            "lastMessageReceivedAt": 1782366776252,
+            "lastMessageReceivedAtMs": 1782367076902,
+            "lastUpdated": 1782366776252,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782366776252,
+            "inboxPosition": 1782366776252,
+            "snippet": "ssss"
+          },
+          {
+            "acceptedMessageRequest": true,
+            "id": "334f63e5-eb4b-468c-a6e6-87c7a4a44399",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "334f63e5-eb4b-468c-a6e6-87c7a4a44399",
+            "profileKey": "SP4B+gWP4rY0N4Y1B9uKDn0d/UK5BWpooPBEiakmhv8=",
+            "profileName": "琳",
+            "profileFamilyName": "张",
+            "profileSharing": false,
+            "color": "A150",
+            "title": "琳 张",
+            "titleNoDefault": "琳 张",
+            "searchableTitle": "琳 张",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          {
+            "acceptedMessageRequest": true,
+            "id": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "profileSharing": false,
+            "color": "A190",
+            "title": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "titleNoDefault": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "searchableTitle": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "hasMessages": false
+          },
+          {
+            "id": "xEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiw=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "xEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiw=",
+            "masterKey": "DM8fqzHwWhM37046ZorzHRMqgn99H3g/eNa1uDbbrAE=",
+            "publicParams": "AMREF86YeY0GkgBc9AF+6ZFNduYyRPoJgPtpZVOc8EYstJDnvWr9Me1nEV8Si4hEcHv4QuEBavpmtACIvinpsGvApJ4lH2PZmhrp6Sxq3wicWq78g6jX8Yi4JEG8/MbDBw==",
+            "revision": 22,
+            "secretParams": "AAzPH6sx8FoTN+9OOmaK8x0TKoJ/fR94P3jWtbg226wBxEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiywbY+dBMqNZc/Eg2XqiFYgA4zLgirFpAfjQjFVFa4P4figtCmFj0MuG9M6mHnGPEB+Opsrbkj90S0JqCzIa7oD/qzpW59HMTuoxIsqFxhl1B/IC9D5BpIKvO/AhY8O/QC0kOe9av0x7WcRXxKLiERwe/hC4QFq+ma0AIi+KemwayBf0vuLwUgh4O7xknnW1PVVUHAg7vYfwxd/lIEsl1gAEgJFwaQwMS3GBK644A5dPpc/WjOc/nppXpel/Yn8PA3ApJ4lH2PZmhrp6Sxq3wicWq78g6jX8Yi4JEG8/MbDBw==",
+            "membersV2": [],
+            "pendingMembersV2": [
+              {
+                "addedByUserId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "role": 1,
+                "serviceId": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+                "timestamp": 0
+              }
+            ],
+            "color": "A100",
+            "remoteAvatarUrl": "",
+            "title": "群组2",
+            "titleNoDefault": "群组2",
+            "searchableTitle": "群组2",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          {
+            "id": "tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiY=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiY=",
+            "masterKey": "ETMSnVrguXjsUbfCm39rZK4DeSwP59ZT4vw8cdT+tPw=",
+            "publicParams": "ALcOnTxCHLKJ+w3oicepz1f7ggzd23iMZZGiibeZRGImpM1w1L4kDdQ8ijkquRKk8oIjZ4eGhWJzLQ7HsyfhpXN8Tca+flG4Gsa1Aryg2ZRnf20N4BeT+ER43Ux2WqVoMA==",
+            "revision": 5,
+            "secretParams": "ABEzEp1a4Ll47FG3wpt/a2SuA3ksD+fWU+L8PHHU/rT8tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiZd/D+hqWKih4mtNOHMeDZ2rDbqZ3D/rBima+DVoiCA8Aj9Pofo9vzaP0W4vSaNnnpYFie0MMen02VcOq9Zs9MGTEdFqEYmnuS1xQ9qslvAAOlA8aRf7q2PBnhLTiDshgWkzXDUviQN1DyKOSq5EqTygiNnh4aFYnMtDsezJ+GlcwuD1TxweN42DkVnQXVWbR4H7r9ExxmgVpAIhoY4tPcEQaKgX8AxYINvX//KANBRk8w8ZLiT6qqkoCdKsdX6oAx8Tca+flG4Gsa1Aryg2ZRnf20N4BeT+ER43Ux2WqVoMA==",
+            "membersV2": [
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A130",
+            "remoteAvatarUrl": "",
+            "title": "群11111222",
+            "titleNoDefault": "群11111222",
+            "searchableTitle": "群11111222",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          {
+            "id": "XUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17Bg=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "XUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17Bg=",
+            "masterKey": "lY69KEDhfgbPDS7Jh+289oQsyC0t8QKvju8AElBnNIU=",
+            "publicParams": "AF1FnEApG/f0lMsBZFsmhyJvImRLU85Ch6zWnSUbNewYvqiFJEY9iMPx0ZBo7y1pvIbg4w3KZUjIBoyYgYKM/hQEpz6gYzydMhUJcRJVTFBbQa+6Mm98Gm8TLH7gMXBEOw==",
+            "revision": 1,
+            "secretParams": "AJWOvShA4X4Gzw0uyYftvPaELMgtLfECr47vABJQZzSFXUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17BgkL/9XU4dto2zBcySpxDiGwVZpKaSzW2RCJ4HhR81MYOWaopiHQQTtde19wtg8MYP+b4UZZJ0P5q7oEhqoyIYJH9VkNW0NhmXuAX7DpnW5hawCcwCMxxTm2F5EWFvsWAS+qIUkRj2Iw/HRkGjvLWm8huDjDcplSMgGjJiBgoz+FOgAH+tRGMCuwydeQbWCj/Zk00RDn8uH0WtRe8dK35cHLn3ZJbjZRajG/ruYa9aSkTnIJ/lRS37QQpm4SF/W/wgEpz6gYzydMhUJcRJVTFBbQa+6Mm98Gm8TLH7gMXBEOw==",
+            "membersV2": [
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A190",
+            "remoteAvatarUrl": "",
+            "title": "一个群",
+            "titleNoDefault": "一个群",
+            "searchableTitle": "一个群",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          }
+        ],
+        "archived": [
+          {
+            "id": "8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaI=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaI=",
+            "masterKey": "5Bw63L/fCe+7Nw+SJdgOkcHF+r6l9o8z59rGk3X+HZ8=",
+            "publicParams": "APAx0FWSFLJ2vZbeEDILH9nq5Hf1nObp2TM/wV+SvpGiSJVLHQFWczxUq4We72UV1rF7LCvdAkYfaJKYXaLjEjFuQ7osiXWSEXcNfHt0cEDIVo53Dz3fnCWY1uB0xFEbVw==",
+            "revision": 14,
+            "secretParams": "AOQcOty/3wnvuzcPkiXYDpHBxfq+pfaPM+faxpN1/h2f8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaJtfCdYdaXJdkyVBFDxlsDRWiawykyG1hB0iGFR9VpH/751bTaIrCoHBw4t0v1Vbas1T34mNGVZ6wtQ2Jz2xpYPwXh/arVhBenSb8SL51dQQMKeouRjE9O6OHrVOTpvig5IlUsdAVZzPFSrhZ7vZRXWsXssK90CRh9okphdouMSMTkB9NIaBXtV20E8XwCiaA3JB09FLFk8SsCWJUP2BV4BJs8NZW9IohMbea70/tSZFAphMc0M35YE0GVBhgpcaA1uQ7osiXWSEXcNfHt0cEDIVo53Dz3fnCWY1uB0xFEbVw==",
+            "membersV2": [
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 2
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A210",
+            "remoteAvatarUrl": "",
+            "title": "我的群11",
+            "titleNoDefault": "我的群11",
+            "searchableTitle": "我的群11",
+            "hasMessages": false,
+            "isArchived": true,
+            "isPinned": false
+          }
+        ]
+      },
+      "chatShell": {
+        "selectedConversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+        "conversationLookup": {
+          "535cc856-c419-4de0-a329-d21579ce8bf9": {
+            "id": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "phoneNumber": "+8618595768089",
+            "e164": "+8618595768089",
+            "isMe": true,
+            "title": "+8618595768089",
+            "titleNoDefault": "+8618595768089",
+            "searchableTitle": "+8618595768089",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782366776252,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "ssss"
+            },
+            "lastMessageReceivedAt": 1782366776252,
+            "lastMessageReceivedAtMs": 1782367076902,
+            "lastUpdated": 1782366776252,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782366776252,
+            "inboxPosition": 1782366776252,
+            "snippet": "ssss"
+          },
+          "66cfd134-7f0e-49b6-8d99-0d8602ead5e3": {
+            "acceptedMessageRequest": true,
+            "id": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "profileKey": "On71Uz8NS1Rz6JsHyNNuGGM0hhIsfnpyDUssXJpZbZM=",
+            "profileName": "繁",
+            "profileFamilyName": "林",
+            "profileSharing": true,
+            "color": "A120",
+            "title": "繁 林",
+            "titleNoDefault": "繁 林",
+            "searchableTitle": "繁 林",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782725143632,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "[Message request update]"
+            },
+            "lastMessageReceivedAt": 1782725143632,
+            "lastMessageReceivedAtMs": 1782725143632,
+            "lastUpdated": 1782725143632,
+            "messageCount": 1,
+            "timestamp": 1782725143632,
+            "inboxPosition": 1782725143632,
+            "snippet": "[Message request update]"
+          },
+          "55d41c45-d3ca-42f1-81ab-3d6737cf29ff": {
+            "acceptedMessageRequest": true,
+            "id": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "profileKey": "zQgKuRzYoSM/33jpwWXWWOJODSMP6bTNhhl5b+sXxTo=",
+            "profileName": "永乐",
+            "profileSharing": true,
+            "color": "A160",
+            "title": "永乐",
+            "titleNoDefault": "永乐",
+            "searchableTitle": "永乐",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782715450639,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "在呢"
+            },
+            "lastMessageReceivedAt": 1782715450639,
+            "lastMessageReceivedAtMs": 1782716079618,
+            "lastUpdated": 1782715450639,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782715450639,
+            "inboxPosition": 1782715450639,
+            "snippet": "在呢"
+          },
+          "334f63e5-eb4b-468c-a6e6-87c7a4a44399": {
+            "acceptedMessageRequest": true,
+            "id": "334f63e5-eb4b-468c-a6e6-87c7a4a44399",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "334f63e5-eb4b-468c-a6e6-87c7a4a44399",
+            "profileKey": "SP4B+gWP4rY0N4Y1B9uKDn0d/UK5BWpooPBEiakmhv8=",
+            "profileName": "琳",
+            "profileFamilyName": "张",
+            "profileSharing": false,
+            "color": "A150",
+            "title": "琳 张",
+            "titleNoDefault": "琳 张",
+            "searchableTitle": "琳 张",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5": {
+            "acceptedMessageRequest": true,
+            "id": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "type": "direct",
+            "conversationType": "direct",
+            "serviceId": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "profileSharing": false,
+            "color": "A190",
+            "title": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "titleNoDefault": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "searchableTitle": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+            "hasMessages": false
+          },
+          "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=": {
+            "id": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "masterKey": "3Nr3Kn+dSdDQn/2k1SGNdqcJjo8UVKPpOjzIy1BDSeQ=",
+            "publicParams": "AIlBP7t5R36PNonBMoJsSmgODszZt0MGbUL6IEI4XGn+4kARhXXTSoAQTbWRjjyWTh24vhLy7Ml8jqBQuudQGTckExhIWPXW2QrDpPJEioiWwKzEvRkWqzUeUgVsOOtAMw==",
+            "revision": 3,
+            "secretParams": "ANza9yp/nUnQ0J/9pNUhjXanCY6PFFSj6To8yMtQQ0nkiUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4VfrAIq/u5JzWRaJidEM2cYZYem11L0Mlt0LDLiCqY5fmsTWXL7P0pHgfX2PCLbdKNnWl+fAFnKara3jtDk+MPF25oMZt00ufGEo4kLhscAMCB9GyZY5HuTa4KlpSQoAjiQBGFddNKgBBNtZGOPJZOHbi+EvLsyXyOoFC651AZNw8Ur/Lv6KdoIAm+YN12K9w3CAp37juG5JXBD0tqWEQByBRRmu8n8ea4vuu6vanFiL/SSYFk5h7H80cibX/NDAYkExhIWPXW2QrDpPJEioiWwKzEvRkWqzUeUgVsOOtAMw==",
+            "membersV2": [
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 1
+              },
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A210",
+            "remoteAvatarUrl": "",
+            "title": "林-群1",
+            "titleNoDefault": "林-群1",
+            "searchableTitle": "林-群1",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782703609087,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "[Video]"
+            },
+            "lastMessageReceivedAt": 1782703609087,
+            "lastMessageReceivedAtMs": 1782704135688,
+            "lastUpdated": 1782703609087,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782703609087,
+            "inboxPosition": 1782703609087,
+            "snippet": "[Video]"
+          },
+          "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=": {
+            "id": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "masterKey": "5lH4VzgNZxjRjPeYzGQgBVAzhqby6civya9veSYMc/0=",
+            "publicParams": "AMJ4JDh8pAWIFu6dHfMELDzRKe5cWTWnWnCJKxF1iklRcASFmNtJmajKhtan8xcyRgy3XisjIzTqa++vhtbKi0juFvKHmDJl/+Xi3seVHSW7WtKm5KRHsfDVWCVOsUZKdA==",
+            "revision": 1,
+            "secretParams": "AOZR+Fc4DWcY0Yz3mMxkIAVQM4am8unIr8mvb3kmDHP9wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVFkJW5E5yp3jsI+7AGWsTd+vfTrXOSCvh+bsXCHVVBMiurWB7bEJaif/BC/J3wTMJiEc/kwUKOywCLzP7aYnTMPZocQoI9Rw/bfnJge2QWDesHbFC0tHYZ3W8yTbKJjRQdwBIWY20mZqMqG1qfzFzJGDLdeKyMjNOpr76+G1sqLSG9IJQrlaf6usAgZWR44mG8TVRpJN4lV1orR2xeqomQGdTVIa43iLEE8YNWlEe2awh7s7uKEtYE7/sew049goAjuFvKHmDJl/+Xi3seVHSW7WtKm5KRHsfDVWCVOsUZKdA==",
+            "membersV2": [
+              {
+                "aci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A180",
+            "remoteAvatarUrl": "",
+            "title": "群组",
+            "titleNoDefault": "群组",
+            "searchableTitle": "群组",
+            "hasMessages": true,
+            "isArchived": false,
+            "isPinned": false,
+            "activeAt": 1782548573348,
+            "lastMessage": {
+              "deletedForEveryone": false,
+              "text": "你"
+            },
+            "lastMessageReceivedAt": 1782548573348,
+            "lastMessageReceivedAtMs": 1782549284221,
+            "lastUpdated": 1782548573348,
+            "messageCount": 1,
+            "sentMessageCount": 1,
+            "timestamp": 1782548573348,
+            "inboxPosition": 1782548573348,
+            "snippet": "你"
+          },
+          "xEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiw=": {
+            "id": "xEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiw=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "xEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiw=",
+            "masterKey": "DM8fqzHwWhM37046ZorzHRMqgn99H3g/eNa1uDbbrAE=",
+            "publicParams": "AMREF86YeY0GkgBc9AF+6ZFNduYyRPoJgPtpZVOc8EYstJDnvWr9Me1nEV8Si4hEcHv4QuEBavpmtACIvinpsGvApJ4lH2PZmhrp6Sxq3wicWq78g6jX8Yi4JEG8/MbDBw==",
+            "revision": 22,
+            "secretParams": "AAzPH6sx8FoTN+9OOmaK8x0TKoJ/fR94P3jWtbg226wBxEQXzph5jQaSAFz0AX7pkU125jJE+gmA+2llU5zwRiywbY+dBMqNZc/Eg2XqiFYgA4zLgirFpAfjQjFVFa4P4figtCmFj0MuG9M6mHnGPEB+Opsrbkj90S0JqCzIa7oD/qzpW59HMTuoxIsqFxhl1B/IC9D5BpIKvO/AhY8O/QC0kOe9av0x7WcRXxKLiERwe/hC4QFq+ma0AIi+KemwayBf0vuLwUgh4O7xknnW1PVVUHAg7vYfwxd/lIEsl1gAEgJFwaQwMS3GBK644A5dPpc/WjOc/nppXpel/Yn8PA3ApJ4lH2PZmhrp6Sxq3wicWq78g6jX8Yi4JEG8/MbDBw==",
+            "membersV2": [],
+            "pendingMembersV2": [
+              {
+                "addedByUserId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "role": 1,
+                "serviceId": "b4ee065d-a9b1-4626-87d6-e7e28a28b1b5",
+                "timestamp": 0
+              }
+            ],
+            "color": "A100",
+            "remoteAvatarUrl": "",
+            "title": "群组2",
+            "titleNoDefault": "群组2",
+            "searchableTitle": "群组2",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          "tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiY=": {
+            "id": "tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiY=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiY=",
+            "masterKey": "ETMSnVrguXjsUbfCm39rZK4DeSwP59ZT4vw8cdT+tPw=",
+            "publicParams": "ALcOnTxCHLKJ+w3oicepz1f7ggzd23iMZZGiibeZRGImpM1w1L4kDdQ8ijkquRKk8oIjZ4eGhWJzLQ7HsyfhpXN8Tca+flG4Gsa1Aryg2ZRnf20N4BeT+ER43Ux2WqVoMA==",
+            "revision": 5,
+            "secretParams": "ABEzEp1a4Ll47FG3wpt/a2SuA3ksD+fWU+L8PHHU/rT8tw6dPEIcson7DeiJx6nPV/uCDN3beIxlkaKJt5lEYiZd/D+hqWKih4mtNOHMeDZ2rDbqZ3D/rBima+DVoiCA8Aj9Pofo9vzaP0W4vSaNnnpYFie0MMen02VcOq9Zs9MGTEdFqEYmnuS1xQ9qslvAAOlA8aRf7q2PBnhLTiDshgWkzXDUviQN1DyKOSq5EqTygiNnh4aFYnMtDsezJ+GlcwuD1TxweN42DkVnQXVWbR4H7r9ExxmgVpAIhoY4tPcEQaKgX8AxYINvX//KANBRk8w8ZLiT6qqkoCdKsdX6oAx8Tca+flG4Gsa1Aryg2ZRnf20N4BeT+ER43Ux2WqVoMA==",
+            "membersV2": [
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              },
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 1
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A130",
+            "remoteAvatarUrl": "",
+            "title": "群11111222",
+            "titleNoDefault": "群11111222",
+            "searchableTitle": "群11111222",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          "XUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17Bg=": {
+            "id": "XUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17Bg=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "XUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17Bg=",
+            "masterKey": "lY69KEDhfgbPDS7Jh+289oQsyC0t8QKvju8AElBnNIU=",
+            "publicParams": "AF1FnEApG/f0lMsBZFsmhyJvImRLU85Ch6zWnSUbNewYvqiFJEY9iMPx0ZBo7y1pvIbg4w3KZUjIBoyYgYKM/hQEpz6gYzydMhUJcRJVTFBbQa+6Mm98Gm8TLH7gMXBEOw==",
+            "revision": 1,
+            "secretParams": "AJWOvShA4X4Gzw0uyYftvPaELMgtLfECr47vABJQZzSFXUWcQCkb9/SUywFkWyaHIm8iZEtTzkKHrNadJRs17BgkL/9XU4dto2zBcySpxDiGwVZpKaSzW2RCJ4HhR81MYOWaopiHQQTtde19wtg8MYP+b4UZZJ0P5q7oEhqoyIYJH9VkNW0NhmXuAX7DpnW5hawCcwCMxxTm2F5EWFvsWAS+qIUkRj2Iw/HRkGjvLWm8huDjDcplSMgGjJiBgoz+FOgAH+tRGMCuwydeQbWCj/Zk00RDn8uH0WtRe8dK35cHLn3ZJbjZRajG/ruYa9aSkTnIJ/lRS37QQpm4SF/W/wgEpz6gYzydMhUJcRJVTFBbQa+6Mm98Gm8TLH7gMXBEOw==",
+            "membersV2": [
+              {
+                "aci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+                "joinedAtVersion": 0,
+                "role": 2
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A190",
+            "remoteAvatarUrl": "",
+            "title": "一个群",
+            "titleNoDefault": "一个群",
+            "searchableTitle": "一个群",
+            "hasMessages": false,
+            "isArchived": false,
+            "isPinned": false
+          },
+          "8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaI=": {
+            "id": "8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaI=",
+            "type": "group",
+            "conversationType": "group",
+            "groupId": "8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaI=",
+            "masterKey": "5Bw63L/fCe+7Nw+SJdgOkcHF+r6l9o8z59rGk3X+HZ8=",
+            "publicParams": "APAx0FWSFLJ2vZbeEDILH9nq5Hf1nObp2TM/wV+SvpGiSJVLHQFWczxUq4We72UV1rF7LCvdAkYfaJKYXaLjEjFuQ7osiXWSEXcNfHt0cEDIVo53Dz3fnCWY1uB0xFEbVw==",
+            "revision": 14,
+            "secretParams": "AOQcOty/3wnvuzcPkiXYDpHBxfq+pfaPM+faxpN1/h2f8DHQVZIUsna9lt4QMgsf2erkd/Wc5unZMz/BX5K+kaJtfCdYdaXJdkyVBFDxlsDRWiawykyG1hB0iGFR9VpH/751bTaIrCoHBw4t0v1Vbas1T34mNGVZ6wtQ2Jz2xpYPwXh/arVhBenSb8SL51dQQMKeouRjE9O6OHrVOTpvig5IlUsdAVZzPFSrhZ7vZRXWsXssK90CRh9okphdouMSMTkB9NIaBXtV20E8XwCiaA3JB09FLFk8SsCWJUP2BV4BJs8NZW9IohMbea70/tSZFAphMc0M35YE0GVBhgpcaA1uQ7osiXWSEXcNfHt0cEDIVo53Dz3fnCWY1uB0xFEbVw==",
+            "membersV2": [
+              {
+                "aci": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+                "joinedAtVersion": 0,
+                "role": 2
+              }
+            ],
+            "pendingMembersV2": [],
+            "color": "A210",
+            "remoteAvatarUrl": "",
+            "title": "我的群11",
+            "titleNoDefault": "我的群11",
+            "searchableTitle": "我的群11",
+            "hasMessages": false,
+            "isArchived": true,
+            "isPinned": false
+          }
+        },
+        "messages": [
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1781677810783:0",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "body": "Hello",
+            "timestamp": 1781677810783,
+            "receivedAt": 1781679510826,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1781679580842:1",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "timestamp": 1781679580842,
+            "receivedAt": 1781679650007,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "Cac-RBAqjCbP15v6sVlA",
+                "cdnNumber": 3,
+                "keyBase64": "VWc7uqUtfcxYSuz1CjXh720MqKRmQjLfEGRHO6E8+1N6ryePxTYNx5zobN0xIUkHnJSCrxeJnaMhh2H8p7zykw==",
+                "key": "VWc7uqUtfcxYSuz1CjXh720MqKRmQjLfEGRHO6E8+1N6ryePxTYNx5zobN0xIUkHnJSCrxeJnaMhh2H8p7zykw==",
+                "size": 12960,
+                "contentType": "audio/mpeg",
+                "fileName": "",
+                "uploadTimestamp": 1781679583490,
+                "plaintextHash": "0922150bac3e563f5bf76d80b4014edee898b65c80b14556372b3339e08b78ae",
+                "status": "ready",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1781679589414:2",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "timestamp": 1781679589414,
+            "receivedAt": 1781679650042,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "8KMb954ggtO9IVPIMbCb",
+                "cdnNumber": 3,
+                "keyBase64": "IwVGQBgNHjxMPNHq4wmrC/o9r2ZAQga1SGX/p57FrChssYouRwxtWx8cpytOc+mZpJA59yTm0wJHoZ5+6aWBAw==",
+                "key": "IwVGQBgNHjxMPNHq4wmrC/o9r2ZAQga1SGX/p57FrChssYouRwxtWx8cpytOc+mZpJA59yTm0wJHoZ5+6aWBAw==",
+                "size": 58560,
+                "contentType": "audio/mpeg",
+                "fileName": "",
+                "uploadTimestamp": 1781679591924,
+                "plaintextHash": "531bd7d2ca0fc358e95895a548de6cbea04c22e159b57fc57d1a6d6c8574ce97",
+                "status": "ready",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1782351422950:3",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "timestamp": 1782351422950,
+            "receivedAt": 1782351422950,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "message-request-response-event",
+            "messageRequestResponseEvent": "ACCEPT"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1782351427411:4",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "body": "你好",
+            "timestamp": 1782351427411,
+            "receivedAt": 1782351427411,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1782366673548:5",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "body": "asd",
+            "timestamp": 1782366673548,
+            "receivedAt": 1782366684160,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1782366704573:6",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "body": "asdasdd",
+            "timestamp": 1782366704573,
+            "receivedAt": 1782366706342,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:535cc856-c419-4de0-a329-d21579ce8bf9:1782366776252:7",
+            "conversationId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "body": "ssss",
+            "timestamp": 1782366776252,
+            "receivedAt": 1782367076902,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782540291471:8",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "122",
+            "timestamp": 1782540291471,
+            "receivedAt": 1782540682175,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782540904946:9",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "233",
+            "timestamp": 1782540904946,
+            "receivedAt": 1782541559383,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782540960223:10",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "33",
+            "timestamp": 1782540960223,
+            "receivedAt": 1782541559408,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782541076899:11",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "333",
+            "timestamp": 1782541076899,
+            "receivedAt": 1782541559430,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782541133750:12",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "22",
+            "timestamp": 1782541133750,
+            "receivedAt": 1782541559441,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782541408324:13",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "2",
+            "timestamp": 1782541408324,
+            "receivedAt": 1782541559713,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782541741516:14",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "2",
+            "timestamp": 1782541741516,
+            "receivedAt": 1782542742772,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:55d41c45-d3ca-42f1-81ab-3d6737cf29ff:1782541794628:15",
+            "conversationId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "body": "1",
+            "timestamp": 1782541794628,
+            "receivedAt": 1782542742836,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff"
+          },
+          {
+            "id": "backup:55d41c45-d3ca-42f1-81ab-3d6737cf29ff:1782541806826:16",
+            "conversationId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "body": "1",
+            "timestamp": 1782541806826,
+            "receivedAt": 1782542742899,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782545743649:17",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "timestamp": 1782545743649,
+            "receivedAt": 1782546116630,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "isErased": true,
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "deletedForEveryone": true,
+            "deletedForEveryoneTimestamp": 1782545743649
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782548496107:18",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "timestamp": 1782548496107,
+            "receivedAt": 1782549284109,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "-vQlnjkKflNjuQQv-Y8Z",
+                "cdnNumber": 3,
+                "keyBase64": "nWRS8uQusghqcG/XBfiQDKfe7zFVaYrdQ3KPZbQ1yjEr/TbpSeWCStWhQA37GkFhbUmK1LRHKLBunHmnzxoaaw==",
+                "key": "nWRS8uQusghqcG/XBfiQDKfe7zFVaYrdQ3KPZbQ1yjEr/TbpSeWCStWhQA37GkFhbUmK1LRHKLBunHmnzxoaaw==",
+                "size": 1135199,
+                "contentType": "image/png",
+                "fileName": "image_2026-06-15_18-17-09 (1).png",
+                "width": 1536,
+                "height": 1024,
+                "uploadTimestamp": 1782439065600,
+                "plaintextHash": "63bca86d595d685e6a0daa7ffa1e15fe1842bcd328d0745fdd8aca67b1b3e8db",
+                "status": "ready",
+                "clientUuid": "7a5a1d2f-5539-4663-a581-9b8a169025d6"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782548508187:19",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "timestamp": 1782548508187,
+            "receivedAt": 1782549284115,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "keyBase64": "FEIp+EH61Y3ZMF3bKsHYVwVDz5Qr/FLfa0dbK5jHRDDeC+lLn3vWXgfQ6hD1o2BMnHGCeckbGZly2oFNk54xEQ==",
+                "key": "FEIp+EH61Y3ZMF3bKsHYVwVDz5Qr/FLfa0dbK5jHRDDeC+lLn3vWXgfQ6hD1o2BMnHGCeckbGZly2oFNk54xEQ==",
+                "size": 14760,
+                "contentType": "audio/mpeg",
+                "plaintextHash": "bb3501deeb8523c2aa398e45abbf3f1e451e1b7371b2ebd126d234c4dbf338a5",
+                "status": "ready",
+                "clientUuid": "8e2b0282-2854-4b6e-b104-38f40001ae7d",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=:1782548573348:20",
+            "conversationId": "wngkOHykBYgW7p0d8wQsPNEp7lxZNadacIkrEXWKSVE=",
+            "body": "你",
+            "timestamp": 1782548573348,
+            "receivedAt": 1782549284221,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:55d41c45-d3ca-42f1-81ab-3d6737cf29ff:1782548783503:21",
+            "conversationId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "body": "😃",
+            "timestamp": 1782548783503,
+            "receivedAt": 1782549284226,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782701152960:22",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "body": "244",
+            "timestamp": 1782701152960,
+            "receivedAt": 1782701482084,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782701202268:23",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "body": "1",
+            "timestamp": 1782701202268,
+            "receivedAt": 1782701482094,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=:1782702441363:31",
+            "conversationId": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "body": "123",
+            "timestamp": 1782702441363,
+            "receivedAt": 1782704135650,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782702954315:24",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782702954315,
+            "receivedAt": 1782704133793,
+            "direction": "incoming",
+            "attachments": [
+              {
+                "cdnKey": "670lZ20Uym0pW8QfsjSr",
+                "cdnNumber": 3,
+                "keyBase64": "RjY/NidKCAizEd5+gLTuTV8xw7dFvIuXqI4Js+Rrn1MG4cZo8pZePNzdUavtHswzHE70PaU0/xs2phEhwTiivQ==",
+                "key": "RjY/NidKCAizEd5+gLTuTV8xw7dFvIuXqI4Js+Rrn1MG4cZo8pZePNzdUavtHswzHE70PaU0/xs2phEhwTiivQ==",
+                "size": 72395,
+                "contentType": "image/jpeg",
+                "width": 1054,
+                "height": 724,
+                "blurHash": "LARysg4n~q_3s:Rjxuoz%gt7MxRj",
+                "uploadTimestamp": 1782702954546,
+                "plaintextHash": "a17f6d7b7a46d42d0f72ec4e2604517eef2be0140fdbf20c7d1ed84267837a73",
+                "status": "ready",
+                "clientUuid": "c896ae37-e09b-48ab-99d8-d4e74ad9688d"
+              }
+            ],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782702962523:25",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782702962523,
+            "receivedAt": 1782704133805,
+            "direction": "incoming",
+            "attachments": [
+              {
+                "cdnKey": "aA2iIEfFe7cp31XsnXRm",
+                "cdnNumber": 3,
+                "keyBase64": "pht69cW6Oc4RlYio/EycnkhEdHsTw34v6bxb2NiVDe3OmO7o4Hwf/Sq33ipVWG/ZMm2SCcx73IQ2C0lygJLd4w==",
+                "key": "pht69cW6Oc4RlYio/EycnkhEdHsTw34v6bxb2NiVDe3OmO7o4Hwf/Sq33ipVWG/ZMm2SCcx73IQ2C0lygJLd4w==",
+                "digestBase64": "0l0sSpuTY/L524309vz7uQvkcsyc6wZ49EyJSLwhMs4=",
+                "digest": "0l0sSpuTY/L524309vz7uQvkcsyc6wZ49EyJSLwhMs4=",
+                "size": 1111730,
+                "contentType": "video/mp4",
+                "width": 720,
+                "height": 1280,
+                "uploadTimestamp": 1782702963113,
+                "status": "ready",
+                "clientUuid": "9870db2e-e8d6-424b-b4df-75e7d2b6a30f"
+              }
+            ],
+            "sourceServiceId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782703071530:26",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782703071530,
+            "receivedAt": 1782704133831,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "-vQlnjkKflNjuQQv-Y8Z",
+                "cdnNumber": 3,
+                "keyBase64": "nWRS8uQusghqcG/XBfiQDKfe7zFVaYrdQ3KPZbQ1yjEr/TbpSeWCStWhQA37GkFhbUmK1LRHKLBunHmnzxoaaw==",
+                "key": "nWRS8uQusghqcG/XBfiQDKfe7zFVaYrdQ3KPZbQ1yjEr/TbpSeWCStWhQA37GkFhbUmK1LRHKLBunHmnzxoaaw==",
+                "size": 1135199,
+                "contentType": "image/png",
+                "fileName": "image_2026-06-15_18-17-09 (1).png",
+                "width": 1536,
+                "height": 1024,
+                "uploadTimestamp": 1782439065600,
+                "plaintextHash": "63bca86d595d685e6a0daa7ffa1e15fe1842bcd328d0745fdd8aca67b1b3e8db",
+                "status": "ready",
+                "clientUuid": "9737ae23-2b83-4809-8966-a24a86512df6"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782703266487:27",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782703266487,
+            "receivedAt": 1782704133835,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "keyBase64": "AR5K0+LX3MQWkbouIgm07J7XPxuIGM2qA91s5nszlp6CpOweYwXDMEv9KEJNXF9/3rtGtsRY1ra1N9X4rx8B9w==",
+                "key": "AR5K0+LX3MQWkbouIgm07J7XPxuIGM2qA91s5nszlp6CpOweYwXDMEv9KEJNXF9/3rtGtsRY1ra1N9X4rx8B9w==",
+                "size": 14688,
+                "contentType": "audio/mpeg",
+                "plaintextHash": "62d42fcde8a71637052148579ce05d6e823397df285e3156bb65b71b6704e25b",
+                "status": "ready",
+                "clientUuid": "df3ca8dc-eb2b-4a21-9663-3ba2086e4bd4",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782703291759:28",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782703291759,
+            "receivedAt": 1782704133839,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "keyBase64": "oi7M7gMTOB2YgmcxaiESZ8ejKa8bvcJwEoyOa8GVYFJbaMQWMgqMol77z9+MA6ITAM9ITVU+iDzMFzios2O80Q==",
+                "key": "oi7M7gMTOB2YgmcxaiESZ8ejKa8bvcJwEoyOa8GVYFJbaMQWMgqMol77z9+MA6ITAM9ITVU+iDzMFzios2O80Q==",
+                "size": 32940,
+                "contentType": "audio/mpeg",
+                "plaintextHash": "e5481f90b4cdfad9c8d5e89ddcab5b4c9449e882ce31f5057603a5e9475a9f5f",
+                "status": "ready",
+                "clientUuid": "33b151d8-c18e-488e-9245-74c673585d94",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782703328761:29",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782703328761,
+            "receivedAt": 1782704133846,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "OB3n3l5wdGKHcs-XJvki",
+                "cdnNumber": 3,
+                "keyBase64": "S5Vaxmkz6n+keCGr6pdeRTw89BpazlU6D1PRyI1IuKjGx0bqUKpfg5JxvD6PArxxupL2VoSiFK7Z/JeN3pRLQw==",
+                "key": "S5Vaxmkz6n+keCGr6pdeRTw89BpazlU6D1PRyI1IuKjGx0bqUKpfg5JxvD6PArxxupL2VoSiFK7Z/JeN3pRLQw==",
+                "size": 16740,
+                "contentType": "audio/mpeg",
+                "uploadTimestamp": 1782703328968,
+                "plaintextHash": "dc499b537fab4ee8866e92da0e634187242be9647672953d8d2c74f6a79ad0a2",
+                "status": "ready",
+                "clientUuid": "c17b396d-1a12-42a2-99c3-162fa45b6b2c",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782703347539:30",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782703347539,
+            "receivedAt": 1782704133849,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "A6d4s-u2R2rC-F0gJrg3",
+                "cdnNumber": 3,
+                "keyBase64": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "key": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "digestBase64": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "digest": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "size": 419296,
+                "contentType": "video/mp4",
+                "width": 480,
+                "height": 848,
+                "uploadTimestamp": 1782703347623,
+                "status": "ready",
+                "clientUuid": "f9b6b091-21fd-48f9-ad91-1aa4c4dbc541"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=:1782703602775:32",
+            "conversationId": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "timestamp": 1782703602775,
+            "receivedAt": 1782704135681,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "VEjNra9uGS_lDownIPuo",
+                "cdnNumber": 3,
+                "keyBase64": "yIN6P6WqgKlB4THFzY24NVidSRFrUQv6OwuS9aH8cAT/+o8UCY0mN0gqlsJ90yNiWSEcMw5loUg+5K6vYopopw==",
+                "key": "yIN6P6WqgKlB4THFzY24NVidSRFrUQv6OwuS9aH8cAT/+o8UCY0mN0gqlsJ90yNiWSEcMw5loUg+5K6vYopopw==",
+                "size": 11772,
+                "contentType": "audio/mpeg",
+                "uploadTimestamp": 1782703610753,
+                "plaintextHash": "48a3710436f34afc1689e70276304343e6e464b26469bb72787401ed5dcd1f1e",
+                "status": "ready",
+                "clientUuid": "40e0fe61-c9eb-45f8-99ac-b1bc85e14734",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=:1782703609087:33",
+            "conversationId": "iUE/u3lHfo82icEygmxKaA4OzNm3QwZtQvogQjhcaf4=",
+            "timestamp": 1782703609087,
+            "receivedAt": 1782704135688,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "A6d4s-u2R2rC-F0gJrg3",
+                "cdnNumber": 3,
+                "keyBase64": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "key": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "digestBase64": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "digest": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "size": 419296,
+                "contentType": "video/mp4",
+                "width": 480,
+                "height": 848,
+                "uploadTimestamp": 1782703347623,
+                "status": "ready",
+                "clientUuid": "db441d64-73da-4018-9131-2f58536d2b9b"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782704284087:34",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782704284087,
+            "receivedAt": 1782704395358,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "A6d4s-u2R2rC-F0gJrg3",
+                "cdnNumber": 3,
+                "keyBase64": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "key": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "digestBase64": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "digest": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "size": 419296,
+                "contentType": "video/mp4",
+                "width": 480,
+                "height": 848,
+                "uploadTimestamp": 1782703347623,
+                "status": "ready",
+                "clientUuid": "c3176beb-a13c-4579-af09-5ee01aeab5a2"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782710548782:35",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782710548782,
+            "receivedAt": 1782710548782,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "pinned-message-notification",
+            "pinMessage": {
+              "targetAuthorAci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+              "targetSentTimestamp": 1782704284087,
+              "pinDurationSeconds": null
+            }
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782710548873:36",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782710548873,
+            "receivedAt": 1782710548873,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "pinned-message-notification",
+            "pinMessage": {
+              "targetAuthorAci": "535cc856-c419-4de0-a329-d21579ce8bf9",
+              "targetSentTimestamp": 1782703291759,
+              "pinDurationSeconds": null
+            }
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782710566987:37",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782710566987,
+            "receivedAt": 1782710566987,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "pinned-message-notification",
+            "pinMessage": {
+              "targetAuthorAci": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+              "targetSentTimestamp": 1782702954315,
+              "pinDurationSeconds": null
+            }
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782711586547:38",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782711586547,
+            "receivedAt": 1782712362704,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "keyBase64": "snN9bX7AccaKqPHo+C7dD64wleU6bJgxbJ4QPzIMkNjC4mrERQSPXbfKWoTsm+fodTqfnzOcHQiB3N2Z2qtyQg==",
+                "key": "snN9bX7AccaKqPHo+C7dD64wleU6bJgxbJ4QPzIMkNjC4mrERQSPXbfKWoTsm+fodTqfnzOcHQiB3N2Z2qtyQg==",
+                "size": 36144,
+                "contentType": "audio/mpeg",
+                "plaintextHash": "52951f3ccc0d920cde1a3c39933bf4ba6d65e0abe741a7c30f940a7d534be791",
+                "status": "ready",
+                "clientUuid": "ad27c6cd-5656-4523-9708-273a25fd2660",
+                "flags": 1
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782715387307:39",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782715387307,
+            "receivedAt": 1782716079456,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "A6d4s-u2R2rC-F0gJrg3",
+                "cdnNumber": 3,
+                "keyBase64": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "key": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "digestBase64": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "digest": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "size": 419296,
+                "contentType": "video/mp4",
+                "width": 480,
+                "height": 848,
+                "uploadTimestamp": 1782703347623,
+                "status": "ready",
+                "clientUuid": "70c3e560-6c38-44af-aaf4-1028e00cc337"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782715436183:40",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "body": "在呢",
+            "timestamp": 1782715436183,
+            "receivedAt": 1782716079485,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:55d41c45-d3ca-42f1-81ab-3d6737cf29ff:1782715450639:41",
+            "conversationId": "55d41c45-d3ca-42f1-81ab-3d6737cf29ff",
+            "body": "在呢",
+            "timestamp": 1782715450639,
+            "receivedAt": 1782716079618,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782715468386:42",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782715468386,
+            "receivedAt": 1782716079655,
+            "direction": "outgoing",
+            "status": "sent",
+            "attachments": [
+              {
+                "cdnKey": "A6d4s-u2R2rC-F0gJrg3",
+                "cdnNumber": 3,
+                "keyBase64": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "key": "ysfadFmRZ2Zm3KANXGw+bgSPQnyKjyu7ySiooagP8YfTMFpKZwhHJziGuVEtnksIiVe/zUx7yBNibtB7gnHB+g==",
+                "digestBase64": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "digest": "25/1lmYkwMawySrlXbcKS5MdSzW7Zt4w0STOXfsr/F8=",
+                "size": 419296,
+                "contentType": "video/mp4",
+                "width": 480,
+                "height": 848,
+                "uploadTimestamp": 1782703347623,
+                "status": "ready",
+                "clientUuid": "70c3e560-6c38-44af-aaf4-1028e00cc337"
+              }
+            ],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782724873464:43",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782724873464,
+            "receivedAt": 1782724873464,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "message-request-response-event",
+            "messageRequestResponseEvent": "BLOCK"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782724873564:44",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782724873564,
+            "receivedAt": 1782724873564,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "message-request-response-event",
+            "messageRequestResponseEvent": "UNBLOCK"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782724921144:45",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782724921144,
+            "receivedAt": 1782724921144,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "message-request-response-event",
+            "messageRequestResponseEvent": "BLOCK"
+          },
+          {
+            "id": "backup:66cfd134-7f0e-49b6-8d99-0d8602ead5e3:1782725143632:46",
+            "conversationId": "66cfd134-7f0e-49b6-8d99-0d8602ead5e3",
+            "timestamp": 1782725143632,
+            "receivedAt": 1782725143632,
+            "direction": "incoming",
+            "attachments": [],
+            "sourceServiceId": "535cc856-c419-4de0-a329-d21579ce8bf9",
+            "desktopType": "message-request-response-event",
+            "messageRequestResponseEvent": "UNBLOCK"
+          }
+        ],
+        "pinnedMessages": []
+      },
+      "mediaRootBackupKeyBase64": "ajikTIang2ektqqnfeHuK/FYPwohd3Xw1dNpr1BD7cQ=",
+      "stats": {
+        "backupInfo": 1,
+        "recipients": 11,
+        "chats": 10,
+        "chatItems": 54,
+        "messages": 47,
+        "skippedChatItems": 7,
+        "skippedChatItemTypes": {
+          "updateMessage.groupChange": 4,
+          "standardMessage": 3
+        },
+        "unsupportedFrames": 7
+      }
+    }
+  }
+}
