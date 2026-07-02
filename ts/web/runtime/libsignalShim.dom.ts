@@ -5,6 +5,22 @@ function unavailable(name: string): never {
   throw new Error(`${name} is provided by the Signal Web backend`);
 }
 
+function uuidStringToBytes(value: string): Uint8Array {
+  const normalized = value.replace(/^PNI:/i, '').replaceAll('-', '');
+  if (!/^[0-9a-f]{32}$/i.test(normalized)) {
+    throw new Error(`Invalid service id UUID: ${value}`);
+  }
+
+  const result = new Uint8Array(16);
+  for (let index = 0; index < result.length; index += 1) {
+    result[index] = Number.parseInt(
+      normalized.slice(index * 2, index * 2 + 2),
+      16
+    );
+  }
+  return result;
+}
+
 class BytesValue {
   public readonly value: Uint8Array;
 
@@ -33,11 +49,39 @@ export class Aci extends BytesValue {
   public static parseFromServiceIdString(value: string): Aci {
     return new Aci(value);
   }
+
+  public getRawUuidBytes(): Uint8Array {
+    return uuidStringToBytes(this.getServiceIdString());
+  }
+
+  public override getRawUuid(): Uint8Array {
+    return this.getRawUuidBytes();
+  }
+
+  public getServiceIdBinary(): Uint8Array {
+    return this.getRawUuidBytes();
+  }
 }
 
 export class Pni extends BytesValue {
   public static parseFromServiceIdString(value: string): Pni {
     return new Pni(value);
+  }
+
+  public getRawUuidBytes(): Uint8Array {
+    return uuidStringToBytes(this.getServiceIdString());
+  }
+
+  public override getRawUuid(): Uint8Array {
+    return this.getRawUuidBytes();
+  }
+
+  public getServiceIdBinary(): Uint8Array {
+    const rawUuid = this.getRawUuidBytes();
+    const result = new Uint8Array(rawUuid.length + 1);
+    result[0] = 1;
+    result.set(rawUuid, 1);
+    return result;
   }
 }
 

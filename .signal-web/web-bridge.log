@@ -1,0 +1,33 @@
+[WARN] Unsupported engine: wanted: {"node":"24.15.0"} (current: {"node":"v22.16.0","pnpm":"11.5.2"})
+$ run-p --race web:dev:bridge web:dev:static web:dev:watch
+[WARN] Unsupported engine: wanted: {"node":"24.15.0"} (current: {"node":"v22.16.0","pnpm":"11.5.2"})
+[WARN] Unsupported engine: wanted: {"node":"24.15.0"} (current: {"node":"v22.16.0","pnpm":"11.5.2"})
+[WARN] Unsupported engine: wanted: {"node":"24.15.0"} (current: {"node":"v22.16.0","pnpm":"11.5.2"})
+$ http-server web-dist --port 3001 --host 127.0.0.1 --cors --silent -c-1
+$ run-s build:styles build:web:assets && rolldown -c rolldown.web.config.ts --watch
+$ tsx ts/web/provisioning/WebProvisioningBridge.node.ts
+node:events:496
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use 0.0.0.0:3001
+    at Server.setupListenHandle [as _listen2] (node:net:1939:16)
+    at listenInCluster (node:net:1996:12)
+    at node:net:2205:7
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1975:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  code: 'EADDRINUSE',
+  errno: -48,
+  syscall: 'listen',
+  address: '0.0.0.0',
+  port: 3001
+}
+
+Node.js v22.16.0
+[ELIFECYCLE] Command failed with exit code 1.
+[ELIFECYCLE] Command failed.
+[ELIFECYCLE] Command failed with exit code 143.
+ERROR: "web:dev:static" exited with 1.
+[ELIFECYCLE] Command failed with exit code 1.

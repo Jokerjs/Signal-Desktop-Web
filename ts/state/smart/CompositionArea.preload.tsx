@@ -1,7 +1,7 @@
 // Copyright 2019 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useCallback, useMemo, memo } from 'react';
+import { useCallback, useEffect, useMemo, memo } from 'react';
 import { useSelector } from 'react-redux';
 import { CompositionArea } from '../../components/CompositionArea.dom.tsx';
 import { useContactNameData } from '../../components/conversation/ContactName.dom.tsx';
@@ -31,7 +31,7 @@ import {
   getSelectedMessageIds,
   isMissingRequiredProfileSharing,
 } from '../selectors/conversations.dom.ts';
-import { getHasPanelOpen } from '../selectors/nav.std.ts';
+import { getHasPanelOpen, getSelectedNavTab } from '../selectors/nav.std.ts';
 import { getSharedGroupNames } from '../../util/sharedGroupNames.dom.ts';
 import {
   getDefaultConversationColor,
@@ -61,6 +61,8 @@ import { isConversationEverUnregistered } from '../../util/isConversationUnregis
 import { isDirectConversation } from '../../util/whatTypeOfConversation.dom.ts';
 import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import { useNavActions } from '../ducks/nav.std.ts';
+import { NavTab } from '../../types/Nav.std.ts';
+import { RecordingState } from '../../types/AudioRecorder.std.ts';
 import { isFeaturedEnabledSelector } from '../../util/isFeatureEnabled.dom.ts';
 
 function renderSmartCompositionRecording() {
@@ -100,6 +102,7 @@ export const SmartCompositionArea = memo(function SmartCompositionArea({
   );
   const hasGlobalModalOpen = useSelector(isShowingAnyModal);
   const hasPanelOpen = useSelector(getHasPanelOpen);
+  const selectedNavTab = useSelector(getSelectedNavTab);
   const getGroupAdmins = useSelector(getGroupAdminsSelector);
   const getPreferredBadge = useSelector(getPreferredBadgeSelector);
   const composerStateForConversationIdSelector = useSelector(
@@ -137,8 +140,10 @@ export const SmartCompositionArea = memo(function SmartCompositionArea({
   }, [messageLookup, selectedMessageIds]);
 
   const isActive = useMemo(() => {
-    return !hasGlobalModalOpen && !hasPanelOpen;
-  }, [hasGlobalModalOpen, hasPanelOpen]);
+    return (
+      selectedNavTab === NavTab.Chats && !hasGlobalModalOpen && !hasPanelOpen
+    );
+  }, [hasGlobalModalOpen, hasPanelOpen, selectedNavTab]);
 
   const groupAdmins = useMemo(() => {
     return getGroupAdmins(id);
@@ -237,6 +242,15 @@ export const SmartCompositionArea = memo(function SmartCompositionArea({
     startRecording,
     errorRecording,
   } = useAudioRecorderActions();
+
+  useEffect(() => {
+    if (isActive || recordingState === RecordingState.Idle) {
+      return;
+    }
+
+    cancelRecording();
+  }, [cancelRecording, isActive, recordingState]);
+
   const { onUseEmoji } = useEmojisActions();
   const {
     showGV2MigrationDialog,

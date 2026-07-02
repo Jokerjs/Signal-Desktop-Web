@@ -4,11 +4,14 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
+  useRef,
   useState,
   type Dispatch,
   type JSX,
   type SetStateAction,
 } from 'react';
+import lodash from 'lodash';
 import { Provider, useSelector } from 'react-redux';
 import type { Store } from 'redux';
 import { AppProvider } from '../../windows/AppProvider.dom.tsx';
@@ -39,24 +42,36 @@ import { InstallScreenBackupStep } from '../../types/InstallScreen.std.ts';
 import {
   buildAttachmentAccessUrl,
   consumeMessageTransportStream,
+  createGroupConversation,
+  confirmSignalUsername,
+  confirmSignalUsernameReservation,
+  deleteSignalUsername,
   requestAttachmentBackfill,
+  replaceSignalUsernameLink,
+  reserveSignalUsername,
+  reserveSignalUsernameByNickname,
+  resetSignalUsernameLink,
   sendDirectDeleteForEveryone,
   sendDirectTextMessage,
   sendDirectReaction,
   sendDirectUnpinMessage,
   sendGroupReaction,
   sendGroupTextMessage,
+  syncSignalUsernameProfile,
   syncContacts,
+  writeProfile as writeSignalProfile,
 } from '../api.dom.ts';
 import { getWebAttachmentContentTypeFromParts } from '../attachmentMime.std.ts';
 import {
   applyContactsBootstrap,
   compareWebMessages,
+  getConversationTitle,
   getDesktopMessageMetrics,
   getConversationListSortTimestamp,
   getWebAttachmentVirtualPath,
   getWebConversationLastMessage,
   getWebMessagePreviewText,
+  normalizeChatShellForLinkedSession,
   registerMessageInCache,
   toDesktopConversation,
   toDesktopMessage,
@@ -74,6 +89,7 @@ import {
 } from '../persistence.dom.ts';
 import type {
   ChatShellState,
+  ContactsBootstrap,
   LinkedSessionRecord,
   MessageStreamEvent,
   WebAttachment,
@@ -107,11 +123,15 @@ import {
 import type { PinnedMessage } from '../../types/PinnedMessage.std.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import { SECOND } from '../../util/durations/index.std.ts';
+import type { ConversationType } from '../../state/ducks/conversations.preload.ts';
+import type { AvatarUpdateOptionsType } from '../../types/Avatar.std.ts';
+import { isSharingPhoneNumberWithEverybody } from '../../util/phoneNumberSharingMode.preload.ts';
 
 const VIDEO_THUMBNAIL_MAX_SIDE = 480;
 const VIDEO_THUMBNAIL_QUALITY = 0.82;
 const VIDEO_THUMBNAIL_TIMEOUT = 30_000;
-const ATTACHMENT_BACKFILL_REQUEST_TIMEOUT = 10 * SECOND;
+const ATTACHMENT_BACKFILL_REQUEST_TIMEOUT = 4 * SECOND;
+const CONTACTS_SYNC_ON_OPEN_THROTTLE_MS = 60 * SECOND;
 const ATTACHMENT_BACKFILL_STATUS_PENDING =
   Proto.SyncMessage.AttachmentBackfillResponse.AttachmentData.Status.PENDING;
 const ATTACHMENT_BACKFILL_STATUS_TERMINAL_ERROR =
@@ -119,6 +139,7 @@ const ATTACHMENT_BACKFILL_STATUS_TERMINAL_ERROR =
     .TERMINAL_ERROR;
 const ATTACHMENT_BACKFILL_ERROR_MESSAGE_NOT_FOUND =
   Proto.SyncMessage.AttachmentBackfillResponse.Error.MESSAGE_NOT_FOUND;
+const { isEqual } = lodash;
 const EMPTY_SHELL: ChatShellState = {
   conversationLookup: {},
   messages: [],
@@ -138,6 +159,11 @@ function isWebAudioAttachment(attachment: WebAttachment): boolean {
   );
 }
 
+function isWebVisualAttachment(attachment: WebAttachment): boolean {
+  const contentType = getWebAttachmentContentTypeFromParts(attachment);
+  return contentType.startsWith('image/') || contentType.startsWith('video/');
+}
+
 function isWebBackupOnlyAudioAttachment(attachment: WebAttachment): boolean {
   const keyBase64 = attachment.keyBase64 ?? attachment.key;
   return (
@@ -151,7 +177,54 @@ function isWebBackupOnlyAudioAttachment(attachment: WebAttachment): boolean {
   );
 }
 
+function isWebBackupOnlyVisualAttachment(attachment: WebAttachment): boolean {
+  const keyBase64 = attachment.keyBase64 ?? attachment.key;
+  return (
+    isWebVisualAttachment(attachment) &&
+    !attachment.cdnId &&
+    !attachment.cdnKey &&
+    Boolean(keyBase64) &&
+    Boolean(attachment.plaintextHash) &&
+    attachment.dataBase64 == null &&
+    attachment.localBlobKey == null
+  );
+}
+
+function shouldRequestWebAttachmentBackfill(
+  attachment: WebAttachment
+): boolean {
+  if (
+    isWebBackupOnlyAudioAttachment(attachment) ||
+    isWebBackupOnlyVisualAttachment(attachment)
+  ) {
+    return true;
+  }
+
+  if (!isWebVisualAttachment(attachment)) {
+    return false;
+  }
+
+  if (
+    attachment.dataBase64 != null ||
+    attachment.downloadPath != null ||
+    attachment.localBlobKey != null ||
+    attachment.path != null
+  ) {
+    return false;
+  }
+
+  return (
+    !buildAttachmentAccessUrl(attachment) ||
+    attachment.backfillError === true ||
+    attachment.status === 'failed'
+  );
+}
+
 type SignalWebRuntime = {
+  writeProfile?: (
+    conversation: ConversationType,
+    options: AvatarUpdateOptionsType
+  ) => Promise<void>;
   forwardMessages?: (
     conversationIds: ReadonlyArray<string>,
     drafts: ReadonlyArray<MessageForwardDraft>
@@ -175,7 +248,56 @@ type SignalWebRuntime = {
   ) => boolean;
   leaveGroup?: (conversationId: string) => Promise<boolean>;
   downloadAttachmentsForMessage?: (messageId: string) => Promise<boolean>;
-  markAttachmentUnavailable?: (messageId: string, attachmentPath: string) => void;
+  markAttachmentReady?: (messageId: string, attachmentPath: string) => void;
+  markAttachmentUnavailable?: (
+    messageId: string,
+    attachmentPath: string
+  ) => void;
+  reserveUsername?: (
+    usernameHashes: ReadonlyArray<string>
+  ) => Promise<{ usernameHash: string }>;
+  reserveUsernameByNickname?: (
+    body: Readonly<{
+      customDiscriminator?: string;
+      maxNicknameLength: number;
+      minNicknameLength: number;
+      nickname: string;
+      previousUsername?: string;
+    }>
+  ) => Promise<{ hashBase64: string; username: string }>;
+  confirmUsername?: (
+    body: Readonly<{
+      encryptedUsername: string;
+      usernameHash: string;
+      zkProof: string;
+    }>
+  ) => Promise<{ usernameLinkHandle: string }>;
+  confirmUsernameReservation?: (
+    body: Readonly<{
+      hashBase64: string;
+      previousLinkEntropyBase64?: string;
+      username: string;
+    }>
+  ) => Promise<{ entropyBase64: string; usernameLinkHandle: string }>;
+  deleteUsername?: () => Promise<void>;
+  replaceUsernameLink?: (
+    body: Readonly<{
+      keepLinkHandle: boolean;
+      usernameLinkEncryptedValue: string;
+    }>
+  ) => Promise<{ usernameLinkHandle: string }>;
+  resetUsernameLink?: (
+    username: string
+  ) => Promise<{ entropyBase64: string; usernameLinkHandle: string }>;
+  syncUsernameProfile?: (username: string | undefined) => Promise<void>;
+  createGroupV2?: (
+    options: Readonly<{
+      name: string;
+      avatar: undefined | Uint8Array<ArrayBuffer>;
+      expireTimer: undefined | number;
+      conversationIds: ReadonlyArray<string>;
+    }>
+  ) => Promise<unknown>;
 };
 
 type BackupImportStatus = Extract<
@@ -204,6 +326,15 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
       { once: true }
     );
   });
+}
+
+function uint8ArrayToBase64(value: Uint8Array<ArrayBuffer>): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < value.length; index += chunkSize) {
+    binary += String.fromCharCode(...value.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function renderEmpty(): JSX.Element {
@@ -270,7 +401,7 @@ function shouldImportBackup(
 ): boolean {
   return Boolean(
     linkedSession?.linkedPayload.ephemeralBackupKeyBase64 &&
-      shell.messages.length === 0
+    shell.messages.length === 0
   );
 }
 
@@ -333,6 +464,132 @@ function dispatchLinkedSessionUserState(
         ) as StateType['user']['ourPni'])
       : undefined,
   });
+}
+
+function mergeLinkedSessionAccount(
+  linkedSession: LinkedSessionRecord,
+  account: ContactsBootstrap['account']
+): LinkedSessionRecord {
+  if (!account) {
+    return linkedSession;
+  }
+
+  const nextAccount = {
+    ...linkedSession.account,
+    ...account,
+  };
+  const nextLinkedPayloadAccount = {
+    ...linkedSession.linkedPayload.account,
+    ...account,
+  };
+
+  if (
+    isEqual(linkedSession.account, nextAccount) &&
+    isEqual(linkedSession.linkedPayload.account, nextLinkedPayloadAccount)
+  ) {
+    return linkedSession;
+  }
+
+  return {
+    ...linkedSession,
+    account: nextAccount,
+    linkedPayload: {
+      ...linkedSession.linkedPayload,
+      account: nextLinkedPayloadAccount,
+    },
+    lastUpdatedAt: Date.now(),
+  };
+}
+
+function mergeContactsBootstrapWithLinkedProfile(
+  data: ContactsBootstrap,
+  linkedSession: LinkedSessionRecord
+): ContactsBootstrap {
+  if (
+    !data.account ||
+    typeof linkedSession.account.localProfileUpdatedAt !== 'number'
+  ) {
+    return data;
+  }
+
+  const nextAccount = {
+    ...data.account,
+    about: linkedSession.account.about,
+    aboutEmoji: linkedSession.account.aboutEmoji,
+    avatarUrl: linkedSession.account.avatarUrl,
+    avatarUrlPath: linkedSession.account.avatarUrlPath,
+    familyName: linkedSession.account.familyName,
+    firstName: linkedSession.account.firstName,
+    localProfileUpdatedAt: linkedSession.account.localProfileUpdatedAt,
+    profileFamilyName: linkedSession.account.profileFamilyName,
+    profileName: linkedSession.account.profileName,
+    title: linkedSession.account.title,
+  };
+
+  if (isEqual(data.account, nextAccount)) {
+    return data;
+  }
+
+  return {
+    ...data,
+    account: nextAccount,
+  };
+}
+
+function updateNoteToSelfProfile(
+  shell: ChatShellState,
+  linkedSession: LinkedSessionRecord,
+  account: LinkedSessionRecord['account']
+): ChatShellState {
+  const conversationId =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  if (!conversationId) {
+    return shell;
+  }
+
+  const existing = shell.conversationLookup[conversationId];
+  if (!existing) {
+    return shell;
+  }
+
+  const updated: WebConversation = {
+    ...existing,
+    about: 'about' in account ? account.about : existing.about,
+    aboutEmoji:
+      'aboutEmoji' in account ? account.aboutEmoji : existing.aboutEmoji,
+    avatarUrl:
+      'avatarUrl' in account ? account.avatarUrl : existing.avatarUrl,
+    avatarUrlPath:
+      'avatarUrlPath' in account
+        ? account.avatarUrlPath
+        : existing.avatarUrlPath,
+    e164: account.number ?? account.phoneNumber ?? existing.e164,
+    familyName:
+      account.familyName ?? account.profileFamilyName ?? existing.familyName,
+    firstName: account.firstName ?? account.profileName ?? existing.firstName,
+    phoneNumber: account.number ?? account.phoneNumber ?? existing.phoneNumber,
+    profileFamilyName:
+      account.profileFamilyName ??
+      account.familyName ??
+      existing.profileFamilyName,
+    profileName:
+      account.profileName ?? account.firstName ?? existing.profileName,
+    username: account.username ?? existing.username,
+  };
+  const title = getConversationTitle(updated);
+
+  return {
+    ...shell,
+    conversationLookup: {
+      ...shell.conversationLookup,
+      [conversationId]: {
+        ...updated,
+        searchableTitle: title,
+        title,
+        titleNoDefault: title,
+      },
+    },
+  };
 }
 
 function WebInbox({
@@ -400,13 +657,13 @@ function WebDesktopAppBody({
           osClassName={window.Signal.OS.getClassName()}
           renderCallManager={renderEmpty}
           renderGlobalModalContainer={renderGlobalModalContainer}
-          renderInstallScreen={() => (
+          renderInstallScreen={() =>
             backupImportScreenState ? (
               <WebBackupImportScreen state={backupImportScreenState} />
             ) : (
               <WebInstallScreen onLinked={reloadLinkedSession} />
             )
-          )}
+          }
           renderLightbox={renderLightbox}
           renderStandaloneRegistration={renderEmpty}
           hasSelectedStoryData={false}
@@ -652,9 +909,10 @@ function getGroupTitleFromMessage(message: WebMessage): string | undefined {
     : undefined;
 }
 
-function getGroupDescriptionFromMessage(
-  message: WebMessage
-): { description: string | undefined; didChange: boolean } {
+function getGroupDescriptionFromMessage(message: WebMessage): {
+  description: string | undefined;
+  didChange: boolean;
+} {
   const detail = message.groupV2Change?.details.find(
     item => item.type === 'description'
   );
@@ -687,7 +945,8 @@ function getDefaultGroupAccessControl(): NonNullable<
 
 function applyGroupV2ChangeToConversation(
   conversation: WebConversation,
-  message: WebMessage
+  message: WebMessage,
+  ourAci?: string
 ): WebConversation {
   const details = message.groupV2Change?.details;
   if (!details?.length) {
@@ -730,6 +989,30 @@ function applyGroupV2ChangeToConversation(
           ...next,
           announcementsOnly: detail.announcementsOnly,
         };
+        break;
+      case 'member-remove':
+        next = {
+          ...next,
+          membersV2: next.membersV2?.filter(
+            member => member.aci !== detail.aci
+          ),
+          ...(ourAci === detail.aci
+            ? {
+                left: true,
+              }
+            : null),
+        };
+        break;
+      case 'member-add':
+      case 'member-add-from-link':
+      case 'member-add-from-invite':
+      case 'member-add-from-admin-approval':
+        if (ourAci === detail.aci) {
+          next = {
+            ...next,
+            left: false,
+          };
+        }
         break;
       default:
         break;
@@ -777,7 +1060,8 @@ function ensureConversationForMessage(
   const existing = shell.conversationLookup[message.conversationId];
   const timestamp = message.receivedAt ?? message.timestamp;
   const isUnreadIncoming =
-    message.direction === 'incoming' && message.readStatus === ReadStatus.Unread;
+    message.direction === 'incoming' &&
+    message.readStatus === ReadStatus.Unread;
   if (existing) {
     const groupTitle = getGroupTitleFromMessage(message);
     const {
@@ -794,6 +1078,7 @@ function ensureConversationForMessage(
         ...existing,
         ...(groupTitle
           ? {
+              name: groupTitle,
               searchableTitle: groupTitle,
               title: groupTitle,
               titleNoDefault: groupTitle,
@@ -816,12 +1101,19 @@ function ensureConversationForMessage(
         publicParams: message.groupV2?.publicParams ?? existing.publicParams,
         revision: message.groupV2?.revision ?? existing.revision,
         secretParams: message.groupV2?.secretParams ?? existing.secretParams,
+        ...(message.expirationTimerUpdate
+          ? {
+              expireTimer: message.expirationTimerUpdate.expireTimer,
+              expireTimerVersion: message.expireTimerVersion,
+            }
+          : null),
         snippet: getWebMessagePreviewText(message) || existing.snippet,
         messageCount: (existing.messageCount ?? 0) + 1,
         sentMessageCount:
           message.direction === 'outgoing'
             ? (existing.sentMessageCount ?? 0) + 1
             : existing.sentMessageCount,
+        messagesDeleted: undefined,
         unreadCount: isUnreadIncoming
           ? (existing.unreadCount ?? 0) + 1
           : existing.unreadCount,
@@ -834,7 +1126,8 @@ function ensureConversationForMessage(
             }
           : null),
       },
-      message
+      message,
+      ourConversationId
     );
     return {
       ...shell,
@@ -857,12 +1150,22 @@ function ensureConversationForMessage(
           publicParams: message.groupV2?.publicParams,
           revision: message.groupV2?.revision,
           secretParams: message.groupV2?.secretParams,
-          lastMessage: getWebConversationLastMessage(message, ourConversationId),
+          lastMessage: getWebConversationLastMessage(
+            message,
+            ourConversationId
+          ),
           lastMessageReceivedAt: message.timestamp,
           lastMessageReceivedAtMs: timestamp,
           inboxPosition: timestamp,
+          ...(message.expirationTimerUpdate
+            ? {
+                expireTimer: message.expirationTimerUpdate.expireTimer,
+                expireTimerVersion: message.expireTimerVersion,
+              }
+            : null),
         },
-        message
+        message,
+        ourConversationId
       ),
     },
   };
@@ -995,10 +1298,26 @@ function mergeChatShellState(
         ? {
             ...currentConversation,
             ...incomingConversation,
+            messagesDeleted:
+              currentConversation.messagesDeleted === true &&
+              incomingConversation.hasMessages !== true
+                ? true
+                : incomingConversation.messagesDeleted,
+            activeAt:
+              currentConversation.messagesDeleted === true &&
+              incomingConversation.hasMessages !== true
+                ? undefined
+                : incomingConversation.activeAt,
+            left: incomingConversation.left ?? currentConversation.left,
           }
         : {
             ...incomingConversation,
             ...currentConversation,
+            activeAt:
+              currentConversation.messagesDeleted === true
+                ? undefined
+                : currentConversation.activeAt,
+            left: currentConversation.left ?? incomingConversation.left,
           };
   }
 
@@ -1126,27 +1445,29 @@ function applyRemoteEditToMessage(
   message: WebMessage,
   edit: MessageStreamEvent & { type: 'edit-message' }
 ): WebMessage {
-  if (message.editHistory?.some(item => item.timestamp === edit.message.timestamp)) {
+  if (
+    message.editHistory?.some(item => item.timestamp === edit.message.timestamp)
+  ) {
     return message;
   }
 
   const receivedAt = edit.message.receivedAt ?? edit.timestamp;
   const originalEditHistory: ReadonlyArray<EditHistoryType> =
     message.editHistory ?? [
-    {
-      attachments: message.attachments,
-      body: message.body,
-      bodyAttachment: message.bodyAttachment,
-      bodyRanges: message.bodyRanges,
-      preview: message.preview,
-      quote: message.quote,
-      timestamp: message.timestamp,
-      received_at: message.receivedAt ?? message.timestamp,
-      received_at_ms: message.receivedAt ?? message.timestamp,
-      serverTimestamp: message.timestamp,
-      readStatus: message.readStatus,
-    } as EditHistoryType,
-  ];
+      {
+        attachments: message.attachments,
+        body: message.body,
+        bodyAttachment: message.bodyAttachment,
+        bodyRanges: message.bodyRanges,
+        preview: message.preview,
+        quote: message.quote,
+        timestamp: message.timestamp,
+        received_at: message.receivedAt ?? message.timestamp,
+        received_at_ms: message.receivedAt ?? message.timestamp,
+        serverTimestamp: message.timestamp,
+        readStatus: message.readStatus,
+      } as EditHistoryType,
+    ];
   const editedMessage: EditHistoryType = {
     attachments: message.attachments,
     body: edit.message.body,
@@ -1362,18 +1683,84 @@ export function WebDesktopApp({
 }>): JSX.Element {
   const [linkedSession, setLinkedSession] = useState(initialLinkedSession);
   const [shell, setShell] = useState(initialShell);
+  const linkedSessionRef = useRef(linkedSession);
+  const shellRef = useRef(shell);
+  const storageContactsRef = useRef<ContactsBootstrap | undefined>(undefined);
+  const contactsSyncOnOpenPromiseRef = useRef<Promise<void> | undefined>(
+    undefined
+  );
+  const lastContactsSyncOnOpenAtRef = useRef(0);
   const [messageRuntimeSessionId, setMessageRuntimeSessionId] =
     useState<string>();
   const [backupImportScreenState, setBackupImportScreenState] =
     useState<BackupImportScreenState>();
 
+  useEffect(() => {
+    linkedSessionRef.current = linkedSession;
+  }, [linkedSession]);
+
+  useEffect(() => {
+    shellRef.current = shell;
+  }, [shell]);
+
+  const messageStreamSessionKey = useMemo(() => {
+    if (!linkedSession?.credentials?.aci) {
+      return undefined;
+    }
+
+    return [
+      linkedSession.linkedAt,
+      linkedSession.credentials.aci,
+      linkedSession.credentials.deviceId,
+      linkedSession.credentials.username,
+    ].join(':');
+  }, [
+    linkedSession?.credentials?.aci,
+    linkedSession?.credentials?.deviceId,
+    linkedSession?.credentials?.username,
+    linkedSession?.linkedAt,
+  ]);
+
   const persistShell = useCallback(
     (next: ChatShellState) => {
       setWebRuntimeChatShell(next);
-      void persistChatShellStateToStorage(next, linkedSession?.credentials?.aci);
+      void persistChatShellStateToStorage(
+        next,
+        linkedSession?.credentials?.aci
+      );
     },
     [linkedSession?.credentials?.aci]
   );
+
+  useEffect(() => {
+    const syncSelectedConversationId = (): void => {
+      const selectedConversationId = getSelectedConversationId(
+        store.getState()
+      );
+      if (!selectedConversationId) {
+        return;
+      }
+
+      setShell(current => {
+        if (
+          current.selectedConversationId === selectedConversationId ||
+          !current.conversationLookup[selectedConversationId]
+        ) {
+          return current;
+        }
+
+        const next = {
+          ...current,
+          selectedConversationId,
+        };
+        persistShell(next);
+        return next;
+      });
+    };
+
+    syncSelectedConversationId();
+    return store.subscribe(syncSelectedConversationId);
+  }, [persistShell, store]);
 
   useEffect(() => {
     setWebRuntimePinnedMessagesChanged(pinnedMessages => {
@@ -1508,7 +1895,9 @@ export function WebDesktopApp({
 
     const clearPendingBackfillForMessage = (messageId: string): void => {
       setShell(current => {
-        const target = current.messages.find(message => message.id === messageId);
+        const target = current.messages.find(
+          message => message.id === messageId
+        );
         if (!target?.attachments?.length) {
           return current;
         }
@@ -1548,9 +1937,7 @@ export function WebDesktopApp({
       });
     };
 
-    const showBackfillFailureModal = (
-      kind: BackfillFailureModalKind
-    ): void => {
+    const showBackfillFailureModal = (kind: BackfillFailureModalKind): void => {
       window.reduxActions?.globalModals?.showBackfillFailureModal?.(kind);
     };
 
@@ -1566,6 +1953,294 @@ export function WebDesktopApp({
 
     runtimeWindow.SignalWebRuntime = {
       ...(runtimeWindow.SignalWebRuntime ?? {}),
+      async writeProfile(conversation, options) {
+        if (!linkedSession) {
+          throw new Error('writeProfile: linked session is not available');
+        }
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'writeProfile: message runtime session is not available'
+          );
+        }
+        const firstName = conversation.firstName;
+        if (!firstName) {
+          throw new Error('writeProfile: missing firstName');
+        }
+
+        let localAvatarUrl: string | undefined;
+        let avatarBase64: string | undefined;
+        let shouldClearAvatar = false;
+        if (!options.keepAvatar) {
+          const { newAvatar } = options.avatarUpdate;
+          if (newAvatar) {
+            avatarBase64 = uint8ArrayToBase64(newAvatar);
+            localAvatarUrl = `data:image/jpeg;base64,${avatarBase64}`;
+          } else {
+            shouldClearAvatar = true;
+          }
+        }
+
+        const timestamp = Date.now();
+        const result = await writeSignalProfile({
+          aboutEmoji: conversation.aboutEmoji,
+          aboutText: conversation.aboutText,
+          avatarBase64,
+          familyName: conversation.familyName,
+          firstName,
+          hasOtherDevices: true,
+          phoneNumberSharing: isSharingPhoneNumberWithEverybody(),
+          removeAvatar: shouldClearAvatar,
+          runtimeSessionId: messageRuntimeSessionId,
+          timestamp,
+        });
+        const account = {
+          ...result.account,
+          ...(localAvatarUrl
+            ? {
+                avatarUrl: localAvatarUrl,
+              }
+            : null),
+          ...(shouldClearAvatar
+            ? {
+                avatarUrl: undefined,
+                avatarUrlPath: undefined,
+              }
+            : null),
+        };
+
+        const nextLinkedSessionBase = mergeLinkedSessionAccount(
+          linkedSession,
+          account
+        );
+        const nextLinkedSession: LinkedSessionRecord = result.protocol
+          ? {
+              ...nextLinkedSessionBase,
+              protocol: result.protocol,
+            }
+          : nextLinkedSessionBase;
+        const storedContacts = storageContactsRef.current;
+        if (storedContacts) {
+          const nextContacts = {
+            ...storedContacts,
+            account: {
+              ...storedContacts.account,
+              ...account,
+            },
+          };
+          storageContactsRef.current = nextContacts;
+          void persistContactsBootstrapForSession(
+            nextLinkedSession.credentials?.aci,
+            nextContacts
+          );
+        }
+        persistLinkedSessionToStorage(nextLinkedSession);
+        void persistLinkedSessionRecordToIndexedDb(nextLinkedSession);
+        setLinkedSession(nextLinkedSession);
+
+        setShell(current => {
+          const next = updateNoteToSelfProfile(
+            current,
+            nextLinkedSession,
+            nextLinkedSession.account
+          );
+          if (next === current) {
+            return current;
+          }
+          persistShell(next);
+          const ourConversationId =
+            nextLinkedSession.credentials?.aci ?? nextLinkedSession.account.aci;
+          if (ourConversationId) {
+            dispatchConversation(nextLinkedSession, ourConversationId, next);
+          }
+          return next;
+        });
+      },
+      async reserveUsername(usernameHashes) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'reserveUsername: message runtime session is not available'
+          );
+        }
+
+        return reserveSignalUsername({
+          runtimeSessionId: messageRuntimeSessionId,
+          usernameHashes,
+        });
+      },
+      async reserveUsernameByNickname(body) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'reserveUsernameByNickname: message runtime session is not available'
+          );
+        }
+
+        return reserveSignalUsernameByNickname({
+          ...body,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
+      async confirmUsername(body) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'confirmUsername: message runtime session is not available'
+          );
+        }
+
+        return confirmSignalUsername({
+          ...body,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
+      async confirmUsernameReservation(body) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'confirmUsernameReservation: message runtime session is not available'
+          );
+        }
+
+        return confirmSignalUsernameReservation({
+          ...body,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
+      async deleteUsername() {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'deleteUsername: message runtime session is not available'
+          );
+        }
+
+        await deleteSignalUsername({
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
+      async replaceUsernameLink(body) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'replaceUsernameLink: message runtime session is not available'
+          );
+        }
+
+        return replaceSignalUsernameLink({
+          ...body,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
+      async resetUsernameLink(username) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'resetUsernameLink: message runtime session is not available'
+          );
+        }
+
+        return resetSignalUsernameLink({
+          runtimeSessionId: messageRuntimeSessionId,
+          username,
+        });
+      },
+      async syncUsernameProfile(username) {
+        if (!linkedSession) {
+          throw new Error(
+            'syncUsernameProfile: linked session is not available'
+          );
+        }
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'syncUsernameProfile: message runtime session is not available'
+          );
+        }
+
+        const result = await syncSignalUsernameProfile({
+          runtimeSessionId: messageRuntimeSessionId,
+          timestamp: Date.now(),
+          username,
+        });
+        const account =
+          username === undefined
+            ? {
+                ...result.account,
+                username,
+              }
+            : result.account;
+
+        const nextLinkedSessionBase = mergeLinkedSessionAccount(
+          linkedSession,
+          account
+        );
+        const nextLinkedSession: LinkedSessionRecord = result.protocol
+          ? {
+              ...nextLinkedSessionBase,
+              protocol: result.protocol,
+            }
+          : nextLinkedSessionBase;
+        const storedContacts = storageContactsRef.current;
+        if (storedContacts) {
+          const nextContacts = {
+            ...storedContacts,
+            account: {
+              ...storedContacts.account,
+              ...account,
+            },
+          };
+          storageContactsRef.current = nextContacts;
+          void persistContactsBootstrapForSession(
+            nextLinkedSession.credentials?.aci,
+            nextContacts
+          );
+        }
+        persistLinkedSessionToStorage(nextLinkedSession);
+        void persistLinkedSessionRecordToIndexedDb(nextLinkedSession);
+        setLinkedSession(nextLinkedSession);
+
+        setShell(current => {
+          const next = updateNoteToSelfProfile(
+            current,
+            nextLinkedSession,
+            nextLinkedSession.account
+          );
+          if (next === current) {
+            return current;
+          }
+          persistShell(next);
+          const ourConversationId =
+            nextLinkedSession.credentials?.aci ?? nextLinkedSession.account.aci;
+          if (ourConversationId) {
+            dispatchConversation(nextLinkedSession, ourConversationId, next);
+          }
+          return next;
+        });
+      },
+      async createGroupV2({ avatar, conversationIds, expireTimer, name }) {
+        if (!linkedSession) {
+          throw new Error('createGroupV2: linked session is not available');
+        }
+        const group = await createGroupConversation({
+          avatar: avatar ? uint8ArrayToBase64(avatar) : undefined,
+          conversationIds,
+          conversations: shellRef.current.conversationLookup,
+          expireTimer,
+          name,
+        });
+
+        setShell(current => {
+          const next: ChatShellState = {
+            ...current,
+            selectedConversationId: group.id,
+            conversationLookup: {
+              ...current.conversationLookup,
+              [group.id]: group,
+            },
+          };
+          persistShell(next);
+          return next;
+        });
+
+        return window.ConversationController.getOrCreateAndWait(
+          group.id,
+          'group',
+          group as Record<string, unknown>
+        );
+      },
       async leaveGroup(conversationId) {
         if (!linkedSession?.credentials?.aci) {
           return false;
@@ -1614,17 +2289,20 @@ export function WebDesktopApp({
             snippet: getWebMessagePreviewText(message) || existing.snippet,
             timestamp,
           };
-          const nextShell = {
-            ...current,
-            messages: [
-              ...current.messages.filter(item => item.id !== message.id),
-              message,
-            ].sort(compareWebMessages),
-            conversationLookup: {
-              ...current.conversationLookup,
-              [conversationId]: nextConversation,
+          const nextShell = normalizeChatShellForLinkedSession(
+            {
+              ...current,
+              messages: [
+                ...current.messages.filter(item => item.id !== message.id),
+                message,
+              ].sort(compareWebMessages),
+              conversationLookup: {
+                ...current.conversationLookup,
+                [conversationId]: nextConversation,
+              },
             },
-          };
+            linkedSession
+          );
           persistShell(nextShell);
           dispatchConversation(linkedSession, conversationId, nextShell);
           window.reduxActions?.conversations?.messagesAdded?.({
@@ -1646,13 +2324,14 @@ export function WebDesktopApp({
           message => message.id === messageId
         );
         const shouldRequestBackfill = Boolean(
-          targetFromShell?.attachments?.some(isWebBackupOnlyAudioAttachment)
+          targetFromShell?.attachments?.some(shouldRequestWebAttachmentBackfill)
         );
-        const canHandle = Boolean(
-          targetFromShell?.attachments?.some(attachment =>
-            Boolean(buildAttachmentAccessUrl(attachment))
-          )
-        ) || shouldRequestBackfill;
+        const canHandle =
+          Boolean(
+            targetFromShell?.attachments?.some(attachment =>
+              Boolean(buildAttachmentAccessUrl(attachment))
+            )
+          ) || shouldRequestBackfill;
         if (!canHandle) {
           return false;
         }
@@ -1687,7 +2366,9 @@ export function WebDesktopApp({
         }
 
         setShell(current => {
-          const target = current.messages.find(message => message.id === messageId);
+          const target = current.messages.find(
+            message => message.id === messageId
+          );
           if (!target?.attachments?.length) {
             return current;
           }
@@ -1695,19 +2376,22 @@ export function WebDesktopApp({
           const nextMessage: WebMessage = {
             ...target,
             attachments: target.attachments.map(attachment => {
-              if (isWebBackupOnlyAudioAttachment(attachment)) {
-                const pendingAttachment = { ...attachment };
-                delete pendingAttachment.downloadPath;
-                delete pendingAttachment.downloadUrl;
-                delete pendingAttachment.localBlobKey;
-                delete pendingAttachment.path;
-                delete pendingAttachment.url;
+              if (
+                isWebBackupOnlyAudioAttachment(attachment) ||
+                isWebBackupOnlyVisualAttachment(attachment)
+              ) {
+                const accessUrl = buildAttachmentAccessUrl(attachment);
                 return {
-                  ...pendingAttachment,
+                  ...attachment,
                   backfillError: undefined,
+                  downloadUrl: isWebBackupOnlyVisualAttachment(attachment)
+                    ? undefined
+                    : accessUrl || attachment.downloadUrl,
                   error: undefined,
                   isCorrupted: undefined,
-                  status: 'pending',
+                  status: isWebBackupOnlyVisualAttachment(attachment)
+                    ? 'pending'
+                    : 'ready',
                 } satisfies NonNullable<WebMessage['attachments']>[number];
               }
 
@@ -1751,18 +2435,41 @@ export function WebDesktopApp({
       },
       markAttachmentUnavailable(messageId, attachmentPath) {
         setShell(current => {
-          const target = current.messages.find(message => message.id === messageId);
+          const target = current.messages.find(
+            message => message.id === messageId
+          );
           if (!target?.attachments?.length) {
             return current;
           }
+          const audioAttachmentCount = target.attachments.filter(attachment =>
+            isWebAudioAttachment(attachment)
+          ).length;
           let didChange = false;
           const nextMessage: WebMessage = {
             ...target,
             attachments: target.attachments.map(attachment => {
-              if (getWebAttachmentVirtualPath(attachment) !== attachmentPath) {
+              const isMatchingAttachment =
+                getWebAttachmentVirtualPath(attachment) === attachmentPath ||
+                (isWebAudioAttachment(attachment) &&
+                  audioAttachmentCount === 1 &&
+                  attachmentPath.startsWith('web:'));
+              if (!isMatchingAttachment) {
                 return attachment;
               }
               didChange = true;
+              if (isWebAudioAttachment(attachment)) {
+                const nextAttachment = { ...attachment };
+                delete nextAttachment.backfillError;
+                delete nextAttachment.downloadPath;
+                delete nextAttachment.downloadUrl;
+                delete nextAttachment.error;
+                delete nextAttachment.isCorrupted;
+                delete nextAttachment.localBlobKey;
+                delete nextAttachment.path;
+                delete nextAttachment.status;
+                delete nextAttachment.url;
+                return nextAttachment;
+              }
               return {
                 ...attachment,
                 backfillError: true,
@@ -1779,7 +2486,77 @@ export function WebDesktopApp({
               message.id === messageId ? nextMessage : message
             ),
           };
+          persistShell(next);
           registerMessageInCache(nextMessage);
+          window.reduxActions?.conversations?.messageChanged?.(
+            nextMessage.id,
+            nextMessage.conversationId,
+            toDesktopMessage(nextMessage)
+          );
+          if (linkedSession) {
+            dispatchConversationMessages(nextMessage.conversationId, next);
+          }
+          return next;
+        });
+      },
+      markAttachmentReady(messageId, attachmentPath) {
+        setShell(current => {
+          const target = current.messages.find(
+            message => message.id === messageId
+          );
+          if (!target?.attachments?.length) {
+            return current;
+          }
+          const audioAttachmentCount = target.attachments.filter(attachment =>
+            isWebAudioAttachment(attachment)
+          ).length;
+          let didChange = false;
+          const nextMessage: WebMessage = {
+            ...target,
+            attachments: target.attachments.map(attachment => {
+              const isMatchingAttachment =
+                getWebAttachmentVirtualPath(attachment) === attachmentPath ||
+                attachment.path === attachmentPath ||
+                (isWebAudioAttachment(attachment) &&
+                  audioAttachmentCount === 1 &&
+                  attachmentPath.startsWith('web:'));
+              if (!isMatchingAttachment) {
+                return attachment;
+              }
+              const accessUrl = buildAttachmentAccessUrl(attachment);
+              if (!accessUrl) {
+                return attachment;
+              }
+              didChange = true;
+              return {
+                ...attachment,
+                backfillError: undefined,
+                downloadUrl: accessUrl,
+                error: undefined,
+                isCorrupted: undefined,
+                status: 'ready',
+              } satisfies NonNullable<WebMessage['attachments']>[number];
+            }),
+          };
+          if (!didChange) {
+            return current;
+          }
+          const next = {
+            ...current,
+            messages: current.messages.map(message =>
+              message.id === messageId ? nextMessage : message
+            ),
+          };
+          persistShell(next);
+          registerMessageInCache(nextMessage);
+          window.reduxActions?.conversations?.messageChanged?.(
+            nextMessage.id,
+            nextMessage.conversationId,
+            toDesktopMessage(nextMessage)
+          );
+          if (linkedSession) {
+            dispatchConversationMessages(nextMessage.conversationId, next);
+          }
           return next;
         });
       },
@@ -1799,7 +2576,8 @@ export function WebDesktopApp({
 
         try {
           for (const target of targets) {
-            const conversation = shell.conversationLookup[target.conversationId];
+            const conversation =
+              shell.conversationLookup[target.conversationId];
             if (!conversation) {
               return false;
             }
@@ -1838,7 +2616,8 @@ export function WebDesktopApp({
             } else {
               await sendDirectDeleteForEveryone({
                 runtimeSessionId: messageRuntimeSessionId,
-                destinationServiceId: conversation.serviceId ?? target.conversationId,
+                destinationServiceId:
+                  conversation.serviceId ?? target.conversationId,
                 deleteForEveryone,
                 timestamp,
               });
@@ -1991,7 +2770,11 @@ export function WebDesktopApp({
           persistShell(nextShell);
           for (const message of outboundMessages) {
             registerMessageInCache(message);
-            dispatchConversation(linkedSession, message.conversationId, nextShell);
+            dispatchConversation(
+              linkedSession,
+              message.conversationId,
+              nextShell
+            );
           }
           return nextShell;
         });
@@ -2022,35 +2805,39 @@ export function WebDesktopApp({
           return false;
         }
 
-	        try {
-	          await sendDirectTextMessage({
-	            runtimeSessionId: messageRuntimeSessionId,
-	            destinationServiceId: conversation.serviceId ?? conversation.id,
-	            body: '',
-	            pinMessage,
-	            timestamp,
-	          });
-	          const notification = createPinnedNotificationMessage({
-	            conversationId,
-	            pinMessage,
-	            receivedAt: timestamp,
-	            senderAci: linkedSession.credentials.aci,
-	            timestamp,
-	          });
-	          setShell(current => {
-	            if (current.messages.some(message => message.id === notification.id)) {
-	              return current;
-	            }
-	            const next = {
-	              ...current,
-	              messages: [...current.messages, notification].sort(compareWebMessages),
-	            };
-	            persistShell(next);
-	            registerMessageInCache(notification);
-	            return next;
-	          });
-	          return true;
-	        } catch (error) {
+        try {
+          await sendDirectTextMessage({
+            runtimeSessionId: messageRuntimeSessionId,
+            destinationServiceId: conversation.serviceId ?? conversation.id,
+            body: '',
+            pinMessage,
+            timestamp,
+          });
+          const notification = createPinnedNotificationMessage({
+            conversationId,
+            pinMessage,
+            receivedAt: timestamp,
+            senderAci: linkedSession.credentials.aci,
+            timestamp,
+          });
+          setShell(current => {
+            if (
+              current.messages.some(message => message.id === notification.id)
+            ) {
+              return current;
+            }
+            const next = {
+              ...current,
+              messages: [...current.messages, notification].sort(
+                compareWebMessages
+              ),
+            };
+            persistShell(next);
+            registerMessageInCache(notification);
+            return next;
+          });
+          return true;
+        } catch (error) {
           console.error('Failed to send web pin message', error);
           return false;
         }
@@ -2089,7 +2876,9 @@ export function WebDesktopApp({
 
         const timestamp = Date.now();
         const ourConversationId = linkedSession.credentials.aci;
-        const previousMessage = shell.messages.find(message => message.id === id);
+        const previousMessage = shell.messages.find(
+          message => message.id === id
+        );
         if (!previousMessage) {
           return false;
         }
@@ -2239,6 +3028,7 @@ export function WebDesktopApp({
         runtimeWindow.SignalWebRuntime?.forwardMessages ||
         runtimeWindow.SignalWebRuntime?.downloadAttachmentsForMessage ||
         runtimeWindow.SignalWebRuntime?.leaveGroup ||
+        runtimeWindow.SignalWebRuntime?.markAttachmentReady ||
         runtimeWindow.SignalWebRuntime?.markAttachmentUnavailable ||
         runtimeWindow.SignalWebRuntime?.pinMessage ||
         runtimeWindow.SignalWebRuntime?.unpinMessage
@@ -2249,6 +3039,7 @@ export function WebDesktopApp({
           downloadAttachmentsForMessage: undefined,
           forwardMessages: undefined,
           leaveGroup: undefined,
+          markAttachmentReady: undefined,
           markAttachmentUnavailable: undefined,
           pinMessage: undefined,
           unpinMessage: undefined,
@@ -2274,7 +3065,9 @@ export function WebDesktopApp({
         return;
       }
       setShell(current => {
-        const existingIds = new Set(current.messages.map(message => message.id));
+        const existingIds = new Set(
+          current.messages.map(message => message.id)
+        );
         const nextMessages = [
           ...current.messages,
           ...messages.filter(message => !existingIds.has(message.id)),
@@ -2307,7 +3100,9 @@ export function WebDesktopApp({
       setShell(current => {
         const nextShell = {
           ...current,
-          messages: current.messages.filter(message => !deleted.has(message.id)),
+          messages: current.messages.filter(
+            message => !deleted.has(message.id)
+          ),
         };
         setWebRuntimeChatShell(nextShell);
         void persistChatShellStateToStorage(
@@ -2337,18 +3132,37 @@ export function WebDesktopApp({
       setShell(current => {
         const existing = current.conversationLookup[conversationId];
         if (!existing) {
-          return current;
+          if (typeof attributes.id !== 'string') {
+            return current;
+          }
+          const updated = normalizeChatShellForLinkedSession(
+            {
+              ...current,
+              conversationLookup: {
+                ...current.conversationLookup,
+                [conversationId]: attributes as WebConversation,
+              },
+            },
+            linkedSession
+          );
+          persistShell(updated);
+          dispatchConversation(linkedSession, conversationId, updated);
+          dispatchConversationMessages(conversationId, updated);
+          return updated;
         }
-        const updated = {
-          ...current,
-          conversationLookup: {
-            ...current.conversationLookup,
-            [conversationId]: {
-              ...existing,
-              ...attributes,
-            } as WebConversation,
+        const updated = normalizeChatShellForLinkedSession(
+          {
+            ...current,
+            conversationLookup: {
+              ...current.conversationLookup,
+              [conversationId]: {
+                ...existing,
+                ...attributes,
+              } as WebConversation,
+            },
           },
-        };
+          linkedSession
+        );
         const next =
           attributes.unreadCount === 0 || attributes.markedUnread === false
             ? markConversationRead(updated, conversationId)
@@ -2402,9 +3216,21 @@ export function WebDesktopApp({
       const recoveredShell = recoverRetriableAttachmentStates(
         storedShell ?? EMPTY_SHELL
       );
+      const profileAwareContacts = contacts
+        ? mergeContactsBootstrapWithLinkedProfile(contacts, nextLinkedSession)
+        : contacts;
+      if (profileAwareContacts?.source === 'storage') {
+        storageContactsRef.current = profileAwareContacts;
+      }
+      if (profileAwareContacts && profileAwareContacts !== contacts) {
+        void persistContactsBootstrapForSession(
+          nextLinkedSession.credentials.aci,
+          profileAwareContacts
+        );
+      }
       const nextShell = applyContactsBootstrap(
         recoveredShell,
-        contacts,
+        profileAwareContacts,
         nextLinkedSession
       );
       if (nextShell !== storedShell) {
@@ -2420,12 +3246,18 @@ export function WebDesktopApp({
   }, [handleConversationChange, messageRuntimeSessionId]);
 
   useEffect(() => {
-    if (!linkedSession?.credentials?.aci) {
+    const initialStreamLinkedSession = linkedSessionRef.current;
+    if (!initialStreamLinkedSession?.credentials?.aci) {
       return undefined;
     }
+    const getCurrentLinkedSession = (): LinkedSessionRecord =>
+      linkedSessionRef.current ?? initialStreamLinkedSession;
 
     const abortController = new AbortController();
-    const importBackup = shouldImportBackup(linkedSession, shell);
+    const importBackup = shouldImportBackup(
+      initialStreamLinkedSession,
+      shellRef.current
+    );
     if (importBackup) {
       setBackupImportScreenState({ status: 'idle' });
     } else {
@@ -2439,12 +3271,11 @@ export function WebDesktopApp({
         pendingAttachmentBackfillTimeouts.delete(messageId);
       }
     };
-    const showBackfillFailureModal = (
-      kind: BackfillFailureModalKind
-    ): void => {
+    const showBackfillFailureModal = (kind: BackfillFailureModalKind): void => {
       window.reduxActions?.globalModals?.showBackfillFailureModal?.(kind);
     };
     const handleEvent = (event: MessageStreamEvent) => {
+      const currentLinkedSession = getCurrentLinkedSession();
       if (event.type === 'session') {
         runtimeSessionId = event.sessionId;
         setMessageRuntimeSessionId(event.sessionId);
@@ -2453,17 +3284,38 @@ export function WebDesktopApp({
           if (!current) {
             return current;
           }
+          const account =
+            typeof current.account.localProfileUpdatedAt === 'number'
+              ? {
+                  ...event.linkedPayload.account,
+                  familyName: current.account.familyName,
+                  firstName: current.account.firstName,
+                  localProfileUpdatedAt: current.account.localProfileUpdatedAt,
+                  profileFamilyName: current.account.profileFamilyName,
+                  profileName: current.account.profileName,
+                  title: current.account.title,
+                }
+              : event.linkedPayload.account;
           const next: LinkedSessionRecord = {
             ...current,
-            account: event.linkedPayload.account,
+            account,
             credentials: event.linkedPayload.credentials,
-            linkedPayload: event.linkedPayload,
+            linkedPayload: {
+              ...event.linkedPayload,
+              account,
+            },
             lastUpdatedAt: Date.now(),
             storageServiceKey: event.linkedPayload.storageServiceKey,
           };
           persistLinkedSessionToStorage(next);
           void persistLinkedSessionRecordToIndexedDb(next);
           return next;
+        });
+      } else if (event.type === 'protocol-state') {
+        void persistLinkedSessionRecordToIndexedDb({
+          ...currentLinkedSession,
+          lastUpdatedAt: Date.now(),
+          protocol: event.protocol,
         });
       } else if (event.type === 'transport-status') {
         if (isDeviceDelinkedError(event.error)) {
@@ -2490,26 +3342,66 @@ export function WebDesktopApp({
                   : SocketStatus.CLOSED,
         });
         if (event.status === 'open' && runtimeSessionId) {
-          void syncContacts({ runtimeSessionId })
+          const nowMs = Date.now();
+          const hasRecentContactsSync =
+            storageContactsRef.current != null &&
+            nowMs - lastContactsSyncOnOpenAtRef.current <
+              CONTACTS_SYNC_ON_OPEN_THROTTLE_MS;
+          const hasContactsSyncInFlight =
+            contactsSyncOnOpenPromiseRef.current != null;
+
+          if (!hasRecentContactsSync && !hasContactsSyncInFlight) {
+            lastContactsSyncOnOpenAtRef.current = nowMs;
+            const contactsSyncPromise = syncContacts({ runtimeSessionId })
             .then(data => {
+              const latestLinkedSession = getCurrentLinkedSession();
+              const profileAwareData = mergeContactsBootstrapWithLinkedProfile(
+                data,
+                latestLinkedSession
+              );
+              if (profileAwareData.source === 'storage') {
+                storageContactsRef.current = profileAwareData;
+              }
+              const syncedLinkedSession = mergeLinkedSessionAccount(
+                latestLinkedSession,
+                profileAwareData.account
+              );
+              if (syncedLinkedSession !== latestLinkedSession) {
+                setLinkedSession(syncedLinkedSession);
+                persistLinkedSessionToStorage(syncedLinkedSession);
+                void persistLinkedSessionRecordToIndexedDb(syncedLinkedSession);
+              }
               void persistContactsBootstrapForSession(
-                linkedSession.credentials?.aci,
-                data
+                syncedLinkedSession.credentials?.aci,
+                profileAwareData
               );
               setShell(current => {
                 const next = applyContactsBootstrap(
                   current,
-                  data,
-                  linkedSession
+                  profileAwareData,
+                  syncedLinkedSession
                 );
                 persistShell(next);
-                dispatchShell(linkedSession, next);
+                dispatchShell(syncedLinkedSession, next);
                 return next;
               });
             })
             .catch(error => {
               console.error('Contacts sync failed', error);
+            })
+            .finally(() => {
+              if (contactsSyncOnOpenPromiseRef.current === contactsSyncPromise) {
+                contactsSyncOnOpenPromiseRef.current = undefined;
+              }
             });
+            contactsSyncOnOpenPromiseRef.current = contactsSyncPromise;
+          } else if (hasContactsSyncInFlight) {
+            console.info('Contacts sync skipped: already in flight');
+          } else {
+            console.info('Contacts sync skipped: recently synced on open', {
+              elapsedMs: nowMs - lastContactsSyncOnOpenAtRef.current,
+            });
+          }
         }
         if (event.error) {
           console.error('Message transport status error', event.error);
@@ -2529,42 +3421,72 @@ export function WebDesktopApp({
           });
         }
       } else if (event.type === 'contacts-bootstrap') {
+        const profileAwareData = mergeContactsBootstrapWithLinkedProfile(
+          event.data,
+          currentLinkedSession
+        );
+        if (profileAwareData.source === 'storage') {
+          storageContactsRef.current = profileAwareData;
+        }
+        const syncedLinkedSession = mergeLinkedSessionAccount(
+          currentLinkedSession,
+          profileAwareData.account
+        );
+        if (syncedLinkedSession !== currentLinkedSession) {
+          setLinkedSession(syncedLinkedSession);
+          persistLinkedSessionToStorage(syncedLinkedSession);
+          void persistLinkedSessionRecordToIndexedDb(syncedLinkedSession);
+        }
         void persistContactsBootstrapForSession(
-          linkedSession.credentials?.aci,
-          event.data
+          syncedLinkedSession.credentials?.aci,
+          profileAwareData
         );
         setShell(current => {
-          const next = applyContactsBootstrap(current, event.data, linkedSession);
+          const next = applyContactsBootstrap(
+            current,
+            profileAwareData,
+            syncedLinkedSession
+          );
           persistShell(next);
-          dispatchShell(linkedSession, next);
+          dispatchShell(syncedLinkedSession, next);
           return next;
         });
       } else if (event.type === 'chat-shell') {
         setShell(current => {
           const merged = mergeChatShellState(current, event.state);
-          const next = applyContactsBootstrap(merged, undefined, linkedSession);
+          const next = applyContactsBootstrap(
+            merged,
+            storageContactsRef.current,
+            currentLinkedSession
+          );
           persistShell(next);
-          dispatchShell(linkedSession, next);
+          dispatchShell(currentLinkedSession, next);
           return next;
         });
       } else if (event.type === 'conversation') {
         setShell(current => {
-          const next = {
-            ...current,
-            conversationLookup: {
-              ...current.conversationLookup,
-              [event.conversation.id]: event.conversation,
+          const next = normalizeChatShellForLinkedSession(
+            {
+              ...current,
+              conversationLookup: {
+                ...current.conversationLookup,
+                [event.conversation.id]: event.conversation,
+              },
             },
-          };
+            currentLinkedSession
+          );
           persistShell(next);
-          dispatchConversation(linkedSession, event.conversation.id, next);
+          dispatchConversation(
+            currentLinkedSession,
+            event.conversation.id,
+            next
+          );
           return next;
         });
       } else if (event.type === 'message') {
-        const selectedConversationId =
-          window.reduxStore?.getState
-            ? getSelectedConversationId(window.reduxStore.getState())
-            : undefined;
+        const selectedConversationId = window.reduxStore?.getState
+          ? getSelectedConversationId(window.reduxStore.getState())
+          : undefined;
         const isSelectedVisible =
           selectedConversationId === event.message.conversationId &&
           document.visibilityState === 'visible';
@@ -2584,7 +3506,8 @@ export function WebDesktopApp({
           }
           shouldDispatchMessage = true;
           const ourConversationId =
-            linkedSession.credentials?.aci ?? linkedSession.account.aci;
+            currentLinkedSession.credentials?.aci ??
+            currentLinkedSession.account.aci;
           const withConversation = ensureConversationForMessage(
             current,
             message,
@@ -2597,7 +3520,11 @@ export function WebDesktopApp({
             ),
           };
           persistShell(next);
-          dispatchConversation(linkedSession, message.conversationId, next);
+          dispatchConversation(
+            currentLinkedSession,
+            message.conversationId,
+            next
+          );
           return next;
         });
         if (shouldDispatchMessage) {
@@ -2625,15 +3552,20 @@ export function WebDesktopApp({
           timestamp: event.timestamp,
         });
         setShell(current => {
-          if (current.messages.some(message => message.id === notification.id)) {
+          if (
+            current.messages.some(message => message.id === notification.id)
+          ) {
             return current;
           }
           const ourConversationId =
-            linkedSession.credentials?.aci ?? linkedSession.account.aci;
+            currentLinkedSession.credentials?.aci ??
+            currentLinkedSession.account.aci;
           const next = ensureConversationForMessage(
             {
               ...current,
-              messages: [...current.messages, notification].sort(compareWebMessages),
+              messages: [...current.messages, notification].sort(
+                compareWebMessages
+              ),
             },
             notification,
             ourConversationId
@@ -2643,7 +3575,9 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'attachment-backfill') {
-        const ourAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
+        const ourAci =
+          currentLinkedSession.credentials?.aci ??
+          currentLinkedSession.account.aci;
         if (!ourAci) {
           return;
         }
@@ -2669,6 +3603,8 @@ export function WebDesktopApp({
               event.error === ATTACHMENT_BACKFILL_ERROR_MESSAGE_NOT_FOUND
             ) {
               showBackfillFailureModal(BackfillFailureModalKind.NotFound);
+            } else if (didRequestBackfill) {
+              showBackfillFailureModal(BackfillFailureModalKind.Timeout);
             }
             let didClearPending = false;
             const nextMessage: WebMessage = {
@@ -2722,6 +3658,13 @@ export function WebDesktopApp({
                 return attachment;
               }
 
+              if (
+                attachment.status === 'ready' &&
+                buildAttachmentAccessUrl(attachment)
+              ) {
+                return attachment;
+              }
+
               if ('status' in update) {
                 if (update.status === ATTACHMENT_BACKFILL_STATUS_PENDING) {
                   pendingCount += 1;
@@ -2732,7 +3675,34 @@ export function WebDesktopApp({
                 ) {
                   return attachment;
                 }
+                const didRequestBackfill =
+                  pendingAttachmentBackfillTimeouts.has(target.id);
+                if (didRequestBackfill) {
+                  clearAttachmentBackfillTimeout(target.id);
+                  showBackfillFailureModal(BackfillFailureModalKind.Timeout);
+                }
                 didChange = true;
+                if (isWebAudioAttachment(attachment)) {
+                  const nextAttachment = { ...attachment };
+                  delete nextAttachment.backfillError;
+                  delete nextAttachment.downloadPath;
+                  delete nextAttachment.downloadUrl;
+                  delete nextAttachment.error;
+                  delete nextAttachment.isCorrupted;
+                  delete nextAttachment.localBlobKey;
+                  delete nextAttachment.path;
+                  delete nextAttachment.status;
+                  delete nextAttachment.url;
+                  return nextAttachment;
+                }
+                if (isWebVisualAttachment(attachment)) {
+                  const nextAttachment = { ...attachment };
+                  delete nextAttachment.backfillError;
+                  delete nextAttachment.error;
+                  delete nextAttachment.isCorrupted;
+                  delete nextAttachment.status;
+                  return nextAttachment;
+                }
                 return {
                   ...attachment,
                   backfillError: true,
@@ -2747,8 +3717,14 @@ export function WebDesktopApp({
                 ...update.attachment,
                 backupCdnNumber: undefined,
                 backfillError: undefined,
+                digestBase64:
+                  update.attachment.digestBase64 ?? update.attachment.digest,
                 error: undefined,
+                incrementalMacBase64:
+                  update.attachment.incrementalMacBase64 ??
+                  update.attachment.incrementalMac,
                 isCorrupted: undefined,
+                keyBase64: update.attachment.keyBase64 ?? update.attachment.key,
                 localKey: undefined,
                 plaintextHash: undefined,
                 status: 'ready',
@@ -2782,12 +3758,16 @@ export function WebDesktopApp({
             nextMessage.conversationId,
             toDesktopMessage(nextMessage)
           );
-          dispatchConversation(linkedSession, nextMessage.conversationId, next);
+          dispatchConversation(
+            currentLinkedSession,
+            nextMessage.conversationId,
+            next
+          );
           dispatchConversationMessages(nextMessage.conversationId, next);
           return next;
         });
       } else if (event.type === 'reaction') {
-        const ourAci = linkedSession.credentials?.aci;
+        const ourAci = currentLinkedSession.credentials?.aci;
         if (!ourAci) {
           return;
         }
@@ -2795,7 +3775,8 @@ export function WebDesktopApp({
           const target = current.messages.find(message => {
             return (
               message.conversationId === event.conversationId &&
-              getWebMessageAuthorAci(message, ourAci) === event.targetAuthorAci &&
+              getWebMessageAuthorAci(message, ourAci) ===
+                event.targetAuthorAci &&
               getWebMessageSentTimestamp(message) === event.targetTimestamp
             );
           });
@@ -2834,7 +3815,7 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'edit-message') {
-        const ourAci = linkedSession.credentials?.aci;
+        const ourAci = currentLinkedSession.credentials?.aci;
         if (!ourAci) {
           return;
         }
@@ -2859,11 +3840,12 @@ export function WebDesktopApp({
           if (nextMessage === target) {
             return current;
           }
-	          const withConversation = updateConversationForChangedMessage(
-	            current,
-	            nextMessage,
-	            linkedSession.credentials?.aci ?? linkedSession.account.aci
-	          );
+          const withConversation = updateConversationForChangedMessage(
+            current,
+            nextMessage,
+            currentLinkedSession.credentials?.aci ??
+              currentLinkedSession.account.aci
+          );
           const next = {
             ...withConversation,
             messages: withConversation.messages.map(message =>
@@ -2871,7 +3853,11 @@ export function WebDesktopApp({
             ),
           };
           persistShell(next);
-          dispatchConversation(linkedSession, nextMessage.conversationId, next);
+          dispatchConversation(
+            currentLinkedSession,
+            nextMessage.conversationId,
+            next
+          );
           window.reduxActions?.conversations?.messageChanged?.(
             target.id,
             target.conversationId,
@@ -2881,7 +3867,7 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'delete-message') {
-        const ourAci = linkedSession.credentials?.aci;
+        const ourAci = currentLinkedSession.credentials?.aci;
         if (!ourAci) {
           return;
         }
@@ -2894,11 +3880,14 @@ export function WebDesktopApp({
             targetTimestamp: event.targetSentTimestamp,
           });
           if (!target) {
-            console.warn('Message stream delete-message target was not applied', {
-              conversationId: event.conversationId,
-              targetAuthorAci: event.targetAuthorAci,
-              targetSentTimestamp: event.targetSentTimestamp,
-            });
+            console.warn(
+              'Message stream delete-message target was not applied',
+              {
+                conversationId: event.conversationId,
+                targetAuthorAci: event.targetAuthorAci,
+                targetSentTimestamp: event.targetSentTimestamp,
+              }
+            );
             return current;
           }
 
@@ -2906,11 +3895,12 @@ export function WebDesktopApp({
           if (nextMessage === target) {
             return current;
           }
-	          const withConversation = updateConversationForChangedMessage(
-	            current,
-	            nextMessage,
-	            linkedSession.credentials?.aci ?? linkedSession.account.aci
-	          );
+          const withConversation = updateConversationForChangedMessage(
+            current,
+            nextMessage,
+            currentLinkedSession.credentials?.aci ??
+              currentLinkedSession.account.aci
+          );
           const next = {
             ...withConversation,
             messages: withConversation.messages.map(message =>
@@ -2918,7 +3908,11 @@ export function WebDesktopApp({
             ),
           };
           persistShell(next);
-          dispatchConversation(linkedSession, nextMessage.conversationId, next);
+          dispatchConversation(
+            currentLinkedSession,
+            nextMessage.conversationId,
+            next
+          );
           window.reduxActions?.conversations?.messageChanged?.(
             target.id,
             target.conversationId,
@@ -2986,14 +3980,16 @@ export function WebDesktopApp({
           });
           return;
         }
-        window.ConversationController?.get?.(event.conversationId)?.notifyTyping?.({
+        window.ConversationController?.get?.(
+          event.conversationId
+        )?.notifyTyping?.({
           fromMe: false,
           isTyping: event.action === 0,
           senderDevice: event.sourceDevice,
           senderId: event.senderAci,
         });
       } else if (event.type === 'poll-vote') {
-        const ourAci = linkedSession.credentials?.aci;
+        const ourAci = currentLinkedSession.credentials?.aci;
         if (!ourAci) {
           return;
         }
@@ -3033,7 +4029,7 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'poll-terminate') {
-        const ourAci = linkedSession.credentials?.aci;
+        const ourAci = currentLinkedSession.credentials?.aci;
         if (!ourAci) {
           return;
         }
@@ -3046,11 +4042,14 @@ export function WebDesktopApp({
             targetTimestamp: event.targetTimestamp,
           });
           if (!target) {
-            console.warn('Message stream poll-terminate target was not applied', {
-              conversationId: event.conversationId,
-              targetAuthorAci: event.targetAuthorAci,
-              targetTimestamp: event.targetTimestamp,
-            });
+            console.warn(
+              'Message stream poll-terminate target was not applied',
+              {
+                conversationId: event.conversationId,
+                targetAuthorAci: event.targetAuthorAci,
+                targetTimestamp: event.targetTimestamp,
+              }
+            );
             return current;
           }
           const nextMessage = applyPollTerminateToMessage(target, event);
@@ -3074,7 +4073,9 @@ export function WebDesktopApp({
         });
       } else if (event.type === 'message-status') {
         setShell(current => {
-          const existing = current.messages.find(message => message.id === event.id);
+          const existing = current.messages.find(
+            message => message.id === event.id
+          );
           const next = {
             ...current,
             messages: current.messages.map(message =>
@@ -3100,7 +4101,7 @@ export function WebDesktopApp({
         try {
           await consumeMessageTransportStream({
             importBackup,
-            linkedSession,
+            linkedSession: getCurrentLinkedSession(),
             includeProtocol: true,
             signal: abortController.signal,
             onEvent: handleEvent,
@@ -3130,7 +4131,7 @@ export function WebDesktopApp({
     return () => {
       abortController.abort();
     };
-  }, [linkedSession]);
+  }, [messageStreamSessionKey]);
 
   const appState = {
     ...store.getState().app,

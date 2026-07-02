@@ -158,6 +158,7 @@ type ClientOverridesType = ClientOnlyWritableInterface &
     | 'removeAllBackupAttachmentDownloadJobs'
     | 'removeAttachmentDownloadJob'
     | 'removeAttachmentDownloadJobsForMessage'
+    | 'updateConversation'
     | 'updateConversations'
   >;
 
@@ -168,6 +169,7 @@ const clientOnlyWritableOverrides: ClientOverridesType = {
   removeAllBackupAttachmentDownloadJobs,
   removeAttachmentDownloadJob,
   removeAttachmentDownloadJobsForMessage,
+  updateConversation,
   updateConversations,
 };
 

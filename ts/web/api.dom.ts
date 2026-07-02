@@ -14,8 +14,10 @@ import type {
   WebUnpinMessage,
   WebMessage,
   WebConversation,
+  WebAccount,
 } from './types.std.ts';
 import { getWebAttachmentContentType } from './attachmentMime.std.ts';
+import { HTTPError } from '../types/HTTPError.std.ts';
 
 function apiUrl(path: string): URL {
   return new URL(path, getRenderApiBaseUrl());
@@ -48,6 +50,18 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
         ? `Request failed with status ${response.status}: ${details}`
         : `Request failed with status ${response.status}`
     );
+  }
+  return response.json() as Promise<T>;
+}
+
+async function parseSignalApiJsonResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const details = await response.text();
+    throw new HTTPError(details || response.statusText, {
+      code: response.status,
+      headers: Object.fromEntries(response.headers),
+      response,
+    });
   }
   return response.json() as Promise<T>;
 }
@@ -89,7 +103,8 @@ function normalizeProvisioningSession(raw: unknown): ProvisioningSession {
     throw new Error('Provisioning session response is not an object');
   }
 
-  const sessionId = getOptionalString(raw.sessionId) ?? getOptionalString(raw.id);
+  const sessionId =
+    getOptionalString(raw.sessionId) ?? getOptionalString(raw.id);
   if (!sessionId) {
     throw new Error('Provisioning session response is missing session id');
   }
@@ -98,7 +113,10 @@ function normalizeProvisioningSession(raw: unknown): ProvisioningSession {
 
   return {
     sessionId,
-    status: getOptionalString(raw.status) ?? getOptionalString(raw.state) ?? 'pending',
+    status:
+      getOptionalString(raw.status) ??
+      getOptionalString(raw.state) ??
+      'pending',
     url: getOptionalString(raw.url) ?? getOptionalString(raw.provisioningUrl),
     error: getOptionalString(raw.error),
     createdAt,
@@ -165,12 +183,10 @@ export async function consumeMessageTransportStream({
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(
-      {
-        ...getLinkedSessionRequestBody(linkedSession, includeProtocol),
-        importBackup,
-      }
-    ),
+    body: JSON.stringify({
+      ...getLinkedSessionRequestBody(linkedSession, includeProtocol),
+      importBackup,
+    }),
     signal,
   });
 
@@ -283,6 +299,274 @@ export async function sendDirectTextMessage({
   return parseJsonResponse(response);
 }
 
+export async function sendDirectExpirationTimerUpdate({
+  runtimeSessionId,
+  destinationServiceId,
+  expireTimer,
+  expireTimerVersion,
+  timestamp,
+}: Readonly<{
+  runtimeSessionId?: string;
+  destinationServiceId: string;
+  expireTimer?: number;
+  expireTimerVersion: number;
+  timestamp: number;
+}>): Promise<WebMessage> {
+  const response = await fetch(apiUrl('/messages/expiration-timer'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId,
+      destinationServiceId,
+      expireTimer,
+      expireTimerVersion,
+      timestamp,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function writeProfile({
+  aboutEmoji,
+  aboutText,
+  avatarBase64,
+  familyName,
+  firstName,
+  hasOtherDevices,
+  phoneNumberSharing,
+  removeAvatar,
+  runtimeSessionId,
+  timestamp,
+}: Readonly<{
+  aboutEmoji?: string;
+  aboutText?: string;
+  avatarBase64?: string;
+  familyName?: string;
+  firstName: string;
+  hasOtherDevices: boolean;
+  phoneNumberSharing: boolean;
+  removeAvatar?: boolean;
+  runtimeSessionId?: string;
+  timestamp: number;
+}>): Promise<{
+  account: WebAccount;
+  protocol?: LinkedSessionRecord['protocol'];
+  timestamp: number;
+}> {
+  const response = await fetch(apiUrl('/profile/write'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      aboutEmoji,
+      aboutText,
+      avatarBase64,
+      familyName,
+      firstName,
+      hasOtherDevices,
+      phoneNumberSharing,
+      removeAvatar,
+      sessionId: runtimeSessionId,
+      timestamp,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function reserveSignalUsername({
+  runtimeSessionId,
+  usernameHashes,
+}: Readonly<{
+  runtimeSessionId?: string;
+  usernameHashes: ReadonlyArray<string>;
+}>): Promise<{ usernameHash: string }> {
+  const response = await fetch(apiUrl('/username/reserve'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      usernameHashes,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function reserveSignalUsernameByNickname({
+  customDiscriminator,
+  maxNicknameLength,
+  minNicknameLength,
+  nickname,
+  previousUsername,
+  runtimeSessionId,
+}: Readonly<{
+  customDiscriminator?: string;
+  maxNicknameLength: number;
+  minNicknameLength: number;
+  nickname: string;
+  previousUsername?: string;
+  runtimeSessionId?: string;
+}>): Promise<{ hashBase64: string; username: string }> {
+  const response = await fetch(apiUrl('/username/reserve-by-nickname'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      customDiscriminator,
+      maxNicknameLength,
+      minNicknameLength,
+      nickname,
+      previousUsername,
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function confirmSignalUsername({
+  encryptedUsername,
+  runtimeSessionId,
+  usernameHash,
+  zkProof,
+}: Readonly<{
+  encryptedUsername: string;
+  runtimeSessionId?: string;
+  usernameHash: string;
+  zkProof: string;
+}>): Promise<{ usernameLinkHandle: string }> {
+  const response = await fetch(apiUrl('/username/confirm'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      encryptedUsername,
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      usernameHash,
+      zkProof,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function confirmSignalUsernameReservation({
+  hashBase64,
+  previousLinkEntropyBase64,
+  runtimeSessionId,
+  username,
+}: Readonly<{
+  hashBase64: string;
+  previousLinkEntropyBase64?: string;
+  runtimeSessionId?: string;
+  username: string;
+}>): Promise<{ entropyBase64: string; usernameLinkHandle: string }> {
+  const response = await fetch(apiUrl('/username/confirm-reservation'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      hashBase64,
+      previousLinkEntropyBase64,
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      username,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function deleteSignalUsername({
+  runtimeSessionId,
+}: Readonly<{
+  runtimeSessionId?: string;
+}>): Promise<void> {
+  const response = await fetch(apiUrl('/username/delete'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+    }),
+  });
+  await parseSignalApiJsonResponse(response);
+}
+
+export async function replaceSignalUsernameLink({
+  keepLinkHandle,
+  runtimeSessionId,
+  usernameLinkEncryptedValue,
+}: Readonly<{
+  keepLinkHandle: boolean;
+  runtimeSessionId?: string;
+  usernameLinkEncryptedValue: string;
+}>): Promise<{ usernameLinkHandle: string }> {
+  const response = await fetch(apiUrl('/username/link'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      keepLinkHandle,
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      usernameLinkEncryptedValue,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function resetSignalUsernameLink({
+  runtimeSessionId,
+  username,
+}: Readonly<{
+  runtimeSessionId?: string;
+  username: string;
+}>): Promise<{ entropyBase64: string; usernameLinkHandle: string }> {
+  const response = await fetch(apiUrl('/username/reset-link'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      username,
+    }),
+  });
+  return parseSignalApiJsonResponse(response);
+}
+
+export async function syncSignalUsernameProfile({
+  runtimeSessionId,
+  timestamp,
+  username,
+}: Readonly<{
+  runtimeSessionId?: string;
+  timestamp: number;
+  username?: string;
+}>): Promise<{
+  account: WebAccount;
+  protocol?: LinkedSessionRecord['protocol'];
+  timestamp: number;
+}> {
+  const response = await fetch(apiUrl('/username/sync-profile'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      timestamp,
+      username,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function sendDirectDeleteForEveryone({
   runtimeSessionId,
   destinationServiceId,
@@ -335,17 +619,6 @@ export async function sendDirectUnpinMessage({
     }),
   });
   return parseJsonResponse(response);
-}
-
-function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(arrayBuffer);
-  const chunkSize = 0x8000;
-  let binary = '';
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return window.btoa(binary);
 }
 
 async function getImageMetadata(file: File): Promise<Partial<WebAttachment>> {
@@ -453,29 +726,33 @@ export async function uploadMessageAttachment({
 }>): Promise<WebAttachment> {
   const contentType = getWebAttachmentContentType(file);
   const metadata = await getLocalAttachmentMetadata(file);
-  const response = await fetch(apiUrl('/messages/attachment/upload'), {
+  const requestUrl = apiUrl('/messages/attachment/upload');
+  const resolvedRuntimeSessionId =
+    runtimeSessionId ?? currentMessageRuntimeSessionId;
+  if (resolvedRuntimeSessionId) {
+    requestUrl.searchParams.set('sessionId', resolvedRuntimeSessionId);
+  }
+  requestUrl.searchParams.set('contentType', contentType);
+  requestUrl.searchParams.set('size', String(file.size));
+  const fileName =
+    contentType.startsWith('image/') || contentType.startsWith('video/')
+      ? undefined
+      : file.name;
+  if (fileName) {
+    requestUrl.searchParams.set('fileName', fileName);
+  }
+
+  const response = await fetch(requestUrl, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/octet-stream',
     },
-    body: JSON.stringify({
-      contentType,
-      dataBase64: arrayBufferToBase64(await file.arrayBuffer()),
-      fileName:
-        contentType.startsWith('image/') || contentType.startsWith('video/')
-          ? undefined
-          : file.name,
-      sessionId: runtimeSessionId,
-      size: file.size,
-    }),
+    body: file,
   });
   return {
     ...(await parseJsonResponse(response)),
     contentType,
-    fileName:
-      contentType.startsWith('image/') || contentType.startsWith('video/')
-        ? undefined
-        : file.name,
+    fileName,
     ...metadata,
   };
 }
@@ -715,6 +992,78 @@ export async function modifyGroupSettings({
   return parseJsonResponse(response);
 }
 
+export async function lookupUsername({
+  username,
+}: Readonly<{
+  username: string;
+}>): Promise<{ aci?: string | null; username: string }> {
+  const response = await fetch(apiUrl('/contacts/lookup-username'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: currentMessageRuntimeSessionId,
+      username,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function lookupPhoneNumbers({
+  acisAndAccessKeys,
+  e164s,
+}: Readonly<{
+  acisAndAccessKeys: ReadonlyArray<{ aci: string; accessKey: string }>;
+  e164s: ReadonlyArray<string>;
+}>): Promise<{
+  debugPermitsUsed: number;
+  entries: ReadonlyArray<readonly [string, { aci?: string; pni?: string }]>;
+}> {
+  const response = await fetch(apiUrl('/contacts/lookup-phone-numbers'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      acisAndAccessKeys,
+      e164s,
+      sessionId: currentMessageRuntimeSessionId,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function createGroupConversation({
+  avatar,
+  conversationIds,
+  conversations,
+  expireTimer,
+  name,
+}: Readonly<{
+  avatar?: string;
+  conversationIds: ReadonlyArray<string>;
+  conversations: Record<string, WebConversation>;
+  expireTimer?: number;
+  name: string;
+}>): Promise<WebConversation> {
+  const response = await fetch(apiUrl('/groups/create'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      avatar,
+      conversationIds,
+      conversations,
+      expireTimer,
+      sessionId: currentMessageRuntimeSessionId,
+      name,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function sendMessageRequestResponseSync({
   runtimeSessionId,
   threadAci,
@@ -798,19 +1147,24 @@ export async function requestAttachmentBackfill({
 }
 
 export function buildAttachmentAccessUrl(attachment: WebAttachment): string {
-  if (attachment.downloadUrl) {
+  const hasTransitTierFields = Boolean(attachment.cdnId || attachment.cdnKey);
+  const keyBase64 = hasTransitTierFields
+    ? (attachment.key ?? attachment.keyBase64)
+    : (attachment.keyBase64 ?? attachment.key);
+  const hasBackupMediaTierFields =
+    Boolean(attachment.plaintextHash) && Boolean(keyBase64);
+  const hasSignalAddressableFields = Boolean(
+    attachment.cdnId || attachment.cdnKey || hasBackupMediaTierFields
+  );
+  if (!hasSignalAddressableFields && attachment.downloadUrl) {
     return attachment.downloadUrl;
   }
-  if (attachment.url) {
+  if (!hasSignalAddressableFields && attachment.url) {
     return attachment.url;
   }
   if (attachment.dataBase64 && attachment.contentType) {
     return `data:${attachment.contentType};base64,${attachment.dataBase64}`;
   }
-  const keyBase64 = attachment.keyBase64 ?? attachment.key;
-  const hasBackupMediaTierFields =
-    Boolean(attachment.plaintextHash) &&
-    Boolean(keyBase64);
   if (!attachment.cdnId && !attachment.cdnKey && !hasBackupMediaTierFields) {
     return '';
   }
@@ -822,9 +1176,12 @@ export function buildAttachmentAccessUrl(attachment: WebAttachment): string {
   if (attachment.cdnKey) {
     params.set('cdnKey', attachment.cdnKey);
   }
-  const digestBase64 = attachment.digestBase64 ?? attachment.digest;
-  const incrementalMacBase64 =
-    attachment.incrementalMacBase64 ?? attachment.incrementalMac;
+  const digestBase64 = hasTransitTierFields
+    ? (attachment.digest ?? attachment.digestBase64)
+    : (attachment.digestBase64 ?? attachment.digest);
+  const incrementalMacBase64 = hasTransitTierFields
+    ? (attachment.incrementalMac ?? attachment.incrementalMacBase64)
+    : (attachment.incrementalMacBase64 ?? attachment.incrementalMac);
 
   if (keyBase64) {
     params.set('keyBase64', keyBase64);

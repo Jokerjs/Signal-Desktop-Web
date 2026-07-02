@@ -27,6 +27,7 @@ import { getNotificationDataForMessage } from '../../util/getNotificationDataFor
 import { getMessagePropStatus } from '../../state/selectors/message.preload.ts';
 import type { AciString } from '../../types/ServiceId.std.ts';
 import { isAciString } from '../../util/isAciString.std.ts';
+import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
 
 const log = createLogger('WebStateAdapter');
 const { isEqual } = lodash;
@@ -55,6 +56,38 @@ export type DesktopMessageMetrics = Readonly<{
   totalUnseen: number;
 }>;
 
+function mergeBootstrapAccountForLinkedSession(
+  linkedSession: LinkedSessionRecord,
+  bootstrap: ContactsBootstrap
+): LinkedSessionRecord['account'] {
+  const account = bootstrap.account;
+  if (!account) {
+    return linkedSession.account;
+  }
+
+  if (typeof linkedSession.account.localProfileUpdatedAt !== 'number') {
+    return {
+      ...linkedSession.account,
+      ...account,
+    };
+  }
+
+  return {
+    ...linkedSession.account,
+    ...account,
+    about: linkedSession.account.about,
+    aboutEmoji: linkedSession.account.aboutEmoji,
+    avatarUrl: linkedSession.account.avatarUrl,
+    avatarUrlPath: linkedSession.account.avatarUrlPath,
+    familyName: linkedSession.account.familyName,
+    firstName: linkedSession.account.firstName,
+    localProfileUpdatedAt: linkedSession.account.localProfileUpdatedAt,
+    profileFamilyName: linkedSession.account.profileFamilyName,
+    profileName: linkedSession.account.profileName,
+    title: linkedSession.account.title,
+  };
+}
+
 export function compareWebMessages(left: WebMessage, right: WebMessage): number {
   return (
     left.timestamp - right.timestamp ||
@@ -69,15 +102,39 @@ export function getConversationTitle(
   if (!conversation) {
     return '';
   }
-  return (
-    conversation.titleNoDefault ??
-    conversation.title ??
-    conversation.profileName ??
-    conversation.phoneNumber ??
-    conversation.e164 ??
-    conversation.username ??
-    conversation.id
-  );
+  const isGroup =
+    conversation.type === 'group' || conversation.conversationType === 'group';
+  const directTitleFallback =
+    !isGroup &&
+    !conversation.systemNickname &&
+    !conversation.systemGivenName &&
+    !conversation.systemFamilyName &&
+    !conversation.profileName &&
+    !conversation.firstName &&
+    !conversation.profileFamilyName &&
+    !conversation.familyName &&
+    !conversation.e164 &&
+    !conversation.phoneNumber &&
+    !conversation.username
+      ? conversation.titleNoNickname ??
+        conversation.titleNoDefault ??
+        conversation.title
+      : undefined;
+  return getTitle({
+    e164: conversation.e164 ?? conversation.phoneNumber,
+    name: isGroup
+      ? conversation.name ?? conversation.titleNoDefault ?? conversation.title
+      : undefined,
+    nicknameFamilyName: conversation.nicknameFamilyName,
+    nicknameGivenName: conversation.nicknameGivenName,
+    profileFamilyName: conversation.profileFamilyName ?? conversation.familyName,
+    profileName: conversation.profileName ?? conversation.firstName,
+    systemFamilyName: conversation.systemFamilyName,
+    systemGivenName: conversation.systemGivenName,
+    systemNickname: conversation.systemNickname ?? directTitleFallback,
+    type: isGroup ? 'group' : 'private',
+    username: conversation.username,
+  });
 }
 
 export function getConversationListSortTimestamp(
@@ -107,9 +164,31 @@ function mergeConversationForBootstrap({
   preserveExistingActivity: boolean;
 }>): WebConversation {
   if (!existing || !preserveExistingActivity) {
+    if (existing?.messagesDeleted === true && incoming.hasMessages !== true) {
+      return {
+        ...existing,
+        ...incoming,
+        activeAt: undefined,
+        hasMessages: false,
+        inboxPosition: undefined,
+        lastMessage: undefined,
+        lastMessageReceivedAt: undefined,
+        lastMessageReceivedAtMs: undefined,
+        lastUpdated: undefined,
+        messageCount: 0,
+        messagesDeleted: true,
+        sentMessageCount: existing.sentMessageCount,
+        snippet: undefined,
+        timestamp: undefined,
+        unreadCount: existing.unreadCount,
+        left: incoming.left ?? existing.left,
+      };
+    }
+
     return {
       ...existing,
       ...incoming,
+      left: incoming.left ?? existing?.left,
     };
   }
 
@@ -124,10 +203,12 @@ function mergeConversationForBootstrap({
     lastMessageReceivedAtMs: existing.lastMessageReceivedAtMs,
     lastUpdated: existing.lastUpdated,
     messageCount: existing.messageCount,
+    messagesDeleted: existing.messagesDeleted,
     sentMessageCount: existing.sentMessageCount,
     snippet: existing.snippet,
     timestamp: existing.timestamp,
     unreadCount: existing.unreadCount,
+    left: incoming.left ?? existing.left,
   };
 }
 
@@ -146,6 +227,163 @@ function dropStorageOnlyActivity(
     snippet: undefined,
     timestamp: undefined,
   };
+}
+
+function isGroupConversation(conversation: WebConversation): boolean {
+  return (
+    conversation.type === 'group' || conversation.conversationType === 'group'
+  );
+}
+
+function hasVisibleConversationActivity(
+  conversation: WebConversation | undefined
+): boolean {
+  return Boolean(
+    conversation?.hasMessages ||
+      conversation?.activeAt ||
+      conversation?.inboxPosition ||
+      conversation?.lastMessage ||
+      conversation?.lastMessageReceivedAt ||
+      conversation?.lastMessageReceivedAtMs ||
+      conversation?.lastUpdated ||
+      conversation?.messageCount ||
+      conversation?.snippet ||
+      conversation?.timestamp
+  );
+}
+
+function shouldHideStorageOnlyArchivedGroup(
+  conversation: WebConversation,
+  existing: WebConversation | undefined
+): boolean {
+  return (
+    isGroupConversation(conversation) &&
+    conversation.isArchived === true &&
+    conversation.isPinned !== true &&
+    conversation.hasMessages !== true &&
+    !hasVisibleConversationActivity(conversation) &&
+    !hasVisibleConversationActivity(existing)
+  );
+}
+
+function shouldDropDeletedGroupConversation(
+  conversation: WebConversation,
+  conversationMessageCount: number
+): boolean {
+  return (
+    isGroupConversation(conversation) &&
+    conversation.messagesDeleted === true &&
+    conversationMessageCount === 0
+  );
+}
+
+function shouldDropArchivedEmptyGroupConversation(
+  conversation: WebConversation,
+  conversationMessageCount: number
+): boolean {
+  return (
+    isGroupConversation(conversation) &&
+    conversation.isArchived === true &&
+    conversation.isPinned !== true &&
+    conversation.hasMessages !== true &&
+    conversationMessageCount === 0
+  );
+}
+
+function applyDesktopGroupMembershipState(
+  conversation: WebConversation,
+  linkedSession: LinkedSessionRecord
+): WebConversation {
+  if (!isGroupConversation(conversation)) {
+    return conversation;
+  }
+
+  const ourAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  const hasMembersV2 = Array.isArray(conversation.membersV2);
+  if (!ourAci || !hasMembersV2) {
+    return conversation;
+  }
+
+  const left = !conversation.membersV2.some(member => member.aci === ourAci);
+  if (conversation.left === left) {
+    return conversation;
+  }
+
+  return {
+    ...conversation,
+    left,
+  };
+}
+
+export function normalizeWebConversationForDesktopSemantics(
+  conversation: WebConversation,
+  linkedSession: LinkedSessionRecord
+): WebConversation {
+  return applyDesktopGroupMembershipState(conversation, linkedSession);
+}
+
+export function normalizeChatShellForLinkedSession(
+  shell: ChatShellState,
+  linkedSession: LinkedSessionRecord
+): ChatShellState {
+  const messageCountByConversation = new Map<string, number>();
+  for (const message of shell.messages) {
+    messageCountByConversation.set(
+      message.conversationId,
+      (messageCountByConversation.get(message.conversationId) ?? 0) + 1
+    );
+  }
+
+  let didChange = false;
+  const conversationLookup: Record<string, WebConversation> = {};
+  for (const conversation of Object.values(shell.conversationLookup)) {
+    const normalizedConversation = applyDesktopGroupMembershipState(
+      conversation,
+      linkedSession
+    );
+    if (!isEqual(normalizedConversation, conversation)) {
+      didChange = true;
+    }
+    const conversationMessageCount =
+      messageCountByConversation.get(normalizedConversation.id) ?? 0;
+    if (
+      shouldDropDeletedGroupConversation(
+        normalizedConversation,
+        conversationMessageCount
+      ) ||
+      shouldDropArchivedEmptyGroupConversation(
+        normalizedConversation,
+        conversationMessageCount
+      )
+    ) {
+      didChange = true;
+      continue;
+    }
+
+    conversationLookup[normalizedConversation.id] = normalizedConversation;
+  }
+
+  const selectedConversation = shell.selectedConversationId
+    ? conversationLookup[shell.selectedConversationId]
+    : undefined;
+  const selectedConversationId =
+    shell.selectedConversationId && selectedConversation
+      ? shell.selectedConversationId
+      : undefined;
+
+  if (selectedConversationId !== shell.selectedConversationId) {
+    didChange = true;
+  }
+
+  const nextShell = didChange
+    ? {
+        ...shell,
+        selectedConversationId,
+        conversationLookup,
+      }
+    : shell;
+
+  return ensureNoteToSelf(nextShell, linkedSession);
 }
 
 function getMembershipsFromMembersV2(
@@ -410,21 +648,47 @@ export function getWebAttachmentVirtualPath(
   const isAudio = isWebAudioAttachment(attachment);
   const isDisplayableMedia = isImage || isVideo || isAudio;
   const isUnavailable = attachment.backfillError || attachment.status === 'failed';
+  const isPermanentlyUnavailable =
+    isUnavailable && !isAudio && !isImage && !isVideo;
   const isBackupOnlyAudio = isWebBackupOnlyAudioAttachment(attachment);
-  return isDisplayableMedia && !isUnavailable
+  const isBackupOnlyVisual = isWebBackupOnlyVisualAttachment(attachment);
+  return isDisplayableMedia && !isPermanentlyUnavailable
     ? isBackupOnlyAudio
-      ? undefined
+      ? attachment.status === 'ready'
+        ? `web:${getWebAttachmentStablePathKey(attachment, accessUrl)}`
+        : undefined
+      : isBackupOnlyVisual
+        ? undefined
       : (attachment.downloadPath ??
         attachment.localBlobKey ??
-        `web:${attachment.id ?? attachment.cdnKey ?? attachment.cdnId ?? accessUrl}`)
+        `web:${getWebAttachmentStablePathKey(attachment, accessUrl)}`)
     : attachment.downloadPath;
+}
+
+function getWebAttachmentStablePathKey(
+  attachment: WebAttachment,
+  accessUrl: string
+): string {
+  return (
+    attachment.id ??
+    attachment.cdnKey ??
+    attachment.cdnId ??
+    attachment.plaintextHash ??
+    attachment.digestBase64 ??
+    attachment.digest ??
+    accessUrl
+  );
 }
 
 function getProjectedAttachmentAccessUrl(
   attachment: WebAttachment
 ): string | undefined {
   const accessUrl = buildAttachmentAccessUrl(attachment);
-  if (isWebBackupOnlyAudioAttachment(attachment)) {
+  if (
+    isWebBackupOnlyVisualAttachment(attachment) ||
+    (isWebBackupOnlyAudioAttachment(attachment) &&
+      attachment.status !== 'ready')
+  ) {
     return undefined;
   }
   return accessUrl || undefined;
@@ -438,10 +702,28 @@ function isWebAudioAttachment(attachment: WebAttachment): boolean {
   );
 }
 
+function isWebVisualAttachment(attachment: WebAttachment): boolean {
+  const contentType = getWebAttachmentContentTypeFromParts(attachment);
+  return contentType.startsWith('image/') || contentType.startsWith('video/');
+}
+
 function isWebBackupOnlyAudioAttachment(attachment: WebAttachment): boolean {
   const keyBase64 = attachment.keyBase64 ?? attachment.key;
   return (
     isWebAudioAttachment(attachment) &&
+    !attachment.cdnId &&
+    !attachment.cdnKey &&
+    Boolean(keyBase64) &&
+    Boolean(attachment.plaintextHash) &&
+    attachment.dataBase64 == null &&
+    attachment.localBlobKey == null
+  );
+}
+
+function isWebBackupOnlyVisualAttachment(attachment: WebAttachment): boolean {
+  const keyBase64 = attachment.keyBase64 ?? attachment.key;
+  return (
+    isWebVisualAttachment(attachment) &&
     !attachment.cdnId &&
     !attachment.cdnKey &&
     Boolean(keyBase64) &&
@@ -458,12 +740,14 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
   const isImage = contentType.startsWith('image/');
   const isVideo = contentType.startsWith('video/');
   const isAudio = isWebAudioAttachment(attachment);
-  const isBackupOnlyAudio = isWebBackupOnlyAudioAttachment(attachment);
+  const isVisual = isWebVisualAttachment(attachment);
   const isUnavailable = attachment.backfillError || attachment.status === 'failed';
-  const shouldProjectAsPermanentlyUnavailable = isUnavailable && !isAudio;
+  const shouldProjectAsPermanentlyUnavailable =
+    isUnavailable && !isAudio && !isVisual;
+  const isPending = attachment.status === 'pending' && !accessUrl;
   const width = attachment.width ?? (isImage || isVideo ? 320 : undefined);
   const height = attachment.height ?? (isImage || isVideo ? 240 : undefined);
-  const virtualPath = isUnavailable
+  const virtualPath = shouldProjectAsPermanentlyUnavailable
     ? undefined
     : getWebAttachmentVirtualPath(attachment);
   const thumbnailAccessUrl = attachment.thumbnail
@@ -534,7 +818,7 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
       : (attachment.incrementalMacBase64 ?? attachment.incrementalMac),
     isVoiceMessage:
       flags === Proto.AttachmentPointer.Flags.VOICE_MESSAGE || undefined,
-    isCorrupted: isBackupOnlyAudio ? undefined : attachment.isCorrupted,
+    isCorrupted: isAudio ? undefined : attachment.isCorrupted,
     key: shouldProjectAsPermanentlyUnavailable
       ? undefined
       : (attachment.keyBase64 ?? attachment.key),
@@ -542,7 +826,7 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
       ? undefined
       : attachment.localKey,
     path: virtualPath,
-    pending: attachment.status === 'pending' || undefined,
+    pending: isPending || undefined,
     plaintextHash: shouldProjectAsPermanentlyUnavailable
       ? undefined
       : attachment.plaintextHash,
@@ -665,6 +949,9 @@ function getDesktopMessageType(message: WebMessage): MessageAttributesType['type
     (message.direction === 'outgoing' ? 'outgoing' : 'incoming');
 
   if (type === 'pinned-message-notification' && !message.pinMessage) {
+    return message.direction === 'outgoing' ? 'outgoing' : 'incoming';
+  }
+  if (type === 'timer-notification' && !message.expirationTimerUpdate) {
     return message.direction === 'outgoing' ? 'outgoing' : 'incoming';
   }
 
@@ -799,11 +1086,47 @@ export function toDesktopConversation(
   conversation: WebConversation,
   linkedSession: LinkedSessionRecord
 ): DesktopConversation {
-  const title = getConversationTitle(conversation);
   const isGroup =
     conversation.type === 'group' || conversation.conversationType === 'group';
   const sessionAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
   const sortTimestamp = getConversationListSortTimestamp(conversation);
+  const left = conversation.left;
+  const groupName = isGroup
+    ? conversation.name ?? conversation.titleNoDefault ?? conversation.title
+    : undefined;
+  const directTitleFallback =
+    !isGroup &&
+    !conversation.systemNickname &&
+    !conversation.systemGivenName &&
+    !conversation.systemFamilyName &&
+    !conversation.profileName &&
+    !conversation.firstName &&
+    !conversation.profileFamilyName &&
+    !conversation.familyName &&
+    !conversation.e164 &&
+    !conversation.phoneNumber &&
+    !conversation.username
+      ? conversation.titleNoNickname ??
+        conversation.titleNoDefault ??
+        conversation.title
+      : undefined;
+  const titleAttributes = {
+    e164: conversation.e164 ?? conversation.phoneNumber,
+    name: groupName,
+    nicknameFamilyName: conversation.nicknameFamilyName,
+    nicknameGivenName: conversation.nicknameGivenName,
+    profileFamilyName: conversation.profileFamilyName ?? conversation.familyName,
+    profileName: conversation.profileName ?? conversation.firstName,
+    systemFamilyName: conversation.systemFamilyName,
+    systemGivenName: conversation.systemGivenName,
+    systemNickname: conversation.systemNickname ?? directTitleFallback,
+    type: isGroup ? ('group' as const) : ('private' as const),
+    username: conversation.username,
+  };
+  const titleNoDefault = getTitleNoDefault(titleAttributes);
+  const titleNoNickname = getTitle(titleAttributes, { ignoreNickname: true });
+  const titleShortNoDefault = getTitle(titleAttributes, { isShort: true });
+  const title = getTitle(titleAttributes);
   const serviceId =
     conversation.serviceId ??
     (!isGroup && isAciString(conversation.id) ? conversation.id : undefined);
@@ -811,18 +1134,40 @@ export function toDesktopConversation(
     acceptedMessageRequest:
       conversation.removalStage == null &&
       (conversation.acceptedMessageRequest ?? true),
-    activeAt: conversation.activeAt ?? sortTimestamp,
+    about: conversation.about,
+    aboutEmoji: conversation.aboutEmoji,
+    activeAt: conversation.activeAt,
     announcementsOnly: conversation.announcementsOnly,
     avatarUrl: conversation.avatarUrl,
     avatarUrlPath: conversation.avatarUrlPath,
     badges: [],
+    capabilities: {
+      ...conversation.capabilities,
+      ...(Boolean(conversation.isMe) || serviceId === sessionAci
+        ? {
+            attachmentBackfill: true,
+          }
+        : null),
+    },
     color: conversation.color,
+    conversationColor: conversation.conversationColor,
+    customColor: conversation.customColor,
+    customColorId: conversation.customColorId,
+    dontNotifyForMentionsIfMuted: conversation.dontNotifyForMentionsIfMuted,
     draft: conversation.draft,
     draftBodyRanges: conversation.draftBodyRanges,
     draftEditMessage: conversation.draftEditMessage,
     e164: conversation.e164 ?? conversation.phoneNumber,
-    firstName: conversation.profileName,
-    familyName: conversation.profileFamilyName,
+    expireTimer: conversation.expireTimer,
+    expireTimerVersion: conversation.expireTimerVersion,
+    firstName:
+      conversation.nicknameGivenName ??
+      conversation.profileName ??
+      conversation.firstName,
+    familyName:
+      conversation.nicknameFamilyName ??
+      conversation.profileFamilyName ??
+      conversation.familyName,
     hasAvatar: conversation.hasAvatar ?? Boolean(conversation.avatarUrl),
     hasMessages: conversation.hasMessages ?? true,
     id: conversation.id,
@@ -831,7 +1176,7 @@ export function toDesktopConversation(
     isBlocked: conversation.isBlocked,
     isMe: Boolean(conversation.isMe) || serviceId === sessionAci,
     isPinned: conversation.isPinned,
-    left: conversation.left,
+    left,
     lastMessage: conversation.lastMessage,
     lastMessageReceivedAt: conversation.lastMessageReceivedAt,
     lastMessageReceivedAtMs: conversation.lastMessageReceivedAtMs,
@@ -841,22 +1186,31 @@ export function toDesktopConversation(
       conversation.messageCountBeforeMessageRequests,
     messageRequestResponseType: conversation.messageRequestResponseType,
     messagesDeleted: conversation.messagesDeleted,
+    muteExpiresAt: conversation.muteExpiresAt,
+    nicknameFamilyName: conversation.nicknameFamilyName,
+    nicknameGivenName: conversation.nicknameGivenName,
+    note: conversation.note,
+    name: groupName,
     phoneNumber: conversation.phoneNumber,
+    pni: conversation.pni,
     profileKey: conversation.profileKey,
     profileName: conversation.profileName,
     profileSharing: conversation.profileSharing ?? true,
     remoteAvatarUrl: conversation.remoteAvatarUrl,
     quotedMessageId: conversation.quotedMessageId,
     removalStage: conversation.removalStage,
-    searchableTitle: conversation.searchableTitle ?? title,
+    searchableTitle: title,
     serviceId,
     sharingPhoneNumber: true,
     sentMessageCount: conversation.sentMessageCount,
     timestamp: (conversation.timestamp ?? sortTimestamp) || undefined,
+    systemFamilyName: conversation.systemFamilyName,
+    systemGivenName: conversation.systemGivenName,
+    systemNickname: conversation.systemNickname,
     title,
-    titleNoDefault: conversation.titleNoDefault ?? title,
-    titleNoNickname: title,
-    titleShortNoDefault: title,
+    titleNoDefault,
+    titleNoNickname,
+    titleShortNoDefault,
     type: isGroup ? 'group' : 'direct',
     unreadCount: conversation.unreadCount ?? 0,
     username: conversation.username,
@@ -877,13 +1231,13 @@ export function toDesktopConversation(
       canAddNewMembers: getCanAddNewMembersForWebGroup({
         accessControl: groupAccessControl,
         areWeAdmin,
-        left: conversation.left,
+        left,
         terminated: conversation.terminated,
       }),
       canEditGroupInfo: getCanEditGroupInfoForWebGroup({
         accessControl: groupAccessControl,
         areWeAdmin,
-        left: conversation.left,
+        left,
         terminated: conversation.terminated,
       }),
       groupId: conversation.groupId ?? conversation.id,
@@ -911,8 +1265,56 @@ function ensureNoteToSelf(
   linkedSession: LinkedSessionRecord
 ): ChatShellState {
   const sessionAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
-  if (!sessionAci || shell.conversationLookup[sessionAci]) {
+  if (!sessionAci) {
     return shell;
+  }
+  const existing = shell.conversationLookup[sessionAci];
+  if (existing) {
+    const account = linkedSession.account;
+    const updated: WebConversation = {
+      ...existing,
+      about: 'about' in account ? account.about : existing.about,
+      aboutEmoji:
+        'aboutEmoji' in account ? account.aboutEmoji : existing.aboutEmoji,
+      avatarUrl:
+        'avatarUrl' in account ? account.avatarUrl : existing.avatarUrl,
+      avatarUrlPath:
+        'avatarUrlPath' in account
+          ? account.avatarUrlPath
+          : existing.avatarUrlPath,
+      capabilities: {
+        ...existing.capabilities,
+        attachmentBackfill: true,
+      },
+      e164: account.number ?? account.phoneNumber ?? existing.e164,
+      firstName: account.firstName ?? account.profileName ?? existing.firstName,
+      familyName:
+        account.familyName ?? account.profileFamilyName ?? existing.familyName,
+      isMe: true,
+      phoneNumber:
+        account.number ?? account.phoneNumber ?? existing.phoneNumber,
+      profileFamilyName:
+        account.profileFamilyName ??
+        account.familyName ??
+        existing.profileFamilyName,
+      profileName:
+        account.profileName ?? account.firstName ?? existing.profileName,
+      serviceId: existing.serviceId ?? sessionAci,
+      username: account.username ?? existing.username,
+    };
+    const title = getConversationTitle(updated);
+    return {
+      ...shell,
+      conversationLookup: {
+        ...shell.conversationLookup,
+        [sessionAci]: {
+          ...updated,
+          searchableTitle: title,
+          title,
+          titleNoDefault: title,
+        },
+      },
+    };
   }
 
   const account = linkedSession.account;
@@ -942,6 +1344,9 @@ function ensureNoteToSelf(
         username: account.username,
         avatarUrl: account.avatarUrl,
         avatarUrlPath: account.avatarUrlPath,
+        capabilities: {
+          attachmentBackfill: true,
+        },
         activeAt: linkedSession.linkedAt,
         lastUpdated: linkedSession.linkedAt,
         timestamp: linkedSession.linkedAt,
@@ -967,16 +1372,43 @@ function setBootstrapConversationLookup(
   );
 }
 
+function getLinkedSessionWithBootstrapAccount(
+  linkedSession: LinkedSessionRecord,
+  bootstrap: ContactsBootstrap
+): LinkedSessionRecord {
+  if (!bootstrap.account) {
+    return linkedSession;
+  }
+
+  const account = mergeBootstrapAccountForLinkedSession(
+    linkedSession,
+    bootstrap
+  );
+  return {
+    ...linkedSession,
+    account,
+    linkedPayload: {
+      ...linkedSession.linkedPayload,
+      account,
+    },
+  };
+}
+
 export function applyContactsBootstrap(
   shell: ChatShellState,
   bootstrap: ContactsBootstrap | undefined,
   linkedSession: LinkedSessionRecord
 ): ChatShellState {
   if (!bootstrap) {
-    const nextShell = ensureNoteToSelf(shell, linkedSession);
+    const nextShell = normalizeChatShellForLinkedSession(shell, linkedSession);
     setBootstrapConversationLookup(nextShell, linkedSession);
     return deriveConversationPreviews(nextShell, linkedSession);
   }
+
+  const effectiveLinkedSession = getLinkedSessionWithBootstrapAccount(
+    linkedSession,
+    bootstrap
+  );
 
   const nextLookup: Record<string, WebConversation> = {
     ...shell.conversationLookup,
@@ -989,6 +1421,13 @@ export function applyContactsBootstrap(
   ]) {
     const existing = nextLookup[conversation.id];
     const isStorageBootstrap = bootstrap.source === 'storage';
+    if (
+      isStorageBootstrap &&
+      shouldHideStorageOnlyArchivedGroup(conversation, existing)
+    ) {
+      delete nextLookup[conversation.id];
+      continue;
+    }
     const isStorageOnlyConversation =
       isStorageBootstrap &&
       !conversation.hasMessages &&
@@ -1010,17 +1449,19 @@ export function applyContactsBootstrap(
     nextLookup[conversation.id] = {
       ...merged,
       activeAt:
-        merged.activeAt ??
-        merged.lastMessageReceivedAtMs ??
-        merged.lastUpdated ??
-        merged.timestamp ??
-        (isStorageOnlyConversation
+        merged.messagesDeleted === true
           ? undefined
-          : nextLookup[conversation.id]?.activeAt),
+          : merged.activeAt ??
+            merged.lastMessageReceivedAtMs ??
+            merged.lastUpdated ??
+            merged.timestamp ??
+            (isStorageOnlyConversation
+              ? undefined
+              : nextLookup[conversation.id]?.activeAt),
     };
   }
 
-  const nextShell = ensureNoteToSelf(
+  const nextShell = normalizeChatShellForLinkedSession(
     {
       ...shell,
       selectedConversationId:
@@ -1029,10 +1470,10 @@ export function applyContactsBootstrap(
         nextLookup
       ),
     },
-    linkedSession
+    effectiveLinkedSession
   );
-  setBootstrapConversationLookup(nextShell, linkedSession);
-  return deriveConversationPreviews(nextShell, linkedSession);
+  setBootstrapConversationLookup(nextShell, effectiveLinkedSession);
+  return deriveConversationPreviews(nextShell, effectiveLinkedSession);
 }
 
 export function createDesktopConversationState(

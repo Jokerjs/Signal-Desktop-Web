@@ -1807,6 +1807,25 @@ export async function fetchMembershipProof({
 
 // Creating a group
 
+type SignalWebRuntimeWithCreateGroupV2 = Readonly<{
+  createGroupV2?: (options: Readonly<{
+    name: string;
+    avatar: undefined | Uint8Array<ArrayBuffer>;
+    expireTimer: undefined | DurationInSeconds;
+    conversationIds: ReadonlyArray<string>;
+    avatars?: ReadonlyArray<AvatarDataType>;
+    refreshedCredentials?: boolean;
+  }>) => Promise<ConversationModel>;
+}>;
+
+function getSignalWebCreateGroupV2():
+  | SignalWebRuntimeWithCreateGroupV2['createGroupV2']
+  | undefined {
+  return (window as typeof window & {
+    SignalWebRuntime?: SignalWebRuntimeWithCreateGroupV2;
+  }).SignalWebRuntime?.createGroupV2;
+}
+
 export async function createGroupV2(
   options: Readonly<{
     name: string;
@@ -1817,6 +1836,11 @@ export async function createGroupV2(
     refreshedCredentials?: boolean;
   }>
 ): Promise<ConversationModel> {
+  const webCreateGroupV2 = getSignalWebCreateGroupV2();
+  if (webCreateGroupV2) {
+    return webCreateGroupV2(options);
+  }
+
   const {
     name,
     avatar,

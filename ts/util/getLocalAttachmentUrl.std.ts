@@ -58,6 +58,10 @@ export function getLocalAttachmentUrl(
   // Fix Windows paths
   path = path.replace(/\\/g, '/');
 
+  if (/^(blob:|data:|https?:)/.test(path)) {
+    return path;
+  }
+
   let url: URL;
   if (disposition === AttachmentDisposition.Download) {
     url = new URL(`attachment://v2/${path}`);

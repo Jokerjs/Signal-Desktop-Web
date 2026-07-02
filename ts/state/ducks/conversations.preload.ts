@@ -2483,6 +2483,27 @@ function markAttachmentAsCorrupted(
   MessageChangedActionType | NoopActionType
 > {
   return async dispatch => {
+    if (
+      options.attachment.path?.startsWith('web:') &&
+      Attachment.isAudio([options.attachment])
+    ) {
+      (
+        window as typeof window & {
+          SignalWebRuntime?: {
+            markAttachmentUnavailable?: (
+              messageId: string,
+              attachmentPath: string
+            ) => void;
+          };
+        }
+      ).SignalWebRuntime?.markAttachmentUnavailable?.(
+        options.messageId,
+        options.attachment.path
+      );
+      dispatch(noopAction('markAttachmentAsCorrupted'));
+      return;
+    }
+
     await doMarkAttachmentAsCorrupted(options.messageId, options.attachment);
     const message = await getMessageById(options.messageId);
     if (message) {
@@ -5743,10 +5764,10 @@ function updateNicknameAndNote(
       nicknameFamilyName: nickname?.familyName,
       note,
     });
-    await DataWriter.updateConversation(conversationModel.attributes);
     const conversation = conversationModel.format();
     dispatch(conversationsUpdated([conversation]));
     conversationModel.captureChange('nicknameAndNote');
+    drop(DataWriter.updateConversation(conversationModel.attributes));
   };
 }
 

@@ -65,9 +65,21 @@ import { itemStorage } from '../textsecure/Storage.preload.ts';
 import { Emoji } from '../axo/emoji.std.ts';
 
 const log = createLogger('getNotificationDataForMessage');
-const i18n = ((
-  ...args: Parameters<typeof window.SignalContext.i18n>
-) => window.SignalContext.i18n(...args)) as typeof window.SignalContext.i18n;
+const i18n = Object.assign(
+  ((
+    ...args: Parameters<typeof window.SignalContext.i18n>
+  ) => window.SignalContext.i18n(...args)) as typeof window.SignalContext.i18n,
+  {
+    getHourCyclePreference: () =>
+      window.SignalContext.i18n.getHourCyclePreference(),
+    getIntl: () => window.SignalContext.i18n.getIntl(),
+    getLocale: () => window.SignalContext.i18n.getLocale(),
+    getLocaleDirection: () => window.SignalContext.i18n.getLocaleDirection(),
+    getLocaleMessages: () => window.SignalContext.i18n.getLocaleMessages(),
+    stopTrackingUsage: () => window.SignalContext.i18n.stopTrackingUsage(),
+    trackUsage: () => window.SignalContext.i18n.trackUsage(),
+  }
+);
 
 function getNameForNumber(e164: string): string {
   const conversation = window.ConversationController.get(e164);

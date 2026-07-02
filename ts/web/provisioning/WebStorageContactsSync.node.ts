@@ -46,10 +46,62 @@ type SyncStorageContactsOptions = Readonly<{
 
 const MAX_READ_KEYS = 100;
 const MAX_PROFILE_AVATAR_FETCHES_PER_BATCH = 8;
+const PROFILE_AVATAR_CACHE_MS = 5 * 60 * 1000;
+
+type ProfileAvatarCacheValue = Readonly<{
+  avatarUrl?: string;
+  expiresAt: number;
+}>;
+
+const profileAvatarUrlCacheByKey = new Map<string, ProfileAvatarCacheValue>();
 
 type ProfileResponse = Readonly<{
   avatar?: string;
 }>;
+
+function getProfileAvatarCacheKey(
+  conversation: WebConversation
+): string | undefined {
+  const { profileKey, serviceId } = conversation;
+  if (!profileKey || !serviceId) {
+    return undefined;
+  }
+
+  return `${serviceId}:${profileKey}`;
+}
+
+function getCachedProfileAvatarUrl(
+  cacheKey: string | undefined
+): string | undefined {
+  if (!cacheKey) {
+    return undefined;
+  }
+
+  const cached = profileAvatarUrlCacheByKey.get(cacheKey);
+  if (!cached) {
+    return undefined;
+  }
+  if (cached.expiresAt <= Date.now()) {
+    profileAvatarUrlCacheByKey.delete(cacheKey);
+    return undefined;
+  }
+
+  return cached.avatarUrl;
+}
+
+function setCachedProfileAvatarUrl(
+  cacheKey: string | undefined,
+  avatarUrl: string | undefined
+): void {
+  if (!cacheKey) {
+    return;
+  }
+
+  profileAvatarUrlCacheByKey.set(cacheKey, {
+    avatarUrl,
+    expiresAt: Date.now() + PROFILE_AVATAR_CACHE_MS,
+  });
+}
 
 function toNumber(value: bigint | number | null | undefined): number | undefined {
   if (typeof value === 'number') {
@@ -151,15 +203,21 @@ function getContactConversation(contact: Proto.ContactRecord): WebConversation |
     isBlocked: Boolean(contact.blocked),
     markedUnread: Boolean(contact.markedUnread),
     phoneNumber: contact.e164 || undefined,
+    pni,
     profileKey: contact.profileKey?.byteLength
       ? Bytes.toBase64(contact.profileKey)
       : undefined,
+    nicknameFamilyName: contact.nickname?.family || undefined,
+    nicknameGivenName: contact.nickname?.given || undefined,
     profileFamilyName: contact.familyName || undefined,
     profileName: contact.givenName || undefined,
     profileSharing,
     removalStage: contact.hidden ? 'justNotification' : undefined,
     searchableTitle: title,
     serviceId: aci,
+    systemFamilyName: contact.systemFamilyName || undefined,
+    systemGivenName: contact.systemGivenName || undefined,
+    systemNickname: contact.systemNickname || undefined,
     title,
     titleNoDefault: title,
     type: 'direct',
@@ -284,6 +342,12 @@ async function fetchContactProfileAvatarUrl({
     return undefined;
   }
 
+  const cacheKey = getProfileAvatarCacheKey(conversation);
+  const cachedAvatarUrl = getCachedProfileAvatarUrl(cacheKey);
+  if (cachedAvatarUrl != null) {
+    return cachedAvatarUrl;
+  }
+
   const profileKeyVersion = deriveProfileKeyVersion(
     profileKey,
     serviceId as ServiceIdString
@@ -307,6 +371,7 @@ async function fetchContactProfileAvatarUrl({
 
   const profile = JSON.parse(responseBody) as ProfileResponse;
   if (!profile.avatar) {
+    setCachedProfileAvatarUrl(cacheKey, undefined);
     return undefined;
   }
 
@@ -321,12 +386,16 @@ async function fetchContactProfileAvatarUrl({
   );
   const contentType = getImageContentType(decryptedAvatar);
   if (!contentType) {
+    setCachedProfileAvatarUrl(cacheKey, undefined);
     return undefined;
   }
 
-  return `data:${contentType};base64,${Buffer.from(decryptedAvatar).toString(
+  const avatarUrl = `data:${contentType};base64,${Buffer.from(decryptedAvatar).toString(
     'base64'
   )}`;
+  setCachedProfileAvatarUrl(cacheKey, avatarUrl);
+
+  return avatarUrl;
 }
 
 async function addProfileAvatars({
@@ -396,6 +465,7 @@ function getGroupConversation(group: Proto.GroupV2Record): WebConversation | und
     hasMessages: false,
     id: groupId,
     isArchived: Boolean(group.archived),
+    left: true,
     markedUnread: Boolean(group.markedUnread),
     masterKey: Bytes.toBase64(group.masterKey),
     publicParams: Bytes.toBase64(publicParams),

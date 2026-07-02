@@ -43,6 +43,7 @@ import {
   sendDirectEditMessage,
   sendDirectTextMessage,
   sendGroupTextMessage,
+  uploadMessageAttachment,
 } from '../api.dom.ts';
 import { persistChatShellStateToStorage } from '../persistence.dom.ts';
 import type {
@@ -106,6 +107,7 @@ import {
   compareWebMessages,
   getWebConversationLastMessage,
   getWebMessagePreviewText,
+  normalizeWebConversationForDesktopSemantics,
   registerMessageInCache,
   toDesktopConversation,
   toDesktopMessage,
@@ -253,11 +255,11 @@ async function fileToDraftAttachment(file: File): Promise<WebAttachment> {
     kind === 'video' && mediaMetadata.thumbnailUrl
       ? mediaMetadata.thumbnailUrl
       : url;
+  const id = `draft-file-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
   return {
-    id: `draft-file-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    id,
     clientUuid: generateUuid(),
     contentType,
-    dataBase64: arrayBufferToBase64(await file.arrayBuffer()),
     fileName: kind === 'image' || kind === 'video' ? undefined : file.name,
     kind,
     path: displayUrl,
@@ -324,6 +326,7 @@ function WebCompositionArea({
   const inputApi = useRef<InputApi | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const mediaInput = useRef<HTMLInputElement | null>(null);
+  const pendingAttachmentFilesRef = useRef<Map<string, File>>(new Map());
   const voiceRecorderRef = useRef<AudioRecorder | null>(null);
   const voiceCancelRef = useRef(false);
   const voiceStartedAtRef = useRef(0);
@@ -363,6 +366,21 @@ function WebCompositionArea({
 
   const draftEditMessage =
     (conversation.draftEditMessage as DraftEditMessageType | undefined) ?? null;
+  const shellConversation = shell.conversationLookup[conversationId];
+  const normalizedShellConversation = shellConversation
+    ? normalizeWebConversationForDesktopSemantics(
+        shellConversation,
+        linkedSession
+      )
+    : undefined;
+  const isSelectedGroupConversation = normalizedShellConversation
+    ? normalizedShellConversation.type === 'group' ||
+      normalizedShellConversation.conversationType === 'group'
+    : conversation.type === 'group';
+  const isLeftGroup =
+    normalizedShellConversation && isSelectedGroupConversation
+      ? normalizedShellConversation.left === true
+      : Boolean(conversation.left);
   const addedBy = useMemo(() => {
     if (conversation.type === 'group') {
       return getAddedByForGroup(conversation);
@@ -408,6 +426,9 @@ function WebCompositionArea({
   const revokePendingAttachmentUrls = useCallback(
     (attachments: ReadonlyArray<WebAttachment>) => {
       const revokeAttachmentUrl = (attachment: WebAttachment): void => {
+        if (attachment.id) {
+          pendingAttachmentFilesRef.current.delete(attachment.id);
+        }
         if (attachment.url?.startsWith('blob:')) {
           URL.revokeObjectURL(attachment.url);
         }
@@ -424,6 +445,50 @@ function WebCompositionArea({
       attachments.forEach(revokeAttachmentUrl);
     },
     []
+  );
+
+  const uploadAttachmentsForSend = useCallback(
+    async (
+      attachments: ReadonlyArray<WebAttachment>
+    ): Promise<ReadonlyArray<WebAttachment>> => {
+      const uploadAttachmentForSend = async (
+        attachment: WebAttachment
+      ): Promise<WebAttachment> => {
+        const uploadedThumbnail = attachment.thumbnail
+          ? await uploadAttachmentForSend(attachment.thumbnail)
+          : undefined;
+        const file = attachment.id
+          ? pendingAttachmentFilesRef.current.get(attachment.id)
+          : undefined;
+        const uploadedAttachment = file
+          ? await uploadMessageAttachment({
+              file,
+              runtimeSessionId: messageRuntimeSessionId,
+            })
+          : undefined;
+
+        return {
+          ...attachment,
+          ...uploadedAttachment,
+          id: uploadedAttachment?.id ?? attachment.id,
+          clientUuid: attachment.clientUuid ?? uploadedAttachment?.clientUuid,
+          contentType: attachment.contentType ?? uploadedAttachment?.contentType,
+          fileName:
+            attachment.fileName === undefined
+              ? uploadedAttachment?.fileName
+              : attachment.fileName,
+          thumbnail: uploadedThumbnail,
+          path: undefined,
+          previewUrl: undefined,
+          status: uploadedAttachment ? 'ready' : attachment.status,
+          thumbnailUrl: undefined,
+          url: undefined,
+        };
+      };
+
+      return Promise.all(attachments.map(uploadAttachmentForSend));
+    },
+    [messageRuntimeSessionId]
   );
 
   const resetVoiceRecordingState = useCallback(() => {
@@ -650,14 +715,15 @@ function WebCompositionArea({
           return;
         }
 
-        const isGroupConversation =
-          conversation.type === 'group' || conversation.conversationType === 'group';
-        if (isGroupConversation && conversation.left) {
+        if (isLeftGroup) {
           showToast({ toastType: ToastType.LeftGroup });
           return;
         }
+        const isSendTargetGroupConversation =
+          conversation.type === 'group' ||
+          conversation.conversationType === 'group';
         const destinationServiceId = conversation.serviceId ?? conversation.id;
-	        const localMessageDestinationId = isGroupConversation
+	        const localMessageDestinationId = isSendTargetGroupConversation
 	          ? (conversation.groupId ?? conversation.id)
 	          : destinationServiceId;
 	        const localMessageId = `sent:${localMessageDestinationId}:${timestamp}`;
@@ -741,10 +807,12 @@ function WebCompositionArea({
 	        );
 	      }
 
-        const sent = isGroupConversation
+        const remoteAttachments = await uploadAttachmentsForSend(attachments);
+
+        const sent = isSendTargetGroupConversation
           ? await (async () => {
               return sendGroupTextMessage({
-                attachments,
+                attachments: remoteAttachments,
                 runtimeSessionId: messageRuntimeSessionId,
                 groupId: conversation.groupId ?? conversation.id,
                 body,
@@ -761,11 +829,11 @@ function WebCompositionArea({
                 recipients: conversation.membersV2?.map(member => member.aci),
               });
             })()
-          : await sendDirectTextMessage({
-              attachments,
-              runtimeSessionId: messageRuntimeSessionId,
-              destinationServiceId,
-              body,
+	          : await sendDirectTextMessage({
+	              attachments: remoteAttachments,
+	              runtimeSessionId: messageRuntimeSessionId,
+	              destinationServiceId,
+	              body,
               isViewOnce: isViewOnceActive,
               timestamp,
               quote,
@@ -778,7 +846,7 @@ function WebCompositionArea({
           direction: 'outgoing',
           timestamp,
           status: sent.status ?? 'sent',
-          attachments: sent.attachments ?? attachments,
+	          attachments: sent.attachments ?? remoteAttachments,
           quote: sent.quote ?? quote,
           isViewOnce: sent.isViewOnce ?? isViewOnceActive,
         };
@@ -920,18 +988,20 @@ function WebCompositionArea({
     conversation,
     discardEditMessage,
     draftEditMessage,
+    isLeftGroup,
     isSending,
     linkedSession,
     messageRuntimeSessionId,
-    pendingAttachments,
-    setShell,
-    shell,
-    showToast,
-    quotedMessage,
-    revokePendingAttachmentUrls,
-    isViewOnceActive,
-    setQuoteByMessageId,
-  ]);
+	    pendingAttachments,
+	    setShell,
+	    shell,
+	    showToast,
+	    quotedMessage,
+	    revokePendingAttachmentUrls,
+	    uploadAttachmentsForSend,
+	    isViewOnceActive,
+	    setQuoteByMessageId,
+	  ]);
 
   const handleForceSend = useCallback(() => {
     setLarge(false);
@@ -1032,22 +1102,31 @@ function WebCompositionArea({
         }
 
         const blob = new Blob([data], { type: AUDIO_MPEG });
+        const file = new File([blob], 'voice-message.mp3', {
+          type: AUDIO_MPEG,
+        });
         const url = URL.createObjectURL(blob);
         const duration = Math.max(
           1,
           Math.ceil((stoppedAt - startedAt) / 1000)
         );
+        const uploadedAttachment = await uploadMessageAttachment({
+          file,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
         const voiceAttachment: WebAttachment = {
-          id: `voice-note-${stoppedAt}-${Math.floor(Math.random() * 100000)}`,
-          clientUuid: generateUuid(),
+          ...uploadedAttachment,
+          id:
+            uploadedAttachment.id ??
+            `voice-note-${stoppedAt}-${Math.floor(Math.random() * 100000)}`,
+          clientUuid: uploadedAttachment.clientUuid ?? generateUuid(),
           contentType: AUDIO_MPEG,
-          dataBase64: bytesToBase64(data),
           duration,
           flags: Proto.AttachmentPointer.Flags.VOICE_MESSAGE,
           kind: 'file',
           path: url,
           size: data.byteLength,
-          status: 'pending',
+          status: 'ready',
           url,
         };
         send('', Date.now(), [voiceAttachment]);
@@ -1057,7 +1136,7 @@ function WebCompositionArea({
         setIsUploadingAttachment(false);
       }
     })();
-  }, [resetVoiceRecordingState, send]);
+  }, [messageRuntimeSessionId, resetVoiceRecordingState, send]);
 
   const shouldShowMicrophone =
     !draftEditMessage &&
@@ -1116,6 +1195,12 @@ function WebCompositionArea({
       void (async () => {
         try {
           const drafts = await Promise.all(files.map(fileToDraftAttachment));
+          drafts.forEach((attachment, index) => {
+            const file = files[index];
+            if (attachment.id && file) {
+              pendingAttachmentFilesRef.current.set(attachment.id, file);
+            }
+          });
           setPendingAttachments(current => [...current, ...drafts]);
           setDirty(true);
         } catch (error) {
@@ -1242,20 +1327,26 @@ function WebCompositionArea({
               const blob = new Blob([data], { type: contentType });
               const url = URL.createObjectURL(blob);
               const imageDimensions = await getImageDimensions(url);
+              const file = new File([blob], 'edited-image.png', {
+                type: IMAGE_PNG,
+              });
               setPendingAttachments(current =>
                 current.map(attachment => {
                   if (attachment.id !== attachmentToEdit.id) {
                     return attachment;
                   }
                   revokePendingAttachmentUrls([attachment]);
+                  if (attachment.id) {
+                    pendingAttachmentFilesRef.current.set(attachment.id, file);
+                  }
                   return {
                     ...attachment,
                     blurHash,
                     contentType: IMAGE_PNG,
-                    dataBase64: bytesToBase64(data),
                     fileName: attachment.fileName?.replace(/\.[^.]+$/, '.png'),
                     path: url,
                     size: data.byteLength,
+                    status: 'pending',
                     url,
                     ...imageDimensions,
                   };

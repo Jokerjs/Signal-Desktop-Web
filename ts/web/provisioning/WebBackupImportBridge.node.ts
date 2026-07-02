@@ -20,6 +20,7 @@ import { HashType } from '../../types/Crypto.std.ts';
 import { getMacAndUpdateHmac } from '../../util/getMacAndUpdateHmac.node.ts';
 import { decipherWithAesKey } from '../../util/decipherWithAesKey.node.ts';
 import { DelimitedStream } from '../../util/DelimitedStream.node.ts';
+import { DurationInSeconds } from '../../util/durations/index.std.ts';
 import { bytesToUuid } from '../../util/uuidToBytes.std.ts';
 import { MY_STORY_ID } from '../../types/Stories.std.ts';
 import { MessageRequestResponseEvent } from '../../types/MessageRequestResponseEvent.std.ts';
@@ -36,6 +37,7 @@ import type {
   WebConversation,
   WebMessage,
 } from '../types.std.ts';
+import type { GroupV2ChangeDetailType } from '../../types/groups.std.ts';
 
 type WebBackupMessagePatch = Partial<
   Pick<
@@ -47,6 +49,7 @@ type WebBackupMessagePatch = Partial<
     | 'desktopType'
     | 'expirationTimerUpdate'
     | 'flags'
+    | 'groupV2Change'
     | 'isErased'
     | 'key_changed'
 	    | 'messageRequestResponseEvent'
@@ -238,15 +241,21 @@ function createConversationFromContact(
     type: 'direct',
     conversationType: 'direct',
     serviceId: aci ?? undefined,
+    pni: pni ?? undefined,
     phoneNumber: phoneNumber ?? undefined,
     e164: phoneNumber ?? undefined,
     username: contact.username ?? undefined,
     profileKey: contact.profileKey?.byteLength
       ? Bytes.toBase64(contact.profileKey)
       : undefined,
+    nicknameFamilyName: contact.nickname?.family ?? undefined,
+    nicknameGivenName: contact.nickname?.given ?? undefined,
     profileName: contact.profileGivenName ?? undefined,
     profileFamilyName: contact.profileFamilyName ?? undefined,
     profileSharing: contact.profileSharing,
+    systemFamilyName: contact.systemFamilyName ?? undefined,
+    systemGivenName: contact.systemGivenName ?? undefined,
+    systemNickname: contact.systemNickname ?? undefined,
     color: fromAvatarColor(contact.avatarColor),
     removalStage,
     title,
@@ -279,7 +288,8 @@ function createConversationFromSelf(
 
 function createConversationFromGroup(
   group: Backups.Group,
-  fallbackId: string
+  fallbackId: string,
+  linkedPayload: LinkedPayload
 ): WebConversation {
   const secretParams = group.masterKey
     ? deriveGroupSecretParams(group.masterKey)
@@ -323,6 +333,9 @@ function createConversationFromGroup(
       };
     })
     .filter((member): member is NonNullable<typeof member> => member != null);
+  const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  const left =
+    ourAci && membersV2 ? !membersV2.some(member => member.aci === ourAci) : undefined;
   return {
     id: groupId,
     type: 'group',
@@ -334,6 +347,7 @@ function createConversationFromGroup(
     secretParams: secretParams ? Bytes.toBase64(secretParams) : undefined,
     membersV2,
     pendingMembersV2,
+    left,
     color: fromAvatarColor(group.avatarColor),
     remoteAvatarUrl: group.snapshot?.avatarUrl ?? undefined,
     title,
@@ -725,6 +739,206 @@ function getSimpleUpdateMessagePatch({
   return undefined;
 }
 
+function isGroupChangeIgnoredForChatList(
+  groupChange: Backups.GroupChangeChatUpdate
+): boolean {
+  const updates = groupChange.updates ?? [];
+  return (
+    updates.length > 0 &&
+    updates.every(item => {
+      const update = item.update;
+      return Boolean(
+        update?.groupMemberLeftUpdate || update?.groupV2MigrationUpdate
+      );
+    })
+  );
+}
+
+function parseGroupV2AccessLevel(input: unknown): number {
+  return typeof input === 'number' ? input : Backups.GroupV2AccessLevel.UNKNOWN;
+}
+
+function parseGroupChangeAci(
+  bytes: Uint8Array<ArrayBuffer> | undefined | null
+): ReturnType<typeof fromAciUuidBytes> {
+  return fromAciUuidBytes(bytes);
+}
+
+function getGroupChangePatch(
+  groupChange: Backups.GroupChangeChatUpdate
+): WebBackupMessagePatch | undefined {
+  const details = new Array<GroupV2ChangeDetailType>();
+  let from: ReturnType<typeof fromAciUuidBytes>;
+
+  for (const item of groupChange.updates ?? []) {
+    const update = item.update;
+    if (!update) {
+      continue;
+    }
+
+    if (update.genericGroupUpdate) {
+      from = parseGroupChangeAci(update.genericGroupUpdate.updaterAci) ?? from;
+      details.push({ type: 'summary' });
+    }
+
+    if (update.groupCreationUpdate) {
+      from = parseGroupChangeAci(update.groupCreationUpdate.updaterAci) ?? from;
+      details.push({ type: 'create' });
+    }
+
+    if (update.groupNameUpdate) {
+      from = parseGroupChangeAci(update.groupNameUpdate.updaterAci) ?? from;
+      details.push({
+        type: 'title',
+        newTitle: update.groupNameUpdate.newGroupName ?? undefined,
+      });
+    }
+
+    if (update.groupAvatarUpdate) {
+      from = parseGroupChangeAci(update.groupAvatarUpdate.updaterAci) ?? from;
+      details.push({
+        type: 'avatar',
+        removed: Boolean(update.groupAvatarUpdate.wasRemoved),
+      });
+    }
+
+    if (update.groupDescriptionUpdate) {
+      from =
+        parseGroupChangeAci(update.groupDescriptionUpdate.updaterAci) ?? from;
+      const description = update.groupDescriptionUpdate.newDescription ?? undefined;
+      details.push({
+        type: 'description',
+        description,
+        removed:
+          description == null || description.length === 0 ? true : undefined,
+      });
+    }
+
+    if (update.groupMembershipAccessLevelChangeUpdate) {
+      const change = update.groupMembershipAccessLevelChangeUpdate;
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      details.push({
+        type: 'access-members',
+        newPrivilege: parseGroupV2AccessLevel(change.accessLevel),
+      });
+    }
+
+    if (update.groupMemberLabelAccessLevelChangeUpdate) {
+      const change = update.groupMemberLabelAccessLevelChangeUpdate;
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      details.push({
+        type: 'access-member-label',
+        newPrivilege: parseGroupV2AccessLevel(change.accessLevel),
+      });
+    }
+
+    if (update.groupAttributesAccessLevelChangeUpdate) {
+      const change = update.groupAttributesAccessLevelChangeUpdate;
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      details.push({
+        type: 'access-attributes',
+        newPrivilege: parseGroupV2AccessLevel(change.accessLevel),
+      });
+    }
+
+    if (update.groupAnnouncementOnlyChangeUpdate) {
+      const change = update.groupAnnouncementOnlyChangeUpdate;
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      details.push({
+        type: 'announcements-only',
+        announcementsOnly: Boolean(change.isAnnouncementOnly),
+      });
+    }
+
+    if (update.groupAdminStatusUpdate) {
+      const change = update.groupAdminStatusUpdate;
+      const memberAci = parseGroupChangeAci(change.memberAci);
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      if (memberAci) {
+        details.push({
+          type: 'member-privilege',
+          aci: memberAci,
+          newPrivilege: change.wasAdminStatusGranted
+            ? SignalService.Member.Role.ADMINISTRATOR
+            : SignalService.Member.Role.DEFAULT,
+        });
+      }
+    }
+
+    if (update.groupMemberLeftUpdate) {
+      const aci = parseGroupChangeAci(update.groupMemberLeftUpdate.aci);
+      from = aci ?? from;
+      if (aci) {
+        details.push({ type: 'member-remove', aci });
+      }
+    }
+
+    if (update.groupMemberRemovedUpdate) {
+      const change = update.groupMemberRemovedUpdate;
+      const aci = parseGroupChangeAci(change.removedAci);
+      from = parseGroupChangeAci(change.removerAci) ?? from;
+      if (aci) {
+        details.push({ type: 'member-remove', aci });
+      }
+    }
+
+    if (update.groupTerminateChangeUpdate) {
+      from =
+        parseGroupChangeAci(update.groupTerminateChangeUpdate.updaterAci) ??
+        from;
+      details.push({ type: 'terminated' });
+    }
+
+    if (update.groupMemberJoinedUpdate) {
+      const aci = parseGroupChangeAci(update.groupMemberJoinedUpdate.newMemberAci);
+      from = aci ?? from;
+      if (aci) {
+        details.push({ type: 'member-add', aci });
+      }
+    }
+
+    if (update.groupMemberAddedUpdate) {
+      const change = update.groupMemberAddedUpdate;
+      const aci = parseGroupChangeAci(change.newMemberAci);
+      from = parseGroupChangeAci(change.updaterAci) ?? from;
+      if (aci) {
+        const inviter = parseGroupChangeAci(change.inviterAci);
+        if (change.hadOpenInvitation || inviter) {
+          details.push({
+            type: 'member-add-from-invite',
+            aci,
+            inviter,
+          });
+        } else {
+          details.push({ type: 'member-add', aci });
+        }
+      }
+    }
+
+    if (update.groupMemberJoinedByLinkUpdate) {
+      const aci = parseGroupChangeAci(
+        update.groupMemberJoinedByLinkUpdate.newMemberAci
+      );
+      from = aci ?? from;
+      if (aci) {
+        details.push({ type: 'member-add-from-link', aci });
+      }
+    }
+  }
+
+  if (!details.length || isGroupChangeIgnoredForChatList(groupChange)) {
+    return undefined;
+  }
+
+  return {
+    desktopType: 'group-v2-change',
+    groupV2Change: {
+      from,
+      details,
+    },
+  };
+}
+
 function getBackupMessagePatch({
   author,
   chatItem,
@@ -771,7 +985,9 @@ function getBackupMessagePatch({
     return {
       desktopType: 'timer-notification',
       expirationTimerUpdate: {
-        expireTimer: Math.floor(expiresInMs / 1000),
+        expireTimer: DurationInSeconds.fromSeconds(
+          Math.floor(expiresInMs / 1000)
+        ),
         sourceServiceId,
       },
       flags: SignalService.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
@@ -801,6 +1017,10 @@ function getBackupMessagePatch({
       author,
       simpleUpdate: item.updateMessage.update.simpleUpdate,
     });
+  }
+
+  if (item.updateMessage?.update?.groupChange) {
+    return getGroupChangePatch(item.updateMessage.update.groupChange);
   }
 
   return undefined;
@@ -951,7 +1171,11 @@ class WebBackupFrameCollector extends Writable {
     } else if (recipient.destination.self) {
       conversation = createConversationFromSelf(this.#linkedPayload, fallbackId);
     } else if (recipient.destination.group) {
-      conversation = createConversationFromGroup(recipient.destination.group, fallbackId);
+      conversation = createConversationFromGroup(
+        recipient.destination.group,
+        fallbackId,
+        this.#linkedPayload
+      );
     }
 
     if (!conversation) {
@@ -1065,7 +1289,9 @@ class WebBackupFrameCollector extends Writable {
 
     this.#messages.push(message);
     this.#stats.messages += 1;
-    const activeAt = Math.max(conversation.activeAt ?? 0, timestamp);
+    const activeAt = conversation.left
+      ? conversation.activeAt
+      : Math.max(conversation.activeAt ?? 0, timestamp);
     const snippet = patch ? getSystemMessageSnippet(patch) : getSnippet(body, attachments);
     this.#upsertConversation({
       ...conversation,

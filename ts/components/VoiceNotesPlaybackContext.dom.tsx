@@ -13,6 +13,8 @@ const log = createLogger('VoiceNotesPlaybackContext');
 const MAX_WAVEFORM_COUNT = 1000;
 const MAX_PARALLEL_COMPUTE = 8;
 const MAX_AUDIO_DURATION = 15 * 60; // 15 minutes
+const AUDIO_METADATA_LOAD_TIMEOUT = 15_000;
+const AUDIO_WAVEFORM_COMPUTE_TIMEOUT = 20_000;
 
 export type ComputePeaksResult = {
   duration: number;
@@ -51,20 +53,37 @@ async function getAudioDuration(buffer: ArrayBuffer): Promise<number> {
   const blobURL = URL.createObjectURL(blob);
   const audio = new Audio();
   audio.muted = true;
+  audio.preload = 'metadata';
   audio.src = blobURL;
 
-  await new Promise<void>((resolve, reject) => {
-    audio.addEventListener('loadedmetadata', () => {
-      resolve();
-    });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        reject(new Error('Timed out loading audio metadata'));
+      }, AUDIO_METADATA_LOAD_TIMEOUT);
 
-    audio.addEventListener('error', event => {
-      const error = new Error(
-        `Failed to load audio from due to error: ${event.type}`
-      );
-      reject(error);
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+      };
+
+      audio.addEventListener('loadedmetadata', () => {
+        cleanup();
+        resolve();
+      });
+
+      audio.addEventListener('error', event => {
+        cleanup();
+        const error = new Error(
+          `Failed to load audio from due to error: ${event.type}`
+        );
+        reject(error);
+      });
+
+      audio.load();
     });
-  });
+  } finally {
+    URL.revokeObjectURL(blobURL);
+  }
 
   if (Number.isNaN(audio.duration)) {
     throw new Error('Invalid audio duration');
@@ -99,6 +118,9 @@ async function doComputePeaks(
 
   // Load and decode `url` into a raw PCM
   const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to load audio from ${url}: ${response.status}`);
+  }
   const raw = await response.arrayBuffer();
 
   const duration = await getAudioDuration(raw);
@@ -177,12 +199,25 @@ export async function computePeaks(
   }
 
   log.info(`${logId}: queueing computing peaks`);
-  const promise = computeQueue.add(() => doComputePeaks(url, barCount));
+  let timeout: number | undefined;
+  const promise = Promise.race([
+    computeQueue.add(() => doComputePeaks(url, barCount)),
+    new Promise<never>((_resolve, reject) => {
+      timeout = window.setTimeout(() => {
+        reject(new Error('Timed out computing audio waveform'));
+      }, AUDIO_WAVEFORM_COMPUTE_TIMEOUT);
+    }),
+  ]);
 
   inProgressMap.set(computeKey, promise);
   try {
-    return await promise;
+    const result = await promise;
+    log.info(`${logId}: finished computing peaks`);
+    return result;
   } finally {
+    if (timeout != null) {
+      window.clearTimeout(timeout);
+    }
     inProgressMap.delete(computeKey);
   }
 }

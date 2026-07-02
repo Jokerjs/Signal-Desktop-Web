@@ -12,6 +12,7 @@ import type {
 import {
   modifyGroupMember,
   modifyGroupSettings,
+  sendDirectExpirationTimerUpdate,
   sendDirectTextMessage,
   sendGroupTextMessage,
   sendMessageRequestResponseSync,
@@ -27,6 +28,7 @@ import OS from './osMainShim.dom.ts';
 import type { LocalizerType, ThemeType } from '../../types/Util.std.ts';
 import { SIGNAL_ACI } from '../../types/SignalConversation.std.ts';
 import type { AciString } from '../../types/ServiceId.std.ts';
+import { isPniString } from '../../types/ServiceId.std.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import { ReadStatus } from '../../messages/MessageReadStatus.std.ts';
 import { SeenStatus } from '../../MessageSeenStatus.std.ts';
@@ -36,7 +38,10 @@ import * as Bytes from '../../Bytes.std.ts';
 import { deriveAccessKeyFromProfileKey } from '../../util/zkgroup.node.ts';
 import { getPinnedMessagesLimit } from '../../util/pinnedMessages.dom.ts';
 import { getPinnedMessageExpiresAt } from '../../util/pinnedMessages.std.ts';
+import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
 import { DurationInSeconds } from '../../util/durations/duration-in-seconds.std.ts';
+import { INITIAL_EXPIRE_TIMER_VERSION } from '../../util/expirationTimer.std.ts';
+import countryDisplayNames from '../../../build/country-display-names.json';
 import packageJson from '../../../package.json';
 import { loadWebSettings, updateWebSettings } from './webSettings.dom.ts';
 import type {
@@ -74,6 +79,8 @@ type DebouncedUpdateLastMessage = (() => void) & {
   flush: () => void;
 };
 
+const { hasOwnProperty } = Object.prototype;
+
 function getGroupAccessControlForRecord(
   attributes: ConversationRecord
 ): NonNullable<ConversationAttributesType['accessControl']> {
@@ -97,8 +104,9 @@ function getDerivedGroupPermissionAttributes(
   }
 
   const accessControl = getGroupAccessControlForRecord(attributes);
-  const membersV2 = Array.isArray(attributes.membersV2)
-    ? attributes.membersV2
+  const hasMembersV2 = Array.isArray(attributes.membersV2);
+  const membersV2 = hasMembersV2
+    ? (attributes.membersV2 as NonNullable<WebConversation['membersV2']>)
     : [];
   const ourAci = getOurAci();
   const areWeAdmin = Boolean(
@@ -114,7 +122,19 @@ function getDerivedGroupPermissionAttributes(
         );
       })
   );
-  const left = Boolean(attributes.left);
+  const left = Boolean(
+    attributes.left ||
+      (ourAci &&
+        hasMembersV2 &&
+        !membersV2.some(member => {
+          return (
+            member &&
+            typeof member === 'object' &&
+            'aci' in member &&
+            member.aci === ourAci
+          );
+        }))
+  );
   const terminated = Boolean(attributes.terminated);
 
   return {
@@ -137,6 +157,86 @@ function getDerivedGroupPermissionAttributes(
           Proto.AccessControl.AccessRequired.MEMBER),
   };
 }
+
+function getDerivedContactIdentityAttributes(
+  attributes: ConversationRecord
+): Record<string, unknown> {
+  const isGroup =
+    attributes.type === 'group' || attributes.conversationType === 'group';
+  if (isGroup) {
+    return {};
+  }
+
+  const pni = typeof attributes.pni === 'string' ? attributes.pni : undefined;
+  const serviceId =
+    typeof attributes.serviceId === 'string' ? attributes.serviceId : undefined;
+
+  if (pni && (!serviceId || serviceId === pni)) {
+    return { serviceId: pni };
+  }
+
+  return {};
+}
+
+function getDerivedTitleAttributes(
+  attributes: ConversationRecord
+): Record<string, unknown> {
+  const isGroup =
+    attributes.type === 'group' || attributes.conversationType === 'group';
+  const groupName = isGroup
+    ? ((attributes.name ?? attributes.titleNoDefault ?? attributes.title) as
+        | string
+        | undefined)
+    : undefined;
+  const directTitleFallback =
+    !isGroup &&
+    !attributes.systemNickname &&
+    !attributes.systemGivenName &&
+    !attributes.systemFamilyName &&
+    !attributes.profileName &&
+    !attributes.firstName &&
+    !attributes.profileFamilyName &&
+    !attributes.familyName &&
+    !attributes.e164 &&
+    !attributes.phoneNumber &&
+    !attributes.username
+      ? ((attributes.titleNoNickname ??
+          attributes.titleNoDefault ??
+          attributes.title) as string | undefined)
+      : undefined;
+  const titleAttributes = {
+    e164: (attributes.e164 ?? attributes.phoneNumber) as string | undefined,
+    name: groupName,
+    nicknameFamilyName: attributes.nicknameFamilyName as string | undefined,
+    nicknameGivenName: attributes.nicknameGivenName as string | undefined,
+    profileFamilyName: (attributes.profileFamilyName ??
+      attributes.familyName) as string | undefined,
+    profileName: (attributes.profileName ??
+      attributes.firstName) as string | undefined,
+    systemFamilyName: attributes.systemFamilyName as string | undefined,
+    systemGivenName: attributes.systemGivenName as string | undefined,
+    systemNickname:
+      (attributes.systemNickname as string | undefined) ?? directTitleFallback,
+    type: isGroup ? ('group' as const) : ('private' as const),
+    username: attributes.username as string | undefined,
+  };
+  const title = getTitle(titleAttributes);
+
+  return {
+    familyName:
+      attributes.nicknameFamilyName ??
+      attributes.profileFamilyName ??
+      attributes.familyName,
+    firstName:
+      attributes.nicknameGivenName ?? attributes.profileName ?? attributes.firstName,
+    searchableTitle: title,
+    title,
+    titleNoDefault: getTitleNoDefault(titleAttributes),
+    titleNoNickname: getTitle(titleAttributes, { ignoreNickname: true }),
+    titleShortNoDefault: getTitle(titleAttributes, { isShort: true }),
+  };
+}
+
 type AddPinnedMessageNotificationParams = Readonly<{
   pinMessage: PinMessageData;
   senderAci: AciString;
@@ -242,6 +342,132 @@ function getConversationMessages(conversationId: string | undefined): Array<Mess
     .sort(compareMessages);
 }
 
+function normalizeSearchText(value: string): string {
+  return value.normalize('NFKD').toLocaleLowerCase();
+}
+
+function getWebSearchableMessageText(message: MessageRecord): string {
+  if (message.poll && typeof message.poll === 'object' && 'question' in message.poll) {
+    const question = message.poll.question;
+    return typeof question === 'string' ? question : '';
+  }
+
+  return typeof message.body === 'string' ? message.body : '';
+}
+
+function getWebSearchTerms(query: string): Array<string> {
+  const normalizedQuery = normalizeSearchText(query.trim());
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+  return terms.length > 0 ? terms : [normalizedQuery];
+}
+
+type WebSearchMention = Readonly<{
+  mentionAci: string;
+  mentionStart: number;
+  mentionLength: number;
+}>;
+
+type WebSearchMessageResult = MessageRecord & {
+  ftsSnippet: string | null;
+  mentionAci: string | null;
+  mentionStart: number | null;
+  mentionLength: number | null;
+};
+
+function findBodyRangeMentionForServiceIds(
+  message: MessageRecord,
+  serviceIds: ReadonlySet<string>
+): WebSearchMention | undefined {
+  if (!serviceIds.size || !Array.isArray(message.bodyRanges)) {
+    return undefined;
+  }
+
+  for (const range of message.bodyRanges) {
+    const mentionRange = range as {
+      mentionAci?: unknown;
+      start?: unknown;
+      length?: unknown;
+    };
+
+    if (
+      mentionRange &&
+      typeof mentionRange === 'object' &&
+      typeof mentionRange.mentionAci === 'string' &&
+      serviceIds.has(mentionRange.mentionAci) &&
+      typeof mentionRange.start === 'number' &&
+      typeof mentionRange.length === 'number'
+    ) {
+      return {
+        mentionAci: mentionRange.mentionAci,
+        mentionStart: mentionRange.start,
+        mentionLength: mentionRange.length,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function searchWebMessages(options: {
+  query?: string;
+  conversationId?: string;
+  options?: { limit?: number };
+  contactServiceIdsMatchingQuery?: ReadonlyArray<string>;
+}): Array<WebSearchMessageResult> {
+  const query = options.query ?? '';
+  const terms = getWebSearchTerms(query);
+  if (!terms.length) {
+    return [];
+  }
+
+  const limit =
+    typeof options.options?.limit === 'number' && options.options.limit > 0
+      ? options.options.limit
+      : options.conversationId
+        ? 100
+        : 500;
+  const mentionServiceIds = new Set(options.contactServiceIdsMatchingQuery ?? []);
+
+  return Object.values(getMessagesLookup())
+    .map(message => {
+      if (options.conversationId && message.conversationId !== options.conversationId) {
+        return undefined;
+      }
+      if (message.isViewOnce || message.storyId) {
+        return undefined;
+      }
+
+      const text = getWebSearchableMessageText(message);
+      const searchableText = normalizeSearchText(text);
+      const matchesBody = terms.every(term => searchableText.includes(term));
+      const mention = findBodyRangeMentionForServiceIds(message, mentionServiceIds);
+      if (!matchesBody && !mention) {
+        return undefined;
+      }
+
+      return {
+        ...message,
+        ftsSnippet: matchesBody ? text : null,
+        mentionAci: mention?.mentionAci ?? null,
+        mentionStart: mention?.mentionStart ?? null,
+        mentionLength: mention?.mentionLength ?? null,
+      };
+    })
+    .filter((message): message is WebSearchMessageResult => message != null)
+    .sort((left, right) => {
+      const receivedDelta = getTimestamp(right) - getTimestamp(left);
+      if (receivedDelta !== 0) {
+        return receivedDelta;
+      }
+      return getMessageSentTimestamp(right) - getMessageSentTimestamp(left);
+    })
+    .slice(0, limit);
+}
+
 async function getWebMicrophonePermission(): Promise<boolean> {
   if (!navigator.mediaDevices?.getUserMedia) {
     return false;
@@ -282,6 +508,25 @@ function getConversationMessagesPage(options: unknown): Array<MessageRecord> {
 function getMessageMetrics(conversationId: string | undefined) {
   const messages = getConversationMessages(conversationId);
   return getDesktopMessageMetrics(messages as never);
+}
+
+function getConversationMessageStats(conversationId: string | undefined) {
+  const messages = getConversationMessages(conversationId);
+  const newest = messages.at(-1);
+  return {
+    activity: newest,
+    preview: newest,
+    hasUserInitiatedMessages: messages.some(message => {
+      const maybeStatsMessage = message as MessageRecord & {
+        isUserInitiatedMessage?: boolean | number;
+      };
+      return (
+        maybeStatsMessage.isUserInitiatedMessage === true ||
+        maybeStatsMessage.isUserInitiatedMessage === 1 ||
+        message.type === 'outgoing'
+      );
+    }),
+  };
 }
 
 function notifyPinnedMessagesChanged(): void {
@@ -600,6 +845,23 @@ function removeMessagesFromRuntime(messageIds: ReadonlyArray<string>): void {
 }
 
 export function setWebRuntimeChatShell(shell: ChatShellState): void {
+  const linkedSession = currentLinkedSession;
+  if (linkedSession) {
+    (
+      window as unknown as {
+        SignalWebBootstrapConversationLookup?: Record<string, ConversationRecord>;
+      }
+    ).SignalWebBootstrapConversationLookup = Object.fromEntries(
+      Object.values(shell.conversationLookup).map(conversation => [
+        conversation.id,
+        toDesktopConversation(
+          conversation,
+          linkedSession
+        ) as ConversationRecord,
+      ])
+    );
+  }
+
   webRuntimeMessagesLookup = Object.fromEntries(
     shell.messages
       .filter(message => !webRuntimeDeletedMessageIds.has(message.id))
@@ -664,7 +926,17 @@ class WebConversationModel {
   public id: string;
 
   public constructor(attributes: ConversationRecord) {
-    this.attributes = attributes;
+    const derivedContactIdentityAttributes =
+      getDerivedContactIdentityAttributes(attributes);
+    const attributesWithIdentity = {
+      ...attributes,
+      ...derivedContactIdentityAttributes,
+    };
+    this.attributes = {
+      ...attributesWithIdentity,
+      ...getDerivedGroupPermissionAttributes(attributesWithIdentity),
+      ...getDerivedTitleAttributes(attributesWithIdentity),
+    };
     this.id = attributes.id;
     this.debouncedUpdateLastMessage = createDebouncedUpdateLastMessage(
       this.updateLastMessage.bind(this)
@@ -679,13 +951,29 @@ class WebConversationModel {
     const changes =
       typeof key === 'string' ? { [key]: value } : key;
     const nextAttributes = { ...this.attributes, ...changes };
+    const derivedContactIdentityAttributes =
+      getDerivedContactIdentityAttributes(nextAttributes);
+    const nextAttributesWithIdentity = {
+      ...nextAttributes,
+      ...derivedContactIdentityAttributes,
+    };
     const derivedGroupPermissionAttributes =
-      getDerivedGroupPermissionAttributes(nextAttributes);
+      getDerivedGroupPermissionAttributes(nextAttributesWithIdentity);
+    const derivedTitleAttributes = getDerivedTitleAttributes({
+      ...nextAttributesWithIdentity,
+      ...derivedGroupPermissionAttributes,
+    });
     const nextChanges = {
       ...changes,
+      ...(derivedContactIdentityAttributes ?? {}),
       ...(derivedGroupPermissionAttributes ?? {}),
+      ...derivedTitleAttributes,
     };
-    this.attributes = { ...nextAttributes, ...derivedGroupPermissionAttributes };
+    this.attributes = {
+      ...nextAttributesWithIdentity,
+      ...derivedGroupPermissionAttributes,
+      ...derivedTitleAttributes,
+    };
     onConversationAttributesChanged?.(this.id, nextChanges);
     if (currentLinkedSession) {
       window.reduxActions?.conversations?.conversationsUpdated?.([
@@ -860,10 +1148,42 @@ class WebConversationModel {
   }
 
   public async leaveGroupV2(): Promise<void> {
+    if (!currentMessageRuntimeSessionId) {
+      throw new Error('leaveGroupV2: missing message runtime session');
+    }
+
     const ourAci = getOurAci();
     if (!ourAci || !isAciString(ourAci)) {
       throw new Error('leaveGroupV2: missing our ACI');
     }
+
+    const membersV2 = Array.isArray(this.attributes.membersV2)
+      ? this.attributes.membersV2
+      : [];
+    const result = await modifyGroupMember({
+      action: 'remove',
+      conversation: this.attributes as WebConversation,
+      recipients: membersV2
+        .map(member => {
+          return member &&
+            typeof member === 'object' &&
+            'aci' in member &&
+            typeof member.aci === 'string'
+            ? member.aci
+            : undefined;
+        })
+        .filter((member): member is string => Boolean(member)),
+      runtimeSessionId: currentMessageRuntimeSessionId,
+      targetServiceId: ourAci,
+    });
+    const nextMembersV2 = membersV2.filter(member => {
+      return !(
+        member &&
+        typeof member === 'object' &&
+        'aci' in member &&
+        member.aci === ourAci
+      );
+    });
 
     await this.addLocalGroupV2Change(
       [
@@ -872,7 +1192,11 @@ class WebConversationModel {
           aci: ourAci,
         },
       ],
-      { left: true }
+      {
+        left: true,
+        membersV2: nextMembersV2,
+        revision: result.revision,
+      }
     );
     window.reduxActions?.toast?.showToast?.({ toastType: ToastType.LeftGroup });
   }
@@ -1200,6 +1524,7 @@ class WebConversationModel {
           newTitle: attributes.title.trim() || undefined,
         },
         localAttributes: {
+          name: attributes.title,
           searchableTitle: attributes.title,
           title: attributes.title,
           titleNoDefault: attributes.title,
@@ -1394,7 +1719,7 @@ class WebConversationModel {
   }
 
   public getTitle(): string {
-    return String(this.attributes.title ?? this.id);
+    return String(getDerivedTitleAttributes(this.attributes).title ?? this.id);
   }
 
   public setMarkedUnread(markedUnread: boolean): void {
@@ -1586,9 +1911,130 @@ class WebConversationModel {
   }
 
   public async updateExpirationTimer(
-    expireTimer: unknown
+    providedExpireTimer: unknown
   ): Promise<void> {
-    this.set({ expireTimer });
+    const expireTimer =
+      typeof providedExpireTimer === 'number' && providedExpireTimer > 0
+        ? (providedExpireTimer as DurationInSeconds)
+        : undefined;
+    const currentExpireTimer =
+      typeof this.attributes.expireTimer === 'number'
+        ? this.attributes.expireTimer
+        : undefined;
+    const timerMatchesLocalValue =
+      currentExpireTimer === expireTimer ||
+      (!currentExpireTimer && !expireTimer);
+
+    if (timerMatchesLocalValue) {
+      return;
+    }
+
+    if (this.isGroup()) {
+      this.set({ expireTimer });
+      await this.maybeRemoveUniversalTimer();
+      return;
+    }
+
+    const destinationServiceId =
+      typeof this.attributes.serviceId === 'string'
+        ? this.attributes.serviceId
+        : this.id;
+    const sourceServiceId = getOurAci();
+    if (!sourceServiceId) {
+      throw new Error('updateExpirationTimer: missing our ACI');
+    }
+
+    const currentVersion =
+      typeof this.attributes.expireTimerVersion === 'number'
+        ? this.attributes.expireTimerVersion
+        : INITIAL_EXPIRE_TIMER_VERSION;
+    const nextVersion =
+      currentVersion >= 0xffffffff
+        ? INITIAL_EXPIRE_TIMER_VERSION
+        : currentVersion + 1;
+    const timestamp = Date.now();
+    const sentAt = timestamp - 1;
+
+    this.set({
+      expireTimer,
+      expireTimerVersion: nextVersion,
+    });
+    await this.maybeRemoveUniversalTimer();
+
+    const webMessage: WebMessage = {
+      id: `timer:${this.id}:${sentAt}`,
+      conversationId: this.id,
+      desktopType: 'timer-notification',
+      direction: 'outgoing',
+      expireTimer,
+      expireTimerVersion: nextVersion,
+      expirationTimerUpdate: {
+        expireTimer,
+        fromSync: false,
+        source: sourceServiceId,
+        sourceServiceId,
+      },
+      flags: Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
+      readStatus: ReadStatus.Read,
+      receivedAt: timestamp,
+      sourceServiceId,
+      status: 'sent',
+      timestamp: sentAt,
+    };
+    const message = toDesktopMessage(webMessage) as MessageRecord;
+    message.seenStatus = SeenStatus.Seen;
+
+    webRuntimeMessagesLookup = {
+      ...webRuntimeMessagesLookup,
+      [message.id]: message,
+    };
+
+    window.reduxActions?.conversations?.messagesAdded?.({
+      conversationId: this.id,
+      isActive: document.visibilityState === 'visible',
+      isJustSent: true,
+      isNewMessage: true,
+      messages: [message],
+    });
+    window.dispatchEvent(
+      new CustomEvent(WEB_MESSAGES_ADDED_EVENT, {
+        detail: {
+          messages: [webMessage],
+        },
+      })
+    );
+    await this.updateLastMessage();
+
+    if (!currentMessageRuntimeSessionId) {
+      return;
+    }
+
+    const sent = await sendDirectExpirationTimerUpdate({
+      runtimeSessionId: currentMessageRuntimeSessionId,
+      destinationServiceId,
+      expireTimer,
+      expireTimerVersion: nextVersion,
+      timestamp,
+    });
+    const sentMessage = toDesktopMessage({
+      ...sent,
+      conversationId: this.id,
+      expireTimer,
+      expireTimerVersion: nextVersion,
+      expirationTimerUpdate: webMessage.expirationTimerUpdate,
+      id: message.id,
+      timestamp: sentAt,
+    }) as MessageRecord;
+
+    webRuntimeMessagesLookup = {
+      ...webRuntimeMessagesLookup,
+      [message.id]: sentMessage,
+    };
+    window.reduxActions?.conversations?.messageChanged?.(
+      message.id,
+      this.id,
+      sentMessage
+    );
   }
 
   public async applyMessageRequestResponse(response: number): Promise<void> {
@@ -1640,8 +2086,38 @@ class WebConversationModel {
     }
   }
 
-  public queueJob<T>(callback: () => T): T {
-    return callback();
+  public queueJob<T>(callback: () => T): T;
+  public queueJob<T>(
+    name: string,
+    callback: (abortSignal: AbortSignal) => T
+  ): T;
+  public queueJob<T>(
+    first: string | (() => T),
+    second?: (abortSignal: AbortSignal) => T
+  ): T {
+    const callback = typeof first === 'function' ? first : second;
+    if (typeof callback !== 'function') {
+      throw new TypeError('WebConversationModel.queueJob callback is required');
+    }
+
+    return callback(new AbortController().signal);
+  }
+
+  public async maybeRemoveUniversalTimer(): Promise<boolean> {
+    if (!this.attributes.pendingUniversalTimer) {
+      return false;
+    }
+
+    this.set({ pendingUniversalTimer: undefined });
+    return true;
+  }
+
+  public async maybeSetPendingUniversalTimer(
+    hasUserInitiatedMessages: boolean
+  ): Promise<void> {
+    if (hasUserInitiatedMessages) {
+      await this.maybeRemoveUniversalTimer();
+    }
   }
 
   public beforeMessageSend(): void {}
@@ -1721,7 +2197,7 @@ class WebConversationModel {
           attachments,
           quote,
         });
-    const message = toDesktopMessage({
+    const sentWebMessage: WebMessage = {
       ...sent,
       attachments: sent.attachments ?? attachments,
       body,
@@ -1730,7 +2206,8 @@ class WebConversationModel {
       status: sent.status ?? 'sent',
       timestamp,
       quote: sent.quote ?? quote,
-    }) as MessageRecord;
+    };
+    const message = toDesktopMessage(sentWebMessage) as MessageRecord;
 
     webRuntimeMessagesLookup = {
       ...webRuntimeMessagesLookup,
@@ -1741,6 +2218,13 @@ class WebConversationModel {
       message.id,
       this.id,
       message
+    );
+    window.dispatchEvent(
+      new CustomEvent(WEB_MESSAGES_ADDED_EVENT, {
+        detail: {
+          messages: [sentWebMessage],
+        },
+      })
     );
     await this.updateLastMessage();
     return message;
@@ -1792,14 +2276,29 @@ function findConversationModelByIdentifier(
     return undefined;
   }
 
+  const lookup = getConversationLookup();
+  if (isPniString(identifier)) {
+    const pniMatch = Object.values(lookup).find(conversation => {
+      return (
+        conversation.pni === identifier &&
+        typeof conversation.serviceId === 'string' &&
+        isAciString(conversation.serviceId)
+      );
+    });
+    if (pniMatch) {
+      return new WebConversationModel(pniMatch);
+    }
+  }
+
   const direct = getConversationModel(identifier);
   if (direct) {
     return direct;
   }
 
-  const existing = Object.values(getConversationLookup()).find(conversation => {
+  const existing = Object.values(lookup).find(conversation => {
     return (
       conversation.serviceId === identifier ||
+      conversation.pni === identifier ||
       conversation.e164 === identifier ||
       conversation.phoneNumber === identifier ||
       conversation.groupId === identifier
@@ -1834,7 +2333,10 @@ function createConversationModelForIdentifier(
           id: identifier,
           type: 'direct' as const,
           conversationType: 'direct' as const,
-          serviceId: identifier,
+          serviceId:
+            isAciString(identifier) || isPniString(identifier)
+              ? identifier
+              : undefined,
           title,
           titleNoDefault: title,
           searchableTitle: title,
@@ -1848,7 +2350,50 @@ function createConversationModelForIdentifier(
   window.reduxActions?.conversations?.conversationsUpdated?.([
     attributes as never,
   ]);
+  onConversationAttributesChanged?.(conversation.id, conversation);
   return new WebConversationModel(attributes);
+}
+
+function applyContactIdentityChange(
+  conversation: WebConversationModel,
+  suggestedChange: Partial<{
+    serviceId: string;
+    e164: string;
+    phoneNumber: string;
+    pni: string;
+  }>
+): void {
+  const change = { ...suggestedChange };
+
+  if (hasOwnProperty.call(change, 'e164') && !change.pni) {
+    change.pni = undefined;
+  }
+
+  const currentServiceId = conversation.getServiceId();
+  const currentPni = conversation.getPni();
+  const hasValidCurrentServiceId =
+    typeof currentServiceId === 'string' &&
+    (isAciString(currentServiceId) || isPniString(currentServiceId));
+  if (
+    change.pni &&
+    !change.serviceId &&
+    (!currentServiceId ||
+      currentServiceId === currentPni ||
+      !hasValidCurrentServiceId)
+  ) {
+    change.serviceId = change.pni;
+  }
+
+  if (
+    !change.serviceId &&
+    hasOwnProperty.call(change, 'pni') &&
+    !change.pni &&
+    currentServiceId === currentPni
+  ) {
+    change.serviceId = undefined;
+  }
+
+  conversation.set(change);
 }
 
 function installConversationController(
@@ -1975,7 +2520,7 @@ function installConversationController(
       if (!conversation) {
         throw new Error('maybeMergeContacts: did not get conversation');
       }
-      conversation.set({
+      applyContactIdentityChange(conversation, {
         ...(aci ? { serviceId: aci } : {}),
         ...(e164 ? { e164, phoneNumber: e164 } : {}),
         ...(pni ? { pni } : {}),
@@ -2169,6 +2714,17 @@ export function setupWebGlobals({
           .filter(message => getMessageSentTimestamp(message) === sentAt)
           .sort((left, right) => getTimestamp(right) - getTimestamp(left));
       }
+      if (name === 'searchMessages') {
+        const options = args?.[0] as
+          | {
+              query?: string;
+              conversationId?: string;
+              options?: { limit?: number };
+              contactServiceIdsMatchingQuery?: ReadonlyArray<string>;
+            }
+          | undefined;
+        return searchWebMessages(options ?? {});
+      }
       if (name === 'getMessageByAuthorAciAndSentAt') {
         const ourAci = args?.[0];
         const authorAci = args?.[1];
@@ -2209,6 +2765,10 @@ export function setupWebGlobals({
       if (name === 'getMessageMetricsForConversation') {
         const options = args?.[0] as { conversationId?: string } | undefined;
         return getMessageMetrics(options?.conversationId);
+      }
+      if (name === 'getConversationMessageStats') {
+        const options = args?.[0] as { conversationId?: string } | undefined;
+        return getConversationMessageStats(options?.conversationId);
       }
       if (name === 'getPinnedMessagesPreloadDataForConversation') {
         const conversationId = args?.[0];
@@ -2298,7 +2858,7 @@ export function setupWebGlobals({
       unregisterForActive: noop,
     },
     executeMenuRole: noop,
-    getCountryDisplayNames: () => ({}),
+    getCountryDisplayNames: () => countryDisplayNames,
     getEnvironment: () => 'production',
     getHourCyclePreference: () => 'UnknownPreference',
     getI18nAvailableLocales: () => ['zh-CN'],

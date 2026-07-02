@@ -1,8 +1,6 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import {
   CiphertextMessageType,
   Direction,
@@ -77,6 +75,9 @@ import type {
   WebPinMessageEvent,
   WebPollTerminateEvent,
   WebPollVoteEvent,
+  ProtocolSenderKeyRecord,
+  ProtocolSessionRecord,
+  ProtocolState,
   WebReceiptEvent,
   WebReactionEvent,
   WebTypingEvent,
@@ -105,6 +106,7 @@ export type WebSendLinkedPayload = Readonly<{
   aciPqLastResortPreKeyRecordBase64?: string;
   pniPqLastResortPreKeyRecordBase64?: string;
   protocolPersistenceVersion?: 1;
+  protocol?: ProtocolState;
 }>;
 
 type ServerKeys = Readonly<{
@@ -139,6 +141,9 @@ type DirectTextSendOptions = Readonly<{
   timestamp: number;
   attachments?: ReadonlyArray<WebAttachment>;
   deleteForEveryone?: WebDeleteForEveryone;
+  expireTimer?: number;
+  expireTimerVersion?: number;
+  flags?: number;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   unpinMessage?: WebUnpinMessage;
@@ -166,7 +171,7 @@ type GroupTextSendOptions = Readonly<{
 
 type GroupUpdateSendOptions = Readonly<{
   chat: AuthenticatedChatConnection;
-  groupChangeBase64: string;
+  groupChangeBase64?: string;
   groupId: string;
   groupV2: GroupTextSendOptions['groupV2'];
   linkedPayload: WebSendLinkedPayload;
@@ -225,57 +230,52 @@ type MessageRequestResponseSyncOptions = Readonly<{
   type: number;
 }>;
 
-type PersistedProtocolSessions = {
-  sessions?: Record<string, Record<string, string>>;
-  senderKeys?: Record<string, Record<string, string>>;
-};
+type FetchLocalProfileSyncOptions = Readonly<{
+  chat: AuthenticatedChatConnection;
+  linkedPayload: WebSendLinkedPayload;
+  timestamp: number;
+}>;
 
-const PROTOCOL_STORE_PATH = resolve(
-  process.env.SIGNAL_WEB_PROTOCOL_STORE_PATH ??
-    '.signal-web/protocol-sessions.json'
-);
-
-function readPersistedProtocolSessions(): PersistedProtocolSessions {
-  if (!existsSync(PROTOCOL_STORE_PATH)) {
-    return {};
-  }
-  return JSON.parse(readFileSync(PROTOCOL_STORE_PATH, 'utf8')) as PersistedProtocolSessions;
+function isProtocolSessionRecord(value: unknown): value is ProtocolSessionRecord {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as ProtocolSessionRecord).namespace != null &&
+      typeof (value as ProtocolSessionRecord).namespace === 'string' &&
+      typeof (value as ProtocolSessionRecord).addressKey === 'string' &&
+      typeof (value as ProtocolSessionRecord).recordBase64 === 'string'
+  );
 }
 
-function writePersistedProtocolSessions(data: PersistedProtocolSessions): void {
-  mkdirSync(dirname(PROTOCOL_STORE_PATH), { recursive: true });
-  writeFileSync(PROTOCOL_STORE_PATH, `${JSON.stringify(data, null, 2)}\n`);
+function isProtocolSenderKeyRecord(
+  value: unknown
+): value is ProtocolSenderKeyRecord {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as ProtocolSenderKeyRecord).namespace != null &&
+      typeof (value as ProtocolSenderKeyRecord).namespace === 'string' &&
+      typeof (value as ProtocolSenderKeyRecord).senderKey === 'string' &&
+      typeof (value as ProtocolSenderKeyRecord).recordBase64 === 'string'
+  );
 }
 
-function loadPersistedSessions(namespace: string): Map<string, SessionRecord> {
-  const persisted = readPersistedProtocolSessions().sessions?.[namespace] ?? {};
+function loadProtocolSessions(
+  namespace: string,
+  protocol: ProtocolState | undefined
+): Map<string, SessionRecord> {
+  const persisted = Object.fromEntries(
+    (protocol?.sessions ?? [])
+      .filter(isProtocolSessionRecord)
+      .filter(record => record.namespace === namespace)
+      .map(record => [record.addressKey, record.recordBase64])
+  );
   return new Map(
     Object.entries(persisted).map(([addressKey, serialized]) => [
       addressKey,
       SessionRecord.deserialize(Bytes.fromBase64(serialized)),
     ])
   );
-}
-
-function persistSessionRecord(
-  namespace: string,
-  addressKey: string,
-  record: SessionRecord
-): void {
-  const data = readPersistedProtocolSessions();
-  data.sessions ??= {};
-  data.sessions[namespace] ??= {};
-  data.sessions[namespace][addressKey] = Bytes.toBase64(record.serialize());
-  writePersistedProtocolSessions(data);
-}
-
-function removePersistedSessionRecord(namespace: string, addressKey: string): void {
-  const data = readPersistedProtocolSessions();
-  if (!data.sessions?.[namespace]) {
-    return;
-  }
-  delete data.sessions[namespace][addressKey];
-  writePersistedProtocolSessions(data);
 }
 
 function getSenderKeyPersistenceKey(
@@ -285,8 +285,16 @@ function getSenderKeyPersistenceKey(
   return `${getProtocolAddressKey(sender)}:${distributionId}`;
 }
 
-function loadPersistedSenderKeys(namespace: string): Map<string, SenderKeyRecord> {
-  const persisted = readPersistedProtocolSessions().senderKeys?.[namespace] ?? {};
+function loadProtocolSenderKeys(
+  namespace: string,
+  protocol: ProtocolState | undefined
+): Map<string, SenderKeyRecord> {
+  const persisted = Object.fromEntries(
+    (protocol?.senderKeys ?? [])
+      .filter(isProtocolSenderKeyRecord)
+      .filter(record => record.namespace === namespace)
+      .map(record => [record.senderKey, record.recordBase64])
+  );
   return new Map(
     Object.entries(persisted).map(([senderKey, serialized]) => [
       senderKey,
@@ -295,26 +303,14 @@ function loadPersistedSenderKeys(namespace: string): Map<string, SenderKeyRecord
   );
 }
 
-function persistSenderKeyRecord(
-  namespace: string,
-  senderKey: string,
-  record: SenderKeyRecord
-): void {
-  const data = readPersistedProtocolSessions();
-  data.senderKeys ??= {};
-  data.senderKeys[namespace] ??= {};
-  data.senderKeys[namespace][senderKey] = Bytes.toBase64(record.serialize());
-  writePersistedProtocolSessions(data);
-}
-
 class WebSessionStore extends SessionStore {
   readonly #namespace: string;
   readonly #sessions = new Map<string, SessionRecord>();
 
-  public constructor(namespace: string) {
+  public constructor(namespace: string, protocol: ProtocolState | undefined) {
     super();
     this.#namespace = namespace;
-    this.#sessions = loadPersistedSessions(namespace);
+    this.#sessions = loadProtocolSessions(namespace, protocol);
   }
 
   override async saveSession(
@@ -323,7 +319,6 @@ class WebSessionStore extends SessionStore {
   ): Promise<void> {
     const addressKey = getProtocolAddressKey(address);
     this.#sessions.set(addressKey, record);
-    persistSessionRecord(this.#namespace, addressKey, record);
   }
 
   override async getSession(address: ProtocolAddress): Promise<SessionRecord | null> {
@@ -370,7 +365,6 @@ class WebSessionStore extends SessionStore {
     for (const deviceId of deviceIds) {
       const addressKey = `${serviceId}.${deviceId}`;
       this.#sessions.delete(addressKey);
-      removePersistedSessionRecord(this.#namespace, addressKey);
     }
   }
 
@@ -384,8 +378,15 @@ class WebSessionStore extends SessionStore {
     )) {
       const addressKey = getProtocolAddressKey(address);
       this.#sessions.delete(addressKey);
-      removePersistedSessionRecord(this.#namespace, addressKey);
     }
+  }
+
+  public exportRecords(): Array<ProtocolSessionRecord> {
+    return [...this.#sessions].map(([addressKey, record]) => ({
+      namespace: this.#namespace,
+      addressKey,
+      recordBase64: Bytes.toBase64(record.serialize()),
+    }));
   }
 }
 
@@ -393,10 +394,10 @@ class WebSenderKeyStore extends SenderKeyStore {
   readonly #namespace: string;
   readonly #senderKeys = new Map<string, SenderKeyRecord>();
 
-  public constructor(namespace: string) {
+  public constructor(namespace: string, protocol: ProtocolState | undefined) {
     super();
     this.#namespace = namespace;
-    this.#senderKeys = loadPersistedSenderKeys(namespace);
+    this.#senderKeys = loadProtocolSenderKeys(namespace, protocol);
   }
 
   override async saveSenderKey(
@@ -406,7 +407,6 @@ class WebSenderKeyStore extends SenderKeyStore {
   ): Promise<void> {
     const senderKey = getSenderKeyPersistenceKey(sender, distributionId);
     this.#senderKeys.set(senderKey, record);
-    persistSenderKeyRecord(this.#namespace, senderKey, record);
   }
 
   override async getSenderKey(
@@ -414,6 +414,14 @@ class WebSenderKeyStore extends SenderKeyStore {
     distributionId: Uuid
   ): Promise<SenderKeyRecord | null> {
     return this.#senderKeys.get(getSenderKeyPersistenceKey(sender, distributionId)) ?? null;
+  }
+
+  public exportRecords(): Array<ProtocolSenderKeyRecord> {
+    return [...this.#senderKeys].map(([senderKey, record]) => ({
+      namespace: this.#namespace,
+      senderKey,
+      recordBase64: Bytes.toBase64(record.serialize()),
+    }));
   }
 }
 
@@ -537,6 +545,7 @@ class WebIdentityKeyStore extends IdentityKeyStore {
 
 type WebProtocolStore = Readonly<{
   localServiceId: string;
+  namespace: string;
   identityStore: WebIdentityKeyStore;
   kyberPreKeyStore: WebKyberPreKeyStore;
   preKeyStore: EmptyWebPreKeyStore;
@@ -692,14 +701,15 @@ function getProtocolStoreForServiceId(
 
   const store: WebProtocolStore = {
     localServiceId,
+    namespace: storeKey,
     identityStore: new WebIdentityKeyStore({
       identityKeyPair,
       registrationId,
     }),
     kyberPreKeyStore: new WebKyberPreKeyStore([pqLastResortPreKeyRecord]),
     preKeyStore: new EmptyWebPreKeyStore(),
-    senderKeyStore: new WebSenderKeyStore(storeKey),
-    sessionStore: new WebSessionStore(storeKey),
+    senderKeyStore: new WebSenderKeyStore(storeKey, linkedPayload.protocol),
+    sessionStore: new WebSessionStore(storeKey, linkedPayload.protocol),
     signedPreKeyStore: new WebSignedPreKeyStore([signedPreKeyRecord]),
   };
   protocolStores.set(storeKey, store);
@@ -708,6 +718,44 @@ function getProtocolStoreForServiceId(
 
 function getProtocolStore(linkedPayload: WebSendLinkedPayload): WebProtocolStore {
   return getProtocolStoreForServiceId(linkedPayload, getLinkedAci(linkedPayload));
+}
+
+export function exportProtocolState(
+  linkedPayload: WebSendLinkedPayload
+): ProtocolState {
+  const aci = getLinkedAci(linkedPayload);
+  const stores = [...protocolStores.entries()]
+    .filter(([storeKey]) => storeKey.startsWith(`${aci}:`))
+    .map(([, store]) => store);
+
+  return {
+    registrationIds: {
+      aci: linkedPayload.aciRegistrationId,
+      pni: linkedPayload.pniRegistrationId,
+    },
+    identityKeys: {
+      aci:
+        linkedPayload.aciIdentityKeyPublic || linkedPayload.aciIdentityKeyPrivate
+          ? {
+              publicKey: linkedPayload.aciIdentityKeyPublic,
+              privateKey: linkedPayload.aciIdentityKeyPrivate,
+            }
+          : undefined,
+      pni:
+        linkedPayload.pniIdentityKeyPublic || linkedPayload.pniIdentityKeyPrivate
+          ? {
+              publicKey: linkedPayload.pniIdentityKeyPublic,
+              privateKey: linkedPayload.pniIdentityKeyPrivate,
+            }
+          : undefined,
+    },
+    identityRecords: linkedPayload.protocol?.identityRecords ?? [],
+    preKeys: linkedPayload.protocol?.preKeys ?? [],
+    signedPreKeys: linkedPayload.protocol?.signedPreKeys ?? [],
+    kyberPreKeys: linkedPayload.protocol?.kyberPreKeys ?? [],
+    sessions: stores.flatMap(store => store.sessionStore.exportRecords()),
+    senderKeys: stores.flatMap(store => store.senderKeyStore.exportRecords()),
+  };
 }
 
 function createAttachmentPointer(
@@ -865,6 +913,9 @@ function createDataMessage({
   attachments = [],
   body,
   deleteForEveryone,
+  expireTimer,
+  expireTimerVersion,
+  flags = 0,
   groupV2,
   isViewOnce = false,
   pinMessage,
@@ -875,6 +926,9 @@ function createDataMessage({
   attachments?: ReadonlyArray<WebAttachment>;
   body: string;
   deleteForEveryone?: WebDeleteForEveryone;
+  expireTimer?: number;
+  expireTimerVersion?: number;
+  flags?: number;
   groupV2?: Proto.GroupContextV2.Params;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
@@ -886,7 +940,7 @@ function createDataMessage({
   return {
     timestamp: BigInt(timestamp),
     attachments: attachments.map(createAttachmentPointer),
-    flags: 0,
+    flags,
     body: body.length > 0 ? body : null,
     bodyRanges: null,
     groupV2: groupV2 ?? null,
@@ -904,8 +958,8 @@ function createDataMessage({
     unpinMessage: createUnpinMessage(unpinMessage),
     pollVote: null,
     pollTerminate: null,
-    expireTimer: null,
-    expireTimerVersion: null,
+    expireTimer: expireTimer ?? null,
+    expireTimerVersion: expireTimerVersion ?? null,
     profileKey: null,
     isViewOnce,
     requiredProtocolVersion: 0,
@@ -951,7 +1005,12 @@ function createTextContent(
   quote?: WebMessage['quote'],
   unpinMessage?: WebUnpinMessage,
   isViewOnce?: boolean,
-  groupV2?: Proto.GroupContextV2.Params
+  groupV2?: Proto.GroupContextV2.Params,
+  expirationTimerUpdate?: Readonly<{
+    expireTimer?: number;
+    expireTimerVersion?: number;
+    flags?: number;
+  }>
 ): Uint8Array<ArrayBuffer> {
   return padMessage(Proto.Content.encode({
     content: {
@@ -959,6 +1018,9 @@ function createTextContent(
         attachments,
         body,
         deleteForEveryone,
+        expireTimer: expirationTimerUpdate?.expireTimer,
+        expireTimerVersion: expirationTimerUpdate?.expireTimerVersion,
+        flags: expirationTimerUpdate?.flags,
         groupV2,
         isViewOnce,
         pinMessage,
@@ -1017,6 +1079,9 @@ function createSentSyncContent({
   body,
   deleteForEveryone,
   destinationServiceId,
+  expireTimer,
+  expireTimerVersion,
+  flags,
   groupV2,
   isViewOnce = false,
   pinMessage,
@@ -1028,6 +1093,9 @@ function createSentSyncContent({
   body: string;
   deleteForEveryone?: WebDeleteForEveryone;
   destinationServiceId?: string;
+  expireTimer?: number;
+  expireTimerVersion?: number;
+  flags?: number;
   groupV2?: Proto.GroupContextV2.Params;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
@@ -1050,6 +1118,9 @@ function createSentSyncContent({
               attachments,
               body,
               deleteForEveryone,
+              expireTimer,
+              expireTimerVersion,
+              flags,
               groupV2,
               isViewOnce,
               pinMessage,
@@ -1186,6 +1257,26 @@ function createMessageRequestResponseSyncContent({
             threadAci: null,
             threadAciBinary: toAciObject(threadAci as AciString).getRawUuidBytes(),
             type,
+          },
+        },
+        padding: null,
+        read: [],
+        stickerPackOperation: [],
+        viewed: [],
+      },
+    },
+    pniSignatureMessage: null,
+    senderKeyDistributionMessage: null,
+  }));
+}
+
+function createFetchLocalProfileSyncContent(): Uint8Array<ArrayBuffer> {
+  return padMessage(Proto.Content.encode({
+    content: {
+      syncMessage: {
+        content: {
+          fetchLatest: {
+            type: Proto.SyncMessage.FetchLatest.Type.LOCAL_PROFILE,
           },
         },
         padding: null,
@@ -1861,21 +1952,43 @@ function convertDataMessageToWebMessage({
     groupV2: dataMessage.groupV2,
     sourceServiceId,
   });
+  // oxlint-disable-next-line no-bitwise
+  const isExpirationTimerUpdate = Boolean(
+    (dataMessage.flags ?? 0) &
+      Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE
+  );
+  const expirationTimer =
+    DurationInSeconds.fromSeconds(dataMessage.expireTimer ?? 0) || undefined;
 
   return {
     id,
     conversationId: groupV2?.id ?? conversationId,
-    body: groupV2Change ? undefined : (dataMessage.body ?? ''),
+    body:
+      groupV2Change || isExpirationTimerUpdate
+        ? undefined
+        : (dataMessage.body ?? ''),
     timestamp,
     receivedAt,
     direction,
-    desktopType: groupV2Change ? 'group-v2-change' : undefined,
+    desktopType: groupV2Change
+      ? 'group-v2-change'
+      : isExpirationTimerUpdate
+        ? 'timer-notification'
+        : undefined,
     status,
     attachments,
     bodyRanges: dataMessage.bodyRanges.map(convertBodyRange).filter(item => item != null),
     contact: convertContact(dataMessage.contact),
     expireTimer: DurationInSeconds.fromSeconds(dataMessage.expireTimer ?? 0),
     expireTimerVersion: dataMessage.expireTimerVersion ?? 0,
+    expirationTimerUpdate: isExpirationTimerUpdate
+      ? {
+          expireTimer: expirationTimer,
+          fromSync: direction === 'outgoing',
+          source: sourceServiceId,
+          sourceServiceId,
+        }
+      : undefined,
     flags: dataMessage.flags ?? 0,
     groupCallUpdate: dataMessage.groupCallUpdate ?? undefined,
     groupV2Change,
@@ -3410,6 +3523,9 @@ export async function sendDirectTextMessage({
   chat,
   deleteForEveryone,
   destinationServiceId,
+  expireTimer,
+  expireTimerVersion,
+  flags,
   isViewOnce,
   linkedPayload,
   pinMessage,
@@ -3426,7 +3542,9 @@ export async function sendDirectTextMessage({
     deleteForEveryone,
     quote,
     unpinMessage,
-    isViewOnce
+    isViewOnce,
+    undefined,
+    { expireTimer, expireTimerVersion, flags }
   );
   let messages = await encryptForDestination({
     chat,
@@ -3519,6 +3637,9 @@ export async function sendDirectTextMessage({
           body,
           deleteForEveryone,
           destinationServiceId,
+          expireTimer,
+          expireTimerVersion,
+          flags,
           isViewOnce,
           pinMessage,
           quote,
@@ -3551,11 +3672,55 @@ export async function sendDirectTextMessage({
     direction: 'outgoing',
     status: 'sent',
     attachments,
+    desktopType:
+      flags === Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE
+        ? 'timer-notification'
+        : undefined,
+    expireTimer: DurationInSeconds.fromSeconds(expireTimer ?? 0) || undefined,
+    expireTimerVersion,
+    expirationTimerUpdate:
+      flags === Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE
+        ? {
+            expireTimer:
+              DurationInSeconds.fromSeconds(expireTimer ?? 0) || undefined,
+            fromSync: false,
+            source: getLinkedAci(linkedPayload),
+            sourceServiceId: getLinkedAci(linkedPayload),
+          }
+        : undefined,
+    flags,
     pinMessage,
     quote,
     unpinMessage,
     sourceServiceId: getLinkedAci(linkedPayload),
   };
+}
+
+export async function sendDirectExpirationTimerUpdate({
+  chat,
+  destinationServiceId,
+  expireTimer,
+  expireTimerVersion,
+  linkedPayload,
+  timestamp,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  destinationServiceId: string;
+  expireTimer?: number;
+  expireTimerVersion: number;
+  linkedPayload: WebSendLinkedPayload;
+  timestamp: number;
+}>): Promise<WebMessage> {
+  return sendDirectTextMessage({
+    body: '',
+    chat,
+    destinationServiceId,
+    expireTimer,
+    expireTimerVersion,
+    flags: Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
+    linkedPayload,
+    timestamp,
+  });
 }
 
 function createGroupContextV2(
@@ -3589,7 +3754,9 @@ export async function sendGroupUpdateMessage({
   timestamp,
 }: GroupUpdateSendOptions): Promise<void> {
   const ourAci = getLinkedAci(linkedPayload);
-  const groupContext = createGroupUpdateContextV2(groupV2, groupChangeBase64);
+  const groupContext = groupChangeBase64
+    ? createGroupUpdateContextV2(groupV2, groupChangeBase64)
+    : createGroupContextV2(groupV2);
   const plaintext = createTextContent('', timestamp, [], undefined, undefined, undefined, undefined, undefined, groupContext);
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
@@ -4157,6 +4324,65 @@ export async function sendMessageRequestResponseSync({
     timestamp,
     type,
   };
+}
+
+export async function sendFetchLocalProfileSync({
+  chat,
+  linkedPayload,
+  timestamp,
+}: FetchLocalProfileSyncOptions): Promise<{ ok: true; timestamp: number }> {
+  const ourAci = getLinkedAci(linkedPayload);
+  let messages = await encryptForDestination({
+    chat,
+    destinationServiceId: ourAci,
+    linkedPayload,
+    plaintext: createFetchLocalProfileSyncContent(),
+  });
+
+  try {
+    await chat.sendSyncMessage({
+      contents: messages,
+      timestamp,
+      urgent: false,
+    });
+  } catch (error) {
+    const sendSummary = {
+      devices: messages.map(message => ({
+        deviceId: message.deviceId,
+        registrationId: message.registrationId,
+        type: message.contents.type(),
+        contentLength: message.contents.serialize().byteLength,
+      })),
+      cause: getErrorSummary(error),
+    };
+    const mismatchedEntries = getMismatchedDevicesEntries(error, ourAci);
+    if (mismatchedEntries) {
+      await handleWebMismatchedDevices({
+        chat,
+        entries: mismatchedEntries,
+        linkedPayload,
+      });
+      messages = await encryptForDestination({
+        chat,
+        destinationServiceId: ourAci,
+        linkedPayload,
+        plaintext: createFetchLocalProfileSyncContent(),
+      });
+      await chat.sendSyncMessage({
+        contents: messages,
+        timestamp,
+        urgent: false,
+      });
+      return { ok: true, timestamp };
+    }
+
+    throw new Error(
+      `sendFetchLocalProfileSync failed: ${JSON.stringify(sendSummary)}`,
+      { cause: error }
+    );
+  }
+
+  return { ok: true, timestamp };
 }
 
 export async function sendAttachmentBackfillRequestSync({

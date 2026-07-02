@@ -14,6 +14,7 @@ import type { CallHistoryGroup } from '../../types/CallDisposition.std.ts';
 import { assertDev } from '../../util/assert.std.ts';
 import { getConversationColorAttributes } from '../../util/getConversationColorAttributes.std.ts';
 import { getGroupMemberships } from '../../util/getGroupMemberships.dom.ts';
+import { isAciString } from '../../util/isAciString.std.ts';
 import {
   getBadgesSelector,
   getPreferredBadgeSelector,
@@ -84,13 +85,19 @@ function getGroupsInCommonSorted(
   if (conversation.type !== 'direct') {
     return [];
   }
+  const serviceId =
+    conversation.serviceId ??
+    (isAciString(conversation.id) ? conversation.id : undefined);
+  if (!serviceId) {
+    return [];
+  }
   const groupsInCommonUnsorted = allComposableConversations.filter(
     otherConversation => {
       if (otherConversation.type !== 'group') {
         return false;
       }
       return otherConversation.memberships?.some(member => {
-        return member.aci === conversation.serviceId;
+        return member.aci === serviceId;
       });
     }
   );

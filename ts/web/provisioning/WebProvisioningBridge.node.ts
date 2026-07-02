@@ -3,27 +3,29 @@
 
 import { Buffer } from 'node:buffer';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import {
-  createReadStream,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs';
-import { mkdir, stat } from 'node:fs/promises';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readdir, rm, stat } from 'node:fs/promises';
 import https from 'node:https';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable, Transform, Writable } from 'node:stream';
 import {
   ErrorCode as LibSignalErrorCode,
   LibSignalErrorBase,
   SignedPreKeyRecord,
+  usernames,
 } from '@signalapp/libsignal-client';
 import type { PrivateKey, PublicKey } from '@signalapp/libsignal-client';
 import { BackupKey } from '@signalapp/libsignal-client/dist/AccountKeys.js';
-import type { AuthenticatedChatConnection } from '@signalapp/libsignal-client/dist/net.js';
+import type {
+  AuthenticatedChatConnection,
+  ServiceAuth,
+} from '@signalapp/libsignal-client/dist/net.js';
 import type {
   ChatConnection,
   UnauthenticatedChatConnection,
@@ -38,15 +40,27 @@ import { setEnvironment, Environment } from '../../environment.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
 import {
   decryptAttachmentV2ToSink,
-  encryptAttachmentV2ToDisk,
-  safeUnlink,
+  encryptAttachmentV2,
 } from '../../AttachmentCrypto.node.ts';
+import type { PlaintextSourceType } from '../../AttachmentCrypto.node.ts';
+import {
+  PaddedLengths,
+  encryptProfile,
+  encryptProfileItemWithPadding,
+} from '../../Crypto.node.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
+import { MediaTier } from '../../types/AttachmentDownload.std.ts';
 import { supportsIncrementalMac } from '../../types/MIME.std.ts';
 import type { MIMEType } from '../../types/MIME.std.ts';
 import { MY_STORY_ID } from '../../types/Stories.std.ts';
+import {
+  getDiscriminator,
+  getNickname,
+  ReserveUsernameError,
+} from '../../types/Username.std.ts';
 import type { ProvisionDecryptResult } from '../../textsecure/ProvisioningCipher.node.ts';
 import type { AciString, ServiceIdString } from '../../types/ServiceId.std.ts';
+import { fromAciObject } from '../../types/ServiceId.std.ts';
 import { toAciObject } from '../../util/ServiceId.node.ts';
 import { normalizeAci } from '../../util/normalizeAci.std.ts';
 import { DAY, DurationInSeconds } from '../../util/durations/index.std.ts';
@@ -54,25 +68,38 @@ import { toDayMillis } from '../../util/timestamp.std.ts';
 import { getUserAgent } from '../../util/getUserAgent.node.ts';
 import { utf16ToEmoji } from '../../util/utf16ToEmoji.node.ts';
 import { Emoji } from '../../axo/emoji.std.ts';
-import { tusUpload, type FetchFunctionType } from '../../util/uploads/tusProtocol.node.ts';
-import { defaultFileReader } from '../../util/uploads/uploads.node.ts';
+import { getAttachmentCiphertextSize } from '../../util/AttachmentCrypto.std.ts';
 import {
-  importEphemeralBackup,
-} from './WebBackupImportBridge.node.ts';
+  fromWebSafeBase64,
+  toWebSafeBase64,
+} from '../../util/webSafeBase64.std.ts';
+import {
+  deriveProfileKeyCommitment,
+  deriveProfileKeyVersion,
+} from '../../util/zkgroup.node.ts';
+import {
+  _tusCreateWithUploadRequest,
+  type FetchFunctionType,
+} from '../../util/uploads/tusProtocol.node.ts';
+import { importEphemeralBackup } from './WebBackupImportBridge.node.ts';
 import { syncStorageContacts } from './WebStorageContactsSync.node.ts';
 import {
   decryptIncomingSignalEnvelope,
+  exportProtocolState,
   getLinkedPayloadProtocolKeyIds,
   sendAttachmentBackfillRequestSync,
   sendDirectEditMessage,
+  sendDirectExpirationTimerUpdate,
   sendDirectTextMessage,
   sendGroupReaction,
   sendGroupTextMessage,
   sendGroupUpdateMessage,
   sendDirectReaction,
+  sendFetchLocalProfileSync,
   sendMessageRequestResponseSync,
 } from './WebSignalSendBridge.node.ts';
 import {
+  createGroupConversation,
   fetchLatestGroupStateConversation,
   modifyGroupMember,
   modifyGroupSettings,
@@ -80,10 +107,10 @@ import {
   type WebGroupSettingsModifyAction,
 } from './WebGroupStateSync.node.ts';
 import type {
-  ChatShellState,
-  ContactsBootstrap,
   MessageStreamEvent,
+  ProtocolState,
   WebAttachment,
+  WebAccount,
   WebConversation,
   WebDeleteForEveryone,
   WebMessage,
@@ -94,7 +121,10 @@ import type {
 try {
   setEnvironment(Environment.PackagedApp, false);
 } catch (error) {
-  if (!(error instanceof Error) || error.message !== 'Environment has already been set') {
+  if (
+    !(error instanceof Error) ||
+    error.message !== 'Environment has already been set'
+  ) {
     throw error;
   }
 }
@@ -105,14 +135,15 @@ const jumbomojiManifest = require('../../../build/jumbomoji.json') as Record<
   string,
   Array<string>
 >;
-const optionalResources = require('../../../build/optional-resources.json') as Record<
-  string,
-  {
-    digest: string;
-    size: number;
-    url: string;
-  }
->;
+const optionalResources =
+  require('../../../build/optional-resources.json') as Record<
+    string,
+    {
+      digest: string;
+      size: number;
+      url: string;
+    }
+  >;
 const productionConfig = require('../../../config/production.json') as {
   backupServerPublicParams: string;
   serverUrl: string;
@@ -128,18 +159,20 @@ function getDefaultCdnUrl(): string {
   return cdnUrl;
 }
 
-const WEB_ATTACHMENT_WORK_DIR = resolve(process.cwd(), '.signal-web', 'attachments');
-const WEB_ATTACHMENT_TMP_DIR = resolve(WEB_ATTACHMENT_WORK_DIR, 'tmp');
-const WEB_EMOJI_CACHE_DIR = resolve(process.cwd(), '.signal-web', 'emoji');
-const WEB_STREAM_EVENT_QUEUE_PATH = resolve(
+const WEB_ATTACHMENT_WORK_DIR = resolve(
   process.cwd(),
   '.signal-web',
-  'message-stream-events.json'
+  'attachments'
 );
-const WEB_BACKUP_IMPORT_CACHE_PATH = resolve(
-  process.cwd(),
-  '.signal-web',
-  'backup-import-cache.json'
+const WEB_ATTACHMENT_TMP_DIR = resolve(WEB_ATTACHMENT_WORK_DIR, 'tmp');
+const WEB_EMOJI_CACHE_DIR =
+  process.env.SIGNAL_WEB_EMOJI_CACHE_DIR ??
+  resolve(process.cwd(), '.signal-web', 'emoji');
+const WEB_ATTACHMENT_TMP_MAX_AGE_MS = Number(
+  process.env.SIGNAL_WEB_ATTACHMENT_TMP_MAX_AGE_MS ?? 24 * 60 * 60 * 1000
+);
+const WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS = Number(
+  process.env.SIGNAL_WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS ?? 16
 );
 const MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT = 500;
 const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
@@ -178,10 +211,17 @@ type ProvisioningSession = {
 type LinkedPayload = {
   account: {
     aci: string;
+    avatarUrl?: string;
+    avatarUrlPath?: string;
+    color?: string;
+    familyName?: string;
     pni?: string;
     number: string;
     phoneNumber: string;
+    profileFamilyName?: string;
+    profileName?: string;
     title: string;
+    username?: string;
   };
   credentials: {
     username: string;
@@ -212,23 +252,14 @@ type LinkedPayload = {
 };
 
 type JsonRecord = Record<string, unknown>;
+type LinkedPayloadWithProtocol = LinkedPayload &
+  Readonly<{
+    protocol?: ProtocolState;
+  }>;
 type PersistedStreamEventEntry = {
   id: string;
   createdAt: number;
   event: MessageStreamEvent;
-};
-type PersistedStreamEvents = {
-  accounts?: Record<string, Array<PersistedStreamEventEntry>>;
-};
-type PersistedBackupImportEntry = {
-  updatedAt: number;
-  contactsBootstrap: ContactsBootstrap;
-  chatShell: ChatShellState;
-  mediaRootBackupKeyBase64?: string;
-  stats: unknown;
-};
-type PersistedBackupImportCache = {
-  accounts?: Record<string, PersistedBackupImportEntry>;
 };
 
 type ProvisioningSessionEvent = {
@@ -238,6 +269,7 @@ type ProvisioningSessionEvent = {
 };
 
 type MessageStreamSession = {
+  sessionId: string;
   createdAt: number;
   updatedAt: number;
   username: string;
@@ -245,7 +277,15 @@ type MessageStreamSession = {
   error?: string;
   lastReceiveError?: string;
   lastSendError?: string;
-  backupImportStatus: 'idle' | 'waiting-for-archive' | 'downloading' | 'importing' | 'done' | 'missing' | 'skipped' | 'error';
+  backupImportStatus:
+    | 'idle'
+    | 'waiting-for-archive'
+    | 'downloading'
+    | 'importing'
+    | 'done'
+    | 'missing'
+    | 'skipped'
+    | 'error';
   backupImportError?: string;
   backupImportStats?: unknown;
   incomingEnvelopeCount: number;
@@ -260,7 +300,11 @@ type MessageStreamSession = {
   sendAttemptCount: number;
   lastSendAttemptAt?: number;
   connection?: AuthenticatedChatConnection;
-  linkedPayload?: LinkedPayload;
+  linkedPayload?: LinkedPayloadWithProtocol;
+  cdsiAuth?: {
+    timestamp: number;
+    auth: ServiceAuth;
+  };
   backupPresentationHeaders?: {
     headers: Record<string, string>;
     retrievedAtMs: number;
@@ -310,7 +354,10 @@ const insecureNodeFetch: FetchFunctionType = (url, init) =>
     agent: insecureHttpsAgent,
   });
 const ALLOWED_ORIGINS = new Set(
-  (process.env.SIGNAL_WEB_ALLOWED_ORIGINS ?? 'http://127.0.0.1:3001,http://localhost:3001')
+  (
+    process.env.SIGNAL_WEB_ALLOWED_ORIGINS ??
+    'http://127.0.0.1:3001,http://localhost:3001'
+  )
     .split(',')
     .map(origin => origin.trim())
     .filter(Boolean)
@@ -318,9 +365,19 @@ const ALLOWED_ORIGINS = new Set(
 
 const sessions = new Map<string, ProvisioningSession>();
 const streamSessions = new Map<string, MessageStreamSession>();
+const persistedStreamEventsByAccount = new Map<
+  string,
+  Array<PersistedStreamEventEntry>
+>();
 const transferArchiveCooldownUntilByAccount = new Map<string, number>();
 
 let signalModulesPromise: ReturnType<typeof loadSignalModules> | undefined;
+let libsignalNetInstance:
+  | InstanceType<Awaited<ReturnType<typeof getSignalModules>>['Net']['Net']>
+  | undefined;
+
+const CDSI_LOOKUP_TIMEOUT_MS = 10_000;
+const CACHED_CDSI_AUTH_TTL_MS = 23 * 60 * 60 * 1000;
 
 function now(): number {
   return Date.now();
@@ -348,101 +405,17 @@ function recordSessionEvent(
 }
 
 function getStreamEventAccountKey(
-  linkedPayload: LinkedPayload | undefined,
+  linkedPayload: LinkedPayloadWithProtocol | undefined,
   fallback: string
 ): string {
-  return linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci ?? fallback;
-}
-
-function readPersistedStreamEvents(): PersistedStreamEvents {
-  if (!existsSync(WEB_STREAM_EVENT_QUEUE_PATH)) {
-    return {};
-  }
-  return JSON.parse(
-    readFileSync(WEB_STREAM_EVENT_QUEUE_PATH, 'utf8')
-  ) as PersistedStreamEvents;
-}
-
-function writePersistedStreamEvents(data: PersistedStreamEvents): void {
-  mkdirSync(resolve(WEB_STREAM_EVENT_QUEUE_PATH, '..'), { recursive: true });
-  writeFileSync(WEB_STREAM_EVENT_QUEUE_PATH, `${JSON.stringify(data, null, 2)}\n`);
-}
-
-function readPersistedBackupImportCache(): PersistedBackupImportCache {
-  if (!existsSync(WEB_BACKUP_IMPORT_CACHE_PATH)) {
-    return {};
-  }
-  return JSON.parse(
-    readFileSync(WEB_BACKUP_IMPORT_CACHE_PATH, 'utf8')
-  ) as PersistedBackupImportCache;
-}
-
-function writePersistedBackupImportCache(
-  data: PersistedBackupImportCache
-): void {
-  mkdirSync(resolve(WEB_BACKUP_IMPORT_CACHE_PATH, '..'), { recursive: true });
-  writeFileSync(
-    WEB_BACKUP_IMPORT_CACHE_PATH,
-    `${JSON.stringify(data, null, 2)}\n`
+  return (
+    linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci ?? fallback
   );
 }
 
-function getPersistedBackupImportEntry(
-  linkedPayload: LinkedPayload | undefined,
-  fallback: string
-): PersistedBackupImportEntry | undefined {
-  const accountKey = getStreamEventAccountKey(linkedPayload, fallback);
-  return readPersistedBackupImportCache().accounts?.[accountKey];
-}
-
-function savePersistedBackupImportEntry({
-  fallback,
-  linkedPayload,
-  value,
-}: {
-  fallback: string;
-  linkedPayload: LinkedPayload | undefined;
-  value: PersistedBackupImportEntry;
-}): void {
-  const accountKey = getStreamEventAccountKey(linkedPayload, fallback);
-  const cache = readPersistedBackupImportCache();
-  writePersistedBackupImportCache({
-    ...cache,
-    accounts: {
-      ...cache.accounts,
-      [accountKey]: value,
-    },
-  });
-}
-
-function emitPersistedBackupImportEntry({
-  entry,
-  linkedPayload,
-  streamSession,
-  writeEvent,
-}: {
-  entry: PersistedBackupImportEntry;
-  linkedPayload: LinkedPayload | undefined;
-  streamSession: MessageStreamSession;
-  writeEvent: (event: unknown) => void;
-}): void {
-  if (entry.mediaRootBackupKeyBase64 && linkedPayload) {
-    streamSession.linkedPayload = {
-      ...linkedPayload,
-      mediaRootBackupKeyBase64: entry.mediaRootBackupKeyBase64,
-    };
-    writeEvent({
-      type: 'linked-session-updated',
-      linkedPayload: streamSession.linkedPayload,
-    });
-  }
-  streamSession.backupImportStats = entry.stats;
-  streamSession.updatedAt = now();
-  writeEvent({ type: 'contacts-bootstrap', data: entry.contactsBootstrap });
-  writeEvent({ type: 'chat-shell', state: entry.chatShell });
-}
-
-function getPersistedStreamEventId(event: MessageStreamEvent): string | undefined {
+function getPersistedStreamEventId(
+  event: MessageStreamEvent
+): string | undefined {
   if (event.type === 'message') {
     return `message:${event.message.id}`;
   }
@@ -501,21 +474,19 @@ function persistStreamEvent(
     return event;
   }
 
-  const data = readPersistedStreamEvents();
-  data.accounts ??= {};
   const cutoff = now() - MAX_PERSISTED_STREAM_EVENT_AGE;
-  const existing = (data.accounts[accountKey] ?? []).filter(
-    item => item.createdAt >= cutoff && item.id !== id
-  );
+  const existing = (
+    persistedStreamEventsByAccount.get(accountKey) ?? []
+  ).filter(item => item.createdAt >= cutoff && item.id !== id);
   existing.push({
     id,
     createdAt: now(),
     event: withStreamEventId(event, id),
   });
-  data.accounts[accountKey] = existing.slice(
-    -MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT
+  persistedStreamEventsByAccount.set(
+    accountKey,
+    existing.slice(-MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT)
   );
-  writePersistedStreamEvents(data);
   return withStreamEventId(event, id);
 }
 
@@ -523,7 +494,7 @@ function replayPersistedStreamEvents(
   accountKey: string,
   writeEvent: (event: unknown) => void
 ): void {
-  const items = readPersistedStreamEvents().accounts?.[accountKey] ?? [];
+  const items = persistedStreamEventsByAccount.get(accountKey) ?? [];
   const cutoff = now() - MAX_PERSISTED_STREAM_EVENT_AGE;
   for (const item of items) {
     if (item.createdAt < cutoff) {
@@ -537,8 +508,7 @@ function acknowledgePersistedStreamEvent(
   accountKey: string,
   eventId: string
 ): void {
-  const data = readPersistedStreamEvents();
-  const items = data.accounts?.[accountKey];
+  const items = persistedStreamEventsByAccount.get(accountKey);
   if (!items) {
     return;
   }
@@ -546,17 +516,28 @@ function acknowledgePersistedStreamEvent(
   if (nextItems.length === items.length) {
     return;
   }
-  data.accounts ??= {};
-  data.accounts[accountKey] = nextItems;
-  writePersistedStreamEvents(data);
+  persistedStreamEventsByAccount.set(accountKey, nextItems);
+}
+
+function emitProtocolState(streamSession: MessageStreamSession): void {
+  if (!streamSession.linkedPayload || !streamSession.writeEvent) {
+    return;
+  }
+  const protocol = exportProtocolState(streamSession.linkedPayload);
+  streamSession.linkedPayload = {
+    ...streamSession.linkedPayload,
+    protocol,
+  };
+  streamSession.writeEvent({
+    type: 'protocol-state',
+    protocol,
+  });
 }
 
 function sendCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
   if (origin && (ALLOWED_ORIGINS.has(origin) || ALLOWED_ORIGINS.has('*'))) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', 'http://127.0.0.1:3001');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -569,7 +550,9 @@ function sendJson(
   body: unknown
 ): void {
   sendCors(req, res);
-  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+  });
   res.end(JSON.stringify(body));
 }
 
@@ -593,11 +576,52 @@ function sendBytes(
 ): void {
   sendCors(req, res);
   res.writeHead(statusCode, {
-    'Cache-Control': 'public, max-age=2592000, immutable',
+    'Cache-Control': 'public, max-age=31536000, immutable',
     'Content-Length': String(body.byteLength),
     'Content-Type': contentType,
   });
   res.end(body);
+}
+
+function sendAttachmentBytes({
+  body,
+  contentType,
+  fileName,
+  req,
+  res,
+}: Readonly<{
+  body: Uint8Array;
+  contentType: string;
+  fileName: string | null;
+  req: IncomingMessage;
+  res: ServerResponse;
+}>): void {
+  sendCors(req, res);
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': String(body.byteLength),
+    ...(fileName
+      ? {
+          'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        }
+      : null),
+    'Cache-Control': 'public, max-age=3600',
+  });
+  res.end(body);
+}
+
+async function decryptAttachmentV2ToBuffer(
+  options: Parameters<typeof decryptAttachmentV2ToSink>[0]
+): Promise<Buffer> {
+  const chunks = new Array<Buffer>();
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      callback();
+    },
+  });
+  await decryptAttachmentV2ToSink(options, sink);
+  return Buffer.concat(chunks);
 }
 
 function toArrayBufferUint8Array(data: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -621,7 +645,9 @@ function verifyOptionalResourceDigest({
   }
 }
 
-async function getEmojiSheetProto(sheet: string): Promise<Uint8Array<ArrayBuffer>> {
+async function getEmojiSheetProto(
+  sheet: string
+): Promise<Uint8Array<ArrayBuffer>> {
   const resourceName = `emoji-sheet-${sheet}.proto`;
   const resource = optionalResources[resourceName];
   if (!resource) {
@@ -632,17 +658,23 @@ async function getEmojiSheetProto(sheet: string): Promise<Uint8Array<ArrayBuffer
   const localPath = resolve(WEB_EMOJI_CACHE_DIR, resourceName);
   if (existsSync(localPath)) {
     const cached = readFileSync(localPath);
-    verifyOptionalResourceDigest({
-      data: cached,
-      digest: resource.digest,
-      resourceName,
-    });
-    return toArrayBufferUint8Array(cached);
+    try {
+      verifyOptionalResourceDigest({
+        data: cached,
+        digest: resource.digest,
+        resourceName,
+      });
+      return toArrayBufferUint8Array(cached);
+    } catch {
+      await rm(localPath, { force: true });
+    }
   }
 
   const response = await nodeFetch(resource.url);
   if (!response.ok) {
-    throw new Error(`${resourceName}: fetch failed with status ${response.status}`);
+    throw new Error(
+      `${resourceName}: fetch failed with status ${response.status}`
+    );
   }
   const data = Buffer.from(await response.arrayBuffer());
   if (data.byteLength !== resource.size) {
@@ -662,6 +694,8 @@ async function getEmojiSheetImages(
 ): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
   const cached = emojiSheetCache.get(sheet);
   if (cached) {
+    emojiSheetCache.delete(sheet);
+    emojiSheetCache.set(sheet, cached);
     return cached;
   }
 
@@ -677,6 +711,13 @@ async function getEmojiSheetImages(
     imageMap.set(key, image);
   }
   emojiSheetCache.set(sheet, imageMap);
+  while (emojiSheetCache.size > WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS) {
+    const oldestSheet = emojiSheetCache.keys().next().value;
+    if (oldestSheet == null) {
+      break;
+    }
+    emojiSheetCache.delete(oldestSheet);
+  }
   return imageMap;
 }
 
@@ -724,7 +765,9 @@ function getSessionResponse(session: ProvisioningSession): JsonRecord {
           pni: session.linkedPayload.account.pni,
           number: session.linkedPayload.account.number,
           deviceId: session.linkedPayload.credentials.deviceId,
-          hasBackupDownloadPath: Boolean(session.linkedPayload.backupDownloadPath),
+          hasBackupDownloadPath: Boolean(
+            session.linkedPayload.backupDownloadPath
+          ),
           hasMediaRootBackupKey: Boolean(
             session.linkedPayload.mediaRootBackupKeyBase64
           ),
@@ -744,6 +787,57 @@ async function readJson(req: IncomingMessage): Promise<JsonRecord> {
     return {};
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8')) as JsonRecord;
+}
+
+function isJsonRequest(req: IncomingMessage): boolean {
+  const contentType = req.headers['content-type'];
+  return (
+    typeof contentType === 'string' &&
+    contentType.toLowerCase().split(';')[0] === 'application/json'
+  );
+}
+
+function getRequiredQueryNumber(url: URL, name: string): number | undefined {
+  const value = url.searchParams.get(name);
+  if (value == null || value.length === 0) {
+    return undefined;
+  }
+  const numberValue = Number(value);
+  if (
+    !Number.isSafeInteger(numberValue) ||
+    numberValue < 0 ||
+    String(numberValue) !== value
+  ) {
+    return undefined;
+  }
+  return numberValue;
+}
+
+function createSizeCheckedStream(
+  input: Readable,
+  expectedSize: number
+): Readable {
+  let byteCount = 0;
+  const transform = new Transform({
+    transform(chunk, _encoding, callback) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteCount += buffer.byteLength;
+      if (byteCount > expectedSize) {
+        callback(new Error('Attachment size exceeds declared size'));
+        return;
+      }
+      callback(null, buffer);
+    },
+    flush(callback) {
+      if (byteCount !== expectedSize) {
+        callback(new Error('Attachment size does not match request body'));
+        return;
+      }
+      callback();
+    },
+  });
+  input.pipe(transform);
+  return transform;
 }
 
 function getBodyString(body: unknown): string {
@@ -780,61 +874,59 @@ function parseWebAttachments(value: unknown): ReadonlyArray<WebAttachment> {
     return [];
   }
 
-  return value
-    .filter(isRecord)
-    .map(item => {
-      const thumbnail = isRecord(item.thumbnail)
-        ? parseWebAttachments([item.thumbnail])[0]
-        : undefined;
-      return {
-        id: getOptionalString(item.id),
-        kind:
-          item.kind === 'file' || item.kind === 'image' || item.kind === 'video'
-            ? item.kind
-            : undefined,
-        cdnId: getOptionalString(item.cdnId),
-        cdnKey: getOptionalString(item.cdnKey),
-        cdnNumber: getOptionalNumber(item.cdnNumber),
-        keyBase64: getOptionalString(item.keyBase64),
-        digestBase64: getOptionalString(item.digestBase64),
-        incrementalMacBase64: getOptionalString(item.incrementalMacBase64),
-        key: getOptionalString(item.key),
-        digest: getOptionalString(item.digest),
-        incrementalMac: getOptionalString(item.incrementalMac),
-        chunkSize: getOptionalNumber(item.chunkSize),
-        size: getOptionalNumber(item.size),
-        contentType: getOptionalString(item.contentType),
-        fileName: getOptionalString(item.fileName),
-        flags: getOptionalNumber(item.flags),
-        width: getOptionalNumber(item.width),
-        height: getOptionalNumber(item.height),
-        duration: getOptionalNumber(item.duration),
-        caption: getOptionalString(item.caption),
-        blurHash: getOptionalString(item.blurHash),
-        uploadTimestamp: getOptionalNumber(item.uploadTimestamp),
-        clientUuid: getOptionalString(item.clientUuid),
-        plaintextHash: getOptionalString(item.plaintextHash),
-        downloadPath: getOptionalString(item.downloadPath),
-        backupCdnNumber: getOptionalNumber(item.backupCdnNumber),
-        localKey: getOptionalString(item.localKey),
-        downloadUrl: getOptionalString(item.downloadUrl),
-        previewUrl: getOptionalString(item.previewUrl),
-        thumbnail,
-        thumbnailUrl: getOptionalString(item.thumbnailUrl),
-        localBlobKey: getOptionalString(item.localBlobKey),
-        url: getOptionalString(item.url),
-        dataBase64: getOptionalString(item.dataBase64),
-        status:
-          item.status === 'pending' ||
-          item.status === 'uploading' ||
-          item.status === 'ready' ||
-          item.status === 'failed' ||
-          item.status === 'sent'
-            ? item.status
-            : undefined,
-        error: getOptionalString(item.error),
-      };
-    });
+  return value.filter(isRecord).map(item => {
+    const thumbnail = isRecord(item.thumbnail)
+      ? parseWebAttachments([item.thumbnail])[0]
+      : undefined;
+    return {
+      id: getOptionalString(item.id),
+      kind:
+        item.kind === 'file' || item.kind === 'image' || item.kind === 'video'
+          ? item.kind
+          : undefined,
+      cdnId: getOptionalString(item.cdnId),
+      cdnKey: getOptionalString(item.cdnKey),
+      cdnNumber: getOptionalNumber(item.cdnNumber),
+      keyBase64: getOptionalString(item.keyBase64),
+      digestBase64: getOptionalString(item.digestBase64),
+      incrementalMacBase64: getOptionalString(item.incrementalMacBase64),
+      key: getOptionalString(item.key),
+      digest: getOptionalString(item.digest),
+      incrementalMac: getOptionalString(item.incrementalMac),
+      chunkSize: getOptionalNumber(item.chunkSize),
+      size: getOptionalNumber(item.size),
+      contentType: getOptionalString(item.contentType),
+      fileName: getOptionalString(item.fileName),
+      flags: getOptionalNumber(item.flags),
+      width: getOptionalNumber(item.width),
+      height: getOptionalNumber(item.height),
+      duration: getOptionalNumber(item.duration),
+      caption: getOptionalString(item.caption),
+      blurHash: getOptionalString(item.blurHash),
+      uploadTimestamp: getOptionalNumber(item.uploadTimestamp),
+      clientUuid: getOptionalString(item.clientUuid),
+      plaintextHash: getOptionalString(item.plaintextHash),
+      downloadPath: getOptionalString(item.downloadPath),
+      backupCdnNumber: getOptionalNumber(item.backupCdnNumber),
+      localKey: getOptionalString(item.localKey),
+      downloadUrl: getOptionalString(item.downloadUrl),
+      previewUrl: getOptionalString(item.previewUrl),
+      thumbnail,
+      thumbnailUrl: getOptionalString(item.thumbnailUrl),
+      localBlobKey: getOptionalString(item.localBlobKey),
+      url: getOptionalString(item.url),
+      dataBase64: getOptionalString(item.dataBase64),
+      status:
+        item.status === 'pending' ||
+        item.status === 'uploading' ||
+        item.status === 'ready' ||
+        item.status === 'failed' ||
+        item.status === 'sent'
+          ? item.status
+          : undefined,
+      error: getOptionalString(item.error),
+    };
+  });
 }
 
 function parseWebQuote(value: unknown): WebMessage['quote'] | undefined {
@@ -921,7 +1013,9 @@ function parseWebUnpinMessage(value: unknown): WebUnpinMessage | undefined {
   };
 }
 
-function parseWebDeleteForEveryone(value: unknown): WebDeleteForEveryone | undefined {
+function parseWebDeleteForEveryone(
+  value: unknown
+): WebDeleteForEveryone | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
   }
@@ -949,30 +1043,52 @@ function errorToLogString(error: unknown): string {
   const cause = error.cause;
   const causeText =
     cause instanceof Error
-      ? cause.stack ?? cause.message
+      ? (cause.stack ?? cause.message)
       : cause != null
         ? String(cause)
         : undefined;
   return causeText
     ? `${error.stack ?? error.message}\nCause: ${causeText}`
-    : error.stack ?? error.message;
+    : (error.stack ?? error.message);
 }
 
-function getLinkedPayloadFromStreamBody(body: JsonRecord): LinkedPayload | undefined {
+function getProtocolStateFromStreamBody(
+  body: JsonRecord
+): ProtocolState | undefined {
+  const protocol = body.protocol;
+  if (!protocol || typeof protocol !== 'object' || Array.isArray(protocol)) {
+    return undefined;
+  }
+  const value = protocol as JsonRecord;
+  if (
+    !value.registrationIds ||
+    typeof value.registrationIds !== 'object' ||
+    Array.isArray(value.registrationIds) ||
+    !value.identityKeys ||
+    typeof value.identityKeys !== 'object' ||
+    Array.isArray(value.identityKeys) ||
+    !Array.isArray(value.identityRecords) ||
+    !Array.isArray(value.preKeys) ||
+    !Array.isArray(value.signedPreKeys) ||
+    !Array.isArray(value.kyberPreKeys) ||
+    !Array.isArray(value.sessions) ||
+    !Array.isArray(value.senderKeys)
+  ) {
+    return undefined;
+  }
+  return protocol as ProtocolState;
+}
+
+function getLinkedPayloadFromStreamBody(
+  body: JsonRecord
+): LinkedPayloadWithProtocol | undefined {
   const value = body.linkedPayload;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
   }
-  const linkedPayload = value as LinkedPayload;
-  if (typeof linkedPayload.aciRegistrationId === 'number') {
-    return linkedPayload;
-  }
-
-  const protocol = body.protocol;
-  if (!protocol || typeof protocol !== 'object' || Array.isArray(protocol)) {
-    return linkedPayload;
-  }
-  const registrationIds = (protocol as JsonRecord).registrationIds;
+  const linkedPayload = value as LinkedPayloadWithProtocol;
+  const protocol = getProtocolStateFromStreamBody(body);
+  const registrationIds = protocol?.registrationIds;
   if (
     !registrationIds ||
     typeof registrationIds !== 'object' ||
@@ -992,6 +1108,7 @@ function getLinkedPayloadFromStreamBody(body: JsonRecord): LinkedPayload | undef
       typeof pniRegistrationId === 'number'
         ? pniRegistrationId
         : linkedPayload.pniRegistrationId,
+    protocol,
   };
 }
 
@@ -1034,13 +1151,14 @@ async function getSignalModules() {
 }
 
 function createNet(Net: Awaited<ReturnType<typeof getSignalModules>>['Net']) {
-  return new Net.Net({
+  libsignalNetInstance ??= new Net.Net({
     env:
       process.env.SIGNAL_WEB_SERVER_ENV === 'staging'
         ? Net.Environment.Staging
         : Net.Environment.Production,
     userAgent: `Signal-Desktop/${packageJson.version} Web`,
   });
+  return libsignalNetInstance;
 }
 
 function buildLinkDeviceUrl({
@@ -1116,7 +1234,10 @@ function encryptDeviceNameBase64({
   if (!normalizedDeviceName) {
     return undefined;
   }
-  const encrypted = Crypto.encryptDeviceName(normalizedDeviceName, identityPublic);
+  const encrypted = Crypto.encryptDeviceName(
+    normalizedDeviceName,
+    identityPublic
+  );
   return Bytes.toBase64(
     Proto.DeviceName.encode({
       ephemeralPublic: encrypted.ephemeralPublic.serialize(),
@@ -1158,7 +1279,10 @@ async function linkDeviceFromEnvelope({
   }
 
   const passwordWithPadding = Bytes.toBase64(Crypto.getRandomBytes(16));
-  const password = passwordWithPadding.substring(0, passwordWithPadding.length - 2);
+  const password = passwordWithPadding.substring(
+    0,
+    passwordWithPadding.length - 2
+  );
   const registrationId = Crypto.generateRegistrationId();
   const pniRegistrationId = Crypto.generateRegistrationId();
   const aciSignedPreKey = Curve.generateSignedPreKey(
@@ -1298,11 +1422,15 @@ async function linkDeviceFromEnvelope({
         LINK_AND_SYNC && envelope.ephemeralBackupKey
           ? `web-backup-${session.sessionId}`
           : undefined,
-      aciIdentityKeyPublic: Bytes.toBase64(envelope.aciKeyPair.publicKey.serialize()),
+      aciIdentityKeyPublic: Bytes.toBase64(
+        envelope.aciKeyPair.publicKey.serialize()
+      ),
       aciIdentityKeyPrivate: Bytes.toBase64(
         envelope.aciKeyPair.privateKey.serialize()
       ),
-      pniIdentityKeyPublic: Bytes.toBase64(envelope.pniKeyPair.publicKey.serialize()),
+      pniIdentityKeyPublic: Bytes.toBase64(
+        envelope.pniKeyPair.publicKey.serialize()
+      ),
       pniIdentityKeyPrivate: Bytes.toBase64(
         envelope.pniKeyPair.privateKey.serialize()
       ),
@@ -1327,7 +1455,9 @@ async function linkDeviceFromEnvelope({
   }
 }
 
-async function startProvisioningSession(deviceName: string): Promise<ProvisioningSession> {
+async function startProvisioningSession(
+  deviceName: string
+): Promise<ProvisioningSession> {
   const { Net, ProvisioningCipher, Bytes, Proto } = await getSignalModules();
   const session: ProvisioningSession = {
     sessionId: randomUUID(),
@@ -1386,7 +1516,9 @@ async function startProvisioningSession(deviceName: string): Promise<Provisionin
               .catch(error => {
                 session.status = 'error';
                 session.error =
-                  error instanceof Error ? error.stack ?? error.message : String(error);
+                  error instanceof Error
+                    ? (error.stack ?? error.message)
+                    : String(error);
                 touch(session);
                 recordSessionEvent(
                   session,
@@ -1398,7 +1530,9 @@ async function startProvisioningSession(deviceName: string): Promise<Provisionin
             ack.send(500);
             session.status = 'error';
             session.error =
-              error instanceof Error ? error.stack ?? error.message : String(error);
+              error instanceof Error
+                ? (error.stack ?? error.message)
+                : String(error);
             touch(session);
             recordSessionEvent(
               session,
@@ -1435,7 +1569,8 @@ async function startProvisioningSession(deviceName: string): Promise<Provisionin
         return;
       }
       session.status = 'error';
-      session.error = error instanceof Error ? error.stack ?? error.message : String(error);
+      session.error =
+        error instanceof Error ? (error.stack ?? error.message) : String(error);
       touch(session);
       recordSessionEvent(
         session,
@@ -1532,7 +1667,12 @@ async function getTransferArchive(
     }
     const parsed = JSON.parse(responseBody) as
       | { cdn: number; key: string }
-      | { error: 'RELINK_REQUESTED' | 'CONTINUE_WITHOUT_UPLOAD' | 'RATE_LIMITED' };
+      | {
+          error:
+            | 'RELINK_REQUESTED'
+            | 'CONTINUE_WITHOUT_UPLOAD'
+            | 'RATE_LIMITED';
+        };
     return parsed;
   }
   return undefined;
@@ -1550,7 +1690,10 @@ async function downloadEphemeralBackup({
   if (!baseUrl) {
     throw new Error(`CDN ${archive.cdn} is not configured`);
   }
-  const url = new URL(`/attachments/${encodeURIComponent(archive.key)}`, baseUrl);
+  const url = new URL(
+    `/attachments/${encodeURIComponent(archive.key)}`,
+    baseUrl
+  );
   try {
     const response = await fetch(url, { signal: abortSignal });
     if (!response.ok) {
@@ -1566,29 +1709,25 @@ async function downloadEphemeralBackup({
   }
 
   return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      { rejectUnauthorized: false },
-      response => {
-        const chunks = new Array<Buffer>();
-        response.on('data', chunk => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        });
-        response.on('end', () => {
-          const body = Buffer.concat(chunks);
-          const statusCode = response.statusCode ?? 0;
-          if (statusCode < 200 || statusCode >= 300) {
-            reject(
-              new Error(
-                `ephemeral backup download failed with status ${statusCode}: ${body.toString('utf8')}`
-              )
-            );
-            return;
-          }
-          resolve(body);
-        });
-      }
-    );
+    const request = https.get(url, { rejectUnauthorized: false }, response => {
+      const chunks = new Array<Buffer>();
+      response.on('data', chunk => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      response.on('end', () => {
+        const body = Buffer.concat(chunks);
+        const statusCode = response.statusCode ?? 0;
+        if (statusCode < 200 || statusCode >= 300) {
+          reject(
+            new Error(
+              `ephemeral backup download failed with status ${statusCode}: ${body.toString('utf8')}`
+            )
+          );
+          return;
+        }
+        resolve(body);
+      });
+    });
     request.on('error', reject);
     abortSignal.addEventListener(
       'abort',
@@ -1643,7 +1782,54 @@ type RemoteConfigResponseBody = Readonly<{
   config?: Record<string, string>;
 }>;
 
-function getBasicAuthorization(credentials: LinkedPayload['credentials']): string {
+type ProfileWriteRequestBody = Readonly<{
+  aboutEmoji?: string;
+  aboutText?: string;
+  avatarBase64?: string;
+  familyName?: string;
+  firstName: string;
+  hasOtherDevices?: boolean;
+  phoneNumberSharing: boolean;
+  removeAvatar?: boolean;
+  sessionId?: string;
+  timestamp?: number;
+}>;
+
+type ProfileRequestData = Readonly<{
+  about: string | null;
+  aboutEmoji: string | null;
+  avatar: boolean;
+  badgeIds: ReadonlyArray<string>;
+  commitment: string;
+  name: string;
+  paymentAddress: string | null;
+  phoneNumberSharing: string;
+  sameAvatar: boolean;
+  version: string;
+}>;
+
+type ProfileResponseBody = Readonly<{
+  about?: string;
+  aboutEmoji?: string;
+  avatar?: string;
+  name?: string;
+  paymentAddress?: string;
+  phoneNumberSharing?: string;
+}>;
+
+type ProfileAvatarUploadHeaders = Readonly<{
+  acl: string;
+  algorithm: string;
+  credential: string;
+  date: string;
+  key: string;
+  policy: string;
+  signature: string;
+}>;
+
+function getBasicAuthorization(
+  credentials: LinkedPayload['credentials']
+): string {
   return `Basic ${Buffer.from(
     `${credentials.username}:${credentials.password}`
   ).toString('base64')}`;
@@ -1661,7 +1847,7 @@ async function fetchSignalJson<T>({
   body?: unknown;
   chat?: ChatConnection;
   headers?: Record<string, string>;
-  method?: 'GET' | 'PUT';
+  method?: 'DELETE' | 'GET' | 'PUT';
   path: string;
 }>): Promise<T> {
   const bodyBytes =
@@ -1719,17 +1905,309 @@ async function fetchSignalJson<T>({
   return (responseBody ? JSON.parse(responseBody) : undefined) as T;
 }
 
+function getProfileRequestData({
+  aboutEmoji,
+  aboutText,
+  avatarData,
+  familyName,
+  firstName,
+  linkedPayload,
+  paymentAddress,
+  phoneNumberSharing,
+  removeAvatar,
+}: Readonly<{
+  aboutEmoji?: string;
+  aboutText?: string;
+  avatarData?: Uint8Array<ArrayBuffer>;
+  familyName?: string;
+  firstName: string;
+  linkedPayload: LinkedPayload;
+  paymentAddress?: string | null;
+  phoneNumberSharing: boolean;
+  removeAvatar?: boolean;
+}>): ProfileRequestData {
+  const profileKey = linkedPayload.profileKeyBase64;
+  const serviceId = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  if (!profileKey) {
+    throw new Error('writeProfile: missing profileKeyBase64');
+  }
+  if (!serviceId) {
+    throw new Error('writeProfile: missing ACI');
+  }
+
+  const keyBuffer = Bytes.fromBase64(profileKey);
+  const fullName = [firstName, familyName].filter(Boolean).join('\0');
+  const encryptedName = encryptProfileItemWithPadding(
+    Bytes.fromString(fullName),
+    keyBuffer,
+    PaddedLengths.Name
+  );
+  const encryptedAbout = aboutText
+    ? encryptProfileItemWithPadding(
+        Bytes.fromString(aboutText),
+        keyBuffer,
+        PaddedLengths.About
+      )
+    : undefined;
+  const encryptedAboutEmoji = aboutEmoji
+    ? encryptProfileItemWithPadding(
+        Bytes.fromString(aboutEmoji),
+        keyBuffer,
+        PaddedLengths.AboutEmoji
+      )
+    : undefined;
+  const encryptedPhoneNumberSharing = encryptProfile(
+    new Uint8Array([phoneNumberSharing ? 1 : 0]),
+    keyBuffer
+  );
+  const isUpdatingAvatar = Boolean(avatarData) || removeAvatar === true;
+
+  return {
+    about: encryptedAbout ? Bytes.toBase64(encryptedAbout) : null,
+    aboutEmoji: encryptedAboutEmoji
+      ? Bytes.toBase64(encryptedAboutEmoji)
+      : null,
+    avatar: Boolean(avatarData),
+    badgeIds: [],
+    commitment: deriveProfileKeyCommitment(
+      profileKey,
+      serviceId as ServiceIdString
+    ),
+    name: Bytes.toBase64(encryptedName),
+    paymentAddress: paymentAddress ?? null,
+    phoneNumberSharing: Bytes.toBase64(encryptedPhoneNumberSharing),
+    sameAvatar: !isUpdatingAvatar,
+    version: deriveProfileKeyVersion(profileKey, serviceId as ServiceIdString),
+  };
+}
+
+async function fetchCurrentProfileForWrite(
+  chat: ChatConnection,
+  linkedPayload: LinkedPayload
+): Promise<ProfileResponseBody> {
+  const profileKey = linkedPayload.profileKeyBase64;
+  const serviceId = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  if (!profileKey) {
+    throw new Error('writeProfile: missing profileKeyBase64');
+  }
+  if (!serviceId) {
+    throw new Error('writeProfile: missing ACI');
+  }
+
+  const profileKeyVersion = deriveProfileKeyVersion(
+    profileKey,
+    serviceId as ServiceIdString
+  );
+  return fetchSignalJson<ProfileResponseBody>({
+    chat,
+    path: `/v1/profile/${serviceId}/${profileKeyVersion}`,
+  });
+}
+
+function getProfileAvatarUploadBody(
+  {
+    acl,
+    algorithm,
+    credential,
+    date,
+    key,
+    policy,
+    signature,
+  }: ProfileAvatarUploadHeaders,
+  encryptedAvatarData: Uint8Array<ArrayBuffer>
+): Readonly<{ body: Uint8Array<ArrayBuffer>; contentType: string }> {
+  const boundaryString = `----------------${randomUUID().replace(/-/g, '')}`;
+  const CRLF = '\r\n';
+  const getSection = (name: string, value: string) =>
+    [
+      `--${boundaryString}`,
+      `Content-Disposition: form-data; name="${name}"${CRLF}`,
+      value,
+    ].join(CRLF);
+
+  const start = [
+    getSection('key', key),
+    getSection('x-amz-credential', credential),
+    getSection('acl', acl),
+    getSection('x-amz-algorithm', algorithm),
+    getSection('x-amz-date', date),
+    getSection('policy', policy),
+    getSection('x-amz-signature', signature),
+    getSection('Content-Type', 'application/octet-stream'),
+    `--${boundaryString}`,
+    'Content-Disposition: form-data; name="file"',
+    `Content-Type: application/octet-stream${CRLF}${CRLF}`,
+  ].join(CRLF);
+  const end = `${CRLF}--${boundaryString}--${CRLF}`;
+
+  return {
+    body: Bytes.concatenate([
+      Bytes.fromString(start),
+      encryptedAvatarData,
+      Bytes.fromString(end),
+    ]),
+    contentType: `multipart/form-data; boundary=${boundaryString}`,
+  };
+}
+
+function isProfileAvatarUploadHeaders(
+  value: unknown
+): value is ProfileAvatarUploadHeaders {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const record = value as Partial<
+    Record<keyof ProfileAvatarUploadHeaders, unknown>
+  >;
+  return (
+    typeof record.acl === 'string' &&
+    typeof record.algorithm === 'string' &&
+    typeof record.credential === 'string' &&
+    typeof record.date === 'string' &&
+    typeof record.key === 'string' &&
+    typeof record.policy === 'string' &&
+    typeof record.signature === 'string'
+  );
+}
+
+async function uploadProfileAvatar(
+  uploadHeaders: ProfileAvatarUploadHeaders,
+  encryptedAvatarData: Uint8Array<ArrayBuffer>
+): Promise<string> {
+  const { body, contentType } = getProfileAvatarUploadBody(
+    uploadHeaders,
+    encryptedAvatarData
+  );
+  const uploadFetch = ALLOW_INSECURE_CDN_TLS ? insecureNodeFetch : nodeFetch;
+  const response = await uploadFetch(getDefaultCdnUrl(), {
+    body: Buffer.from(body),
+    headers: {
+      'Content-Length': body.byteLength.toString(),
+      'Content-Type': contentType,
+      'User-Agent': getUserAgent(packageJson.version),
+    },
+    method: 'POST',
+  });
+  const responseBody = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      responseBody
+        ? `profile avatar upload failed with status ${response.status}: ${responseBody}`
+        : `profile avatar upload failed with status ${response.status}`
+    );
+  }
+
+  return uploadHeaders.key;
+}
+
+function getProfileAccountUpdate({
+  aboutEmoji,
+  aboutText,
+  avatarUrlPath,
+  familyName,
+  firstName,
+  linkedPayload,
+  removeAvatar,
+  timestamp,
+}: Readonly<{
+  aboutEmoji?: string;
+  aboutText?: string;
+  avatarUrlPath?: string;
+  familyName?: string;
+  firstName: string;
+  linkedPayload: LinkedPayload;
+  removeAvatar?: boolean;
+  timestamp: number;
+}>): WebAccount {
+  const title = [firstName, familyName].filter(Boolean).join(' ').trim();
+  return {
+    ...linkedPayload.account,
+    about: aboutText,
+    aboutEmoji:
+      aboutEmoji == null
+        ? undefined
+        : Emoji.unsafeCastMaybeInvalidStringToVariant(aboutEmoji),
+    ...(avatarUrlPath
+      ? {
+          avatarUrlPath,
+        }
+      : null),
+    ...(removeAvatar === true
+      ? {
+          avatarUrl: undefined,
+          avatarUrlPath: undefined,
+        }
+      : null),
+    familyName,
+    firstName,
+    localProfileUpdatedAt: timestamp,
+    profileFamilyName: familyName,
+    profileName: firstName,
+    title: title || linkedPayload.account.title,
+  };
+}
+
 function getLatestAttachmentStreamSession(): MessageStreamSession | undefined {
   return [...streamSessions.values()]
     .filter(session => session.status === 'open' && session.linkedPayload)
     .sort((left, right) => right.updatedAt - left.updatedAt)[0];
 }
 
-function getAttachmentStreamSession(sessionId: string | null): MessageStreamSession | undefined {
+function getAttachmentStreamSession(
+  sessionId: string | null
+): MessageStreamSession | undefined {
   if (sessionId) {
-    return streamSessions.get(sessionId) ?? getLatestAttachmentStreamSession();
+    return streamSessions.get(sessionId);
   }
   return getLatestAttachmentStreamSession();
+}
+
+function getAttachmentTmpDir(streamSession: MessageStreamSession): string {
+  return resolve(WEB_ATTACHMENT_TMP_DIR, streamSession.sessionId);
+}
+
+async function cleanupAttachmentTmpDir(
+  streamSession: MessageStreamSession
+): Promise<void> {
+  await rm(getAttachmentTmpDir(streamSession), {
+    force: true,
+    recursive: true,
+  });
+}
+
+async function cleanupExpiredAttachmentTmpDirs(): Promise<void> {
+  if (!Number.isFinite(WEB_ATTACHMENT_TMP_MAX_AGE_MS)) {
+    return;
+  }
+  let entries;
+  try {
+    entries = await readdir(WEB_ATTACHMENT_TMP_DIR, { withFileTypes: true });
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error != null &&
+      'code' in error &&
+      error.code === 'ENOENT'
+    ) {
+      return;
+    }
+    throw error;
+  }
+
+  const expiresBefore = now() - WEB_ATTACHMENT_TMP_MAX_AGE_MS;
+  await Promise.all(
+    entries.map(async entry => {
+      if (!entry.isDirectory()) {
+        return;
+      }
+      const absolutePath = resolve(WEB_ATTACHMENT_TMP_DIR, entry.name);
+      const stats = await stat(absolutePath);
+      if (stats.mtimeMs < expiresBefore) {
+        await rm(absolutePath, { force: true, recursive: true });
+      }
+    })
+  );
 }
 
 async function waitForAttachmentStreamSession(
@@ -1789,7 +2267,10 @@ function getBackupMediaId({
   plaintextHash: string;
 }>): { bytes: Uint8Array<ArrayBuffer>; string: string } {
   const mediaName = Bytes.toHex(
-    Bytes.concatenate([Bytes.fromHex(plaintextHash), Bytes.fromBase64(keyBase64)])
+    Bytes.concatenate([
+      Bytes.fromHex(plaintextHash),
+      Bytes.fromBase64(keyBase64),
+    ])
   );
   const mediaIdBytes = mediaRootKey.deriveMediaId(mediaName);
   return {
@@ -1821,8 +2302,7 @@ async function getBackupPresentationHeaders(
 ): Promise<Record<string, string>> {
   if (
     streamSession.backupPresentationHeaders &&
-    streamSession.backupPresentationHeaders.retrievedAtMs >
-      Date.now() - DAY
+    streamSession.backupPresentationHeaders.retrievedAtMs > Date.now() - DAY
   ) {
     return streamSession.backupPresentationHeaders.headers;
   }
@@ -1849,7 +2329,8 @@ async function getBackupPresentationHeaders(
       `&redemptionEndSeconds=${endDayInMs / 1000}`,
   });
   const rawCredential = response.credentials?.media?.find(
-    credential => credential.redemptionTime != null &&
+    credential =>
+      credential.redemptionTime != null &&
       credential.redemptionTime * 1000 === startDayInMs
   );
   if (!rawCredential?.credential || rawCredential.redemptionTime == null) {
@@ -1860,7 +2341,9 @@ async function getBackupPresentationHeaders(
     Bytes.fromBase64(productionConfig.backupServerPublicParams)
   );
   const credential = requestContext.receive(
-    new BackupAuthCredentialResponse(Bytes.fromBase64(rawCredential.credential)),
+    new BackupAuthCredentialResponse(
+      Bytes.fromBase64(rawCredential.credential)
+    ),
     DurationInSeconds.fromSeconds(rawCredential.redemptionTime),
     serverPublicParams
   );
@@ -1900,7 +2383,10 @@ async function getBackupArchiveInfo(
   if (streamSession.backupArchiveInfo) {
     return streamSession.backupArchiveInfo;
   }
-  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const headers = await getBackupPresentationHeaders(
+    streamSession,
+    linkedPayload
+  );
   const unauthConnection = await getBackupUnauthConnection(streamSession);
   const response = await fetchSignalJson<BackupInfoResponseBody>({
     chat: unauthConnection,
@@ -1926,7 +2412,10 @@ async function findBackupMediaLocation({
   mediaId: string;
   streamSession: MessageStreamSession;
 }>): Promise<BackupMediaLocation | undefined> {
-  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const headers = await getBackupPresentationHeaders(
+    streamSession,
+    linkedPayload
+  );
   const unauthConnection = await getBackupUnauthConnection(streamSession);
   let cursor: string | undefined;
   do {
@@ -1949,11 +2438,7 @@ async function findBackupMediaLocation({
     const storedObject = response.storedMediaObjects?.find(
       item => item.mediaId === mediaId
     );
-    if (
-      storedObject?.cdn != null &&
-      response.backupDir &&
-      response.mediaDir
-    ) {
+    if (storedObject?.cdn != null && response.backupDir && response.mediaDir) {
       return {
         backupDir: response.backupDir,
         mediaDir: response.mediaDir,
@@ -1982,7 +2467,10 @@ async function getBackupCdnReadHeaders({
     return cached.headers;
   }
 
-  const headers = await getBackupPresentationHeaders(streamSession, linkedPayload);
+  const headers = await getBackupPresentationHeaders(
+    streamSession,
+    linkedPayload
+  );
   const unauthConnection = await getBackupUnauthConnection(streamSession);
   const response = await fetchSignalJson<BackupCdnCredentialsResponseBody>({
     chat: unauthConnection,
@@ -2101,7 +2589,8 @@ async function importBackupForMessageStream({
 }): Promise<void> {
   if (!linkedPayload?.ephemeralBackupKeyBase64) {
     streamSession.backupImportStatus = 'missing';
-    streamSession.backupImportError = 'Linked payload does not include ephemeral backup key';
+    streamSession.backupImportError =
+      'Linked payload does not include ephemeral backup key';
     streamSession.updatedAt = now();
     writeEvent({
       type: 'error',
@@ -2118,17 +2607,9 @@ async function importBackupForMessageStream({
     const archive = await getTransferArchive(chat, abortSignal, cooldownKey);
     if (!archive) {
       streamSession.backupImportStatus = 'missing';
-      streamSession.backupImportError = 'Timed out waiting for transfer archive';
+      streamSession.backupImportError =
+        'Timed out waiting for transfer archive';
       streamSession.updatedAt = now();
-      const cached = getPersistedBackupImportEntry(linkedPayload, cooldownKey);
-      if (cached) {
-        emitPersistedBackupImportEntry({
-          entry: cached,
-          linkedPayload,
-          streamSession,
-          writeEvent,
-        });
-      }
       writeEvent({
         type: 'backup-import-status',
         status: 'missing',
@@ -2140,18 +2621,9 @@ async function importBackupForMessageStream({
       streamSession.backupImportStatus = 'missing';
       streamSession.backupImportError =
         archive.error === 'RATE_LIMITED'
-          ? 'transfer_archive is rate limited; using existing local chat state'
+          ? 'transfer_archive is rate limited'
           : archive.error;
       streamSession.updatedAt = now();
-      const cached = getPersistedBackupImportEntry(linkedPayload, cooldownKey);
-      if (cached) {
-        emitPersistedBackupImportEntry({
-          entry: cached,
-          linkedPayload,
-          streamSession,
-          writeEvent,
-        });
-      }
       writeEvent({
         type: 'backup-import-status',
         status: 'missing',
@@ -2200,17 +2672,6 @@ async function importBackupForMessageStream({
       });
     }
 
-    savePersistedBackupImportEntry({
-      fallback: cooldownKey,
-      linkedPayload: streamSession.linkedPayload ?? linkedPayload,
-      value: {
-        updatedAt: now(),
-        contactsBootstrap: result.contactsBootstrap,
-        chatShell: result.chatShell,
-        mediaRootBackupKeyBase64: result.mediaRootBackupKeyBase64,
-        stats: result.stats,
-      },
-    });
     streamSession.backupImportStatus = 'done';
     streamSession.backupImportStats = result.stats;
     streamSession.updatedAt = now();
@@ -2304,7 +2765,10 @@ function maybeConvertInitialGroupMessageToChange({
   }
 
   const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
-  if (!ourAci || !conversation.membersV2.some(member => member.aci === ourAci)) {
+  if (
+    !ourAci ||
+    !conversation.membersV2.some(member => member.aci === ourAci)
+  ) {
     return message;
   }
 
@@ -2324,10 +2788,15 @@ function maybeConvertInitialGroupMessageToChange({
   };
 }
 
-async function handleMessageStream(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleMessageStream(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   const body = await readJson(req);
-  const username = typeof body.username === 'string' ? body.username : undefined;
-  const password = typeof body.password === 'string' ? body.password : undefined;
+  const username =
+    typeof body.username === 'string' ? body.username : undefined;
+  const password =
+    typeof body.password === 'string' ? body.password : undefined;
   const linkedPayload = getLinkedPayloadFromStreamBody(body);
   const importBackup = body.importBackup !== false;
   if (!username || !password) {
@@ -2338,7 +2807,8 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
   const sessionId = randomUUID();
   const abortController = new AbortController();
   let connection: AuthenticatedChatConnection | undefined;
-  const streamAci = linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
+  const streamAci =
+    linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
 
   for (const [existingSessionId, existingSession] of streamSessions) {
     const existingAci =
@@ -2351,11 +2821,13 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
       existingSession.status = 'closed';
       existingSession.updatedAt = now();
       void existingSession.disconnect().catch(() => undefined);
+      void cleanupAttachmentTmpDir(existingSession).catch(() => undefined);
       streamSessions.delete(existingSessionId);
     }
   }
 
   const streamSession: MessageStreamSession = {
+    sessionId,
     createdAt: now(),
     updatedAt: now(),
     username,
@@ -2396,7 +2868,10 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
     }
   };
   streamSession.writeEvent = writeEvent;
-  const streamEventAccountKey = getStreamEventAccountKey(linkedPayload, username);
+  const streamEventAccountKey = getStreamEventAccountKey(
+    linkedPayload,
+    username
+  );
   const writePersistedEvent = (event: MessageStreamEvent) => {
     writeEvent(persistStreamEvent(streamEventAccountKey, event));
   };
@@ -2474,141 +2949,149 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
             envelopeBytes: envelope,
             linkedPayload,
           })
-            .then(async ({
-              contentSummary,
-              ignoredReason,
-              message,
-              pinMessage,
-              reaction,
-              editMessage,
-              deleteMessage,
-              unpinMessage,
-              attachmentBackfill,
-              receipt,
-              typing,
-              pollVote,
-              pollTerminate,
-              storageManifestFetchLatest,
-            }) => {
-              streamSession.lastReceiveError = undefined;
-              streamSession.updatedAt = now();
-              let conversation: WebConversation | undefined;
-              let outputMessage = message;
-              if (message?.groupV2 && connection) {
-                try {
-                  conversation = await enrichConversationForGroupMessage({
-                    connection,
-                    linkedPayload,
-                    message,
-                  });
-                  outputMessage = maybeConvertInitialGroupMessageToChange({
-                    conversation,
-                    linkedPayload,
-                    message,
-                  });
-                } catch (error) {
-                  console.warn(
-                    'message stream failed to enrich group conversation',
-                    error
-                  );
-                }
-              }
-              if (outputMessage) {
-                streamSession.decodedMessageCount += 1;
-                streamSession.lastDecodedMessageSummary = {
-                  id: outputMessage.id,
-                  conversationId: outputMessage.conversationId,
-                  direction: outputMessage.direction,
-                  timestamp: outputMessage.timestamp,
-                  bodyLength: outputMessage.body?.length ?? 0,
-                  sourceServiceId: outputMessage.sourceServiceId,
-                };
-                if (conversation) {
-                  writePersistedEvent({ type: 'conversation', conversation });
-                }
-                writePersistedEvent({ type: 'message', message: outputMessage });
-              }
-              if (pinMessage) {
-                writePersistedEvent(pinMessage);
-              }
-              if (reaction) {
-                writePersistedEvent(reaction);
-              }
-              if (editMessage) {
-                writePersistedEvent(editMessage);
-              }
-              if (deleteMessage) {
-                writePersistedEvent(deleteMessage);
-              }
-              if (unpinMessage) {
-                writePersistedEvent(unpinMessage);
-              }
-              if (attachmentBackfill) {
-                streamSession.attachmentBackfillEventCount =
-                  (streamSession.attachmentBackfillEventCount ?? 0) + 1;
-                streamSession.lastAttachmentBackfillSummary = {
-                  conversationId: attachmentBackfill.conversationId,
-                  targetAuthorAci: attachmentBackfill.targetAuthorAci,
-                  targetSentTimestamp: attachmentBackfill.targetSentTimestamp,
-                  attachmentCount: attachmentBackfill.attachments?.length ?? 0,
-                  attachmentStates: attachmentBackfill.attachments?.map(item => {
-                    if ('status' in item) {
-                      return { status: item.status };
-                    }
-                    return {
-                      contentType: item.attachment.contentType,
-                      cdnId: item.attachment.cdnId,
-                      cdnKey: item.attachment.cdnKey,
-                      cdnNumber: item.attachment.cdnNumber,
-                      size: item.attachment.size,
-                      flags: item.attachment.flags,
-                    };
-                  }),
-                  error: attachmentBackfill.error,
-                  timestamp: attachmentBackfill.timestamp,
-                };
-                writePersistedEvent(attachmentBackfill);
-              }
-              if (receipt) {
-                writePersistedEvent(receipt);
-              }
-              if (typing) {
-                writePersistedEvent(typing);
-              }
-              if (pollVote) {
-                writePersistedEvent(pollVote);
-              }
-              if (pollTerminate) {
-                writePersistedEvent(pollTerminate);
-              }
-              if (storageManifestFetchLatest && connection) {
-                void syncStorageContacts({
-                  allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-                  chat: connection,
-                  cdnUrl: getDefaultCdnUrl(),
-                  linkedPayload,
-                  storageUrl: productionConfig.storageUrl,
-                })
-                  .then(contacts => {
-                    streamSession.updatedAt = now();
-                    writePersistedEvent({
-                      type: 'contacts-bootstrap',
-                      data: contacts,
+            .then(
+              async ({
+                contentSummary,
+                ignoredReason,
+                message,
+                pinMessage,
+                reaction,
+                editMessage,
+                deleteMessage,
+                unpinMessage,
+                attachmentBackfill,
+                receipt,
+                typing,
+                pollVote,
+                pollTerminate,
+                storageManifestFetchLatest,
+              }) => {
+                streamSession.lastReceiveError = undefined;
+                streamSession.updatedAt = now();
+                emitProtocolState(streamSession);
+                let conversation: WebConversation | undefined;
+                let outputMessage = message;
+                if (message?.groupV2 && connection) {
+                  try {
+                    conversation = await enrichConversationForGroupMessage({
+                      connection,
+                      linkedPayload,
+                      message,
                     });
+                    outputMessage = maybeConvertInitialGroupMessageToChange({
+                      conversation,
+                      linkedPayload,
+                      message,
+                    });
+                  } catch (error) {
+                    console.warn(
+                      'message stream failed to enrich group conversation',
+                      error
+                    );
+                  }
+                }
+                if (outputMessage) {
+                  streamSession.decodedMessageCount += 1;
+                  streamSession.lastDecodedMessageSummary = {
+                    id: outputMessage.id,
+                    conversationId: outputMessage.conversationId,
+                    direction: outputMessage.direction,
+                    timestamp: outputMessage.timestamp,
+                    bodyLength: outputMessage.body?.length ?? 0,
+                    sourceServiceId: outputMessage.sourceServiceId,
+                  };
+                  if (conversation) {
+                    writePersistedEvent({ type: 'conversation', conversation });
+                  }
+                  writePersistedEvent({
+                    type: 'message',
+                    message: outputMessage,
+                  });
+                }
+                if (pinMessage) {
+                  writePersistedEvent(pinMessage);
+                }
+                if (reaction) {
+                  writePersistedEvent(reaction);
+                }
+                if (editMessage) {
+                  writePersistedEvent(editMessage);
+                }
+                if (deleteMessage) {
+                  writePersistedEvent(deleteMessage);
+                }
+                if (unpinMessage) {
+                  writePersistedEvent(unpinMessage);
+                }
+                if (attachmentBackfill) {
+                  streamSession.attachmentBackfillEventCount =
+                    (streamSession.attachmentBackfillEventCount ?? 0) + 1;
+                  streamSession.lastAttachmentBackfillSummary = {
+                    conversationId: attachmentBackfill.conversationId,
+                    targetAuthorAci: attachmentBackfill.targetAuthorAci,
+                    targetSentTimestamp: attachmentBackfill.targetSentTimestamp,
+                    attachmentCount:
+                      attachmentBackfill.attachments?.length ?? 0,
+                    attachmentStates: attachmentBackfill.attachments?.map(
+                      item => {
+                        if ('status' in item) {
+                          return { status: item.status };
+                        }
+                        return {
+                          contentType: item.attachment.contentType,
+                          cdnId: item.attachment.cdnId,
+                          cdnKey: item.attachment.cdnKey,
+                          cdnNumber: item.attachment.cdnNumber,
+                          size: item.attachment.size,
+                          flags: item.attachment.flags,
+                        };
+                      }
+                    ),
+                    error: attachmentBackfill.error,
+                    timestamp: attachmentBackfill.timestamp,
+                  };
+                  writePersistedEvent(attachmentBackfill);
+                }
+                if (receipt) {
+                  writePersistedEvent(receipt);
+                }
+                if (typing) {
+                  writePersistedEvent(typing);
+                }
+                if (pollVote) {
+                  writePersistedEvent(pollVote);
+                }
+                if (pollTerminate) {
+                  writePersistedEvent(pollTerminate);
+                }
+                if (storageManifestFetchLatest && connection) {
+                  void syncStorageContacts({
+                    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+                    chat: connection,
+                    cdnUrl: getDefaultCdnUrl(),
+                    linkedPayload,
+                    storageUrl: productionConfig.storageUrl,
                   })
-                  .catch(error => {
-                    streamSession.lastReceiveError = errorToLogString(error);
-                    streamSession.updatedAt = now();
-                    writeEvent({
-                      type: 'error',
-                      error: streamSession.lastReceiveError,
-                      timestamp,
-                      envelopeSize: envelope.byteLength,
+                    .then(contacts => {
+                      streamSession.updatedAt = now();
+                      writePersistedEvent({
+                        type: 'contacts-bootstrap',
+                        data: contacts,
+                      });
+                    })
+                    .catch(error => {
+                      streamSession.lastReceiveError = errorToLogString(error);
+                      streamSession.updatedAt = now();
+                      writeEvent({
+                        type: 'error',
+                        error: streamSession.lastReceiveError,
+                        timestamp,
+                        envelopeSize: envelope.byteLength,
+                      });
                     });
-                  });
-              }
-              const hasModifierEvent = Boolean(
-                pinMessage ||
+                }
+                const hasModifierEvent = Boolean(
+                  pinMessage ||
                   reaction ||
                   editMessage ||
                   deleteMessage ||
@@ -2619,19 +3102,20 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
                   pollVote ||
                   pollTerminate ||
                   storageManifestFetchLatest
-              );
-              if (!message && !hasModifierEvent) {
-                streamSession.ignoredEnvelopeCount += 1;
-                streamSession.lastIgnoredEnvelopeReason =
-                  ignoredReason ??
-                  'Decrypted content did not contain a supported message, edit, delete, pin, reaction, receipt, typing, or sent sync message';
-                streamSession.lastIgnoredContentSummary = contentSummary;
-              } else {
-                streamSession.decodedMessageCount +=
-                  hasModifierEvent && !message ? 1 : 0;
+                );
+                if (!message && !hasModifierEvent) {
+                  streamSession.ignoredEnvelopeCount += 1;
+                  streamSession.lastIgnoredEnvelopeReason =
+                    ignoredReason ??
+                    'Decrypted content did not contain a supported message, edit, delete, pin, reaction, receipt, typing, or sent sync message';
+                  streamSession.lastIgnoredContentSummary = contentSummary;
+                } else {
+                  streamSession.decodedMessageCount +=
+                    hasModifierEvent && !message ? 1 : 0;
+                }
+                sendAck(200);
               }
-              sendAck(200);
-            })
+            )
             .catch(error => {
               if (
                 LibSignalErrorBase.is(
@@ -2700,7 +3184,7 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
   } catch (error) {
     streamSession.status = 'error';
     streamSession.error =
-      error instanceof Error ? error.stack ?? error.message : String(error);
+      error instanceof Error ? (error.stack ?? error.message) : String(error);
     streamSession.updatedAt = now();
     writeEvent({
       type: 'transport-status',
@@ -2717,6 +3201,7 @@ async function handleMessageStream(req: IncomingMessage, res: ServerResponse): P
     void streamSession.backupUnauthConnection
       ?.disconnect()
       .catch(() => undefined);
+    void cleanupAttachmentTmpDir(streamSession).catch(() => undefined);
     streamSessions.delete(sessionId);
   });
 }
@@ -2727,7 +3212,8 @@ async function handleMessageStreamAck(
 ): Promise<void> {
   const body = await readJson(req);
   const eventId = typeof body.eventId === 'string' ? body.eventId : undefined;
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const aci = typeof body.aci === 'string' ? body.aci : undefined;
   if (!eventId) {
     sendText(req, res, 400, 'Missing eventId');
@@ -2738,7 +3224,10 @@ async function handleMessageStreamAck(
   const accountKey =
     aci ??
     (streamSession
-      ? getStreamEventAccountKey(streamSession.linkedPayload, streamSession.username)
+      ? getStreamEventAccountKey(
+          streamSession.linkedPayload,
+          streamSession.username
+        )
       : undefined);
   if (!accountKey) {
     sendText(req, res, 400, 'Missing account key');
@@ -2749,9 +3238,13 @@ async function handleMessageStreamAck(
   sendJson(req, res, 200, { ok: true });
 }
 
-async function handleSendMessage(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleSendMessage(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -2797,18 +3290,18 @@ async function handleSendMessage(req: IncomingMessage, res: ServerResponse): Pro
   }
 
   try {
-      const resolvedAttachments = await resolveInlineAttachments({
-        attachments,
-        streamSession,
-      });
-      const message = await sendDirectTextMessage({
-        attachments: resolvedAttachments,
-        body: messageBody ?? '',
-        chat: streamSession.connection,
-        deleteForEveryone,
-        destinationServiceId: checkedDestinationServiceId,
-        isViewOnce,
-        linkedPayload: streamSession.linkedPayload,
+    const resolvedAttachments = await resolveInlineAttachments({
+      attachments,
+      streamSession,
+    });
+    const message = await sendDirectTextMessage({
+      attachments: resolvedAttachments,
+      body: messageBody ?? '',
+      chat: streamSession.connection,
+      deleteForEveryone,
+      destinationServiceId: checkedDestinationServiceId,
+      isViewOnce,
+      linkedPayload: streamSession.linkedPayload,
       pinMessage,
       quote,
       timestamp,
@@ -2816,6 +3309,67 @@ async function handleSendMessage(req: IncomingMessage, res: ServerResponse): Pro
     });
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
+    sendJson(req, res, 200, message);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
+async function handleSendExpirationTimer(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const destinationServiceId =
+    typeof body.destinationServiceId === 'string'
+      ? body.destinationServiceId
+      : undefined;
+  const expireTimer =
+    typeof body.expireTimer === 'number' && body.expireTimer > 0
+      ? body.expireTimer
+      : undefined;
+  const expireTimerVersion =
+    typeof body.expireTimerVersion === 'number'
+      ? body.expireTimerVersion
+      : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  if (!destinationServiceId) {
+    sendText(req, res, 400, 'Missing destinationServiceId');
+    return;
+  }
+  if (expireTimerVersion == null) {
+    sendText(req, res, 400, 'Missing expireTimerVersion');
+    return;
+  }
+
+  try {
+    const message = await sendDirectExpirationTimerUpdate({
+      chat: streamSession.connection,
+      destinationServiceId,
+      expireTimer,
+      expireTimerVersion,
+      linkedPayload: streamSession.linkedPayload,
+      timestamp,
+    });
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, message);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -2840,25 +3394,33 @@ async function getAttachmentUploadForm(
   };
 }
 
-async function putEncryptedAttachment(
-  encryptedPath: string,
+async function putEncryptedAttachmentStream(
+  encryptedStream: Readable,
   encryptedSize: number,
   uploadForm: AttachmentUploadForm
 ): Promise<void> {
   if (uploadForm.cdn === 3) {
-    await tusUpload({
+    let caughtTusError: Error | undefined;
+    const done = await _tusCreateWithUploadRequest({
       endpoint: uploadForm.signedUploadLocation,
       headers: uploadForm.headers,
       fileName: uploadForm.key,
-      filePath: encryptedPath,
       fileSize: encryptedSize,
-      reader: defaultFileReader,
+      readable: encryptedStream,
+      onCaughtError(error) {
+        caughtTusError = error;
+      },
       ...(ALLOW_INSECURE_CDN_TLS
         ? {
             fetchFn: insecureNodeFetch,
           }
         : null),
     });
+    if (!done) {
+      throw new Error('putEncryptedAttachmentStream TUS upload interrupted', {
+        cause: caughtTusError,
+      });
+    }
     return;
   }
 
@@ -2883,7 +3445,7 @@ async function putEncryptedAttachment(
       'Content-Range': `bytes 0-*/${encryptedSize}`,
     },
     // oxlint-disable-next-line typescript/no-explicit-any
-    body: createReadStream(encryptedPath) as any,
+    body: encryptedStream as any,
     // @ts-expect-error Node fetch requires duplex for streaming request bodies.
     duplex: 'half',
   });
@@ -2894,39 +3456,83 @@ async function putEncryptedAttachment(
   }
 }
 
-async function handleUploadAttachment(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  const dataBase64 = getOptionalString(body.dataBase64);
+async function handleUploadAttachment(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const url = new URL(req.url ?? '/', `http://${HOST}:${PORT}`);
+  let attachment: WebAttachment;
+  let sessionId: string | undefined;
+
+  if (isJsonRequest(req)) {
+    const body = await readJson(req);
+    const dataBase64 = getOptionalString(body.dataBase64);
+    const contentType =
+      getOptionalString(body.contentType) ?? 'application/octet-stream';
+    const fileName = getOptionalString(body.fileName);
+    const declaredSize = getOptionalNumber(body.size);
+    sessionId = getOptionalString(body.sessionId);
+    if (!sessionId) {
+      sendText(req, res, 400, 'Missing sessionId');
+      return;
+    }
+    const streamSession = streamSessions.get(sessionId);
+
+    if (!streamSession?.connection) {
+      sendText(req, res, 404, 'Message runtime session not found');
+      return;
+    }
+    if (!dataBase64) {
+      sendText(req, res, 400, 'Missing dataBase64');
+      return;
+    }
+
+    const plaintext = Buffer.from(dataBase64, 'base64');
+    if (declaredSize != null && declaredSize !== plaintext.byteLength) {
+      sendText(req, res, 400, 'Attachment size does not match dataBase64');
+      return;
+    }
+
+    attachment = await uploadAttachmentBytes({
+      contentType,
+      fileName,
+      plaintext: { data: new Uint8Array(plaintext) },
+      plaintextSize: plaintext.byteLength,
+      streamSession,
+    });
+    sendJson(req, res, 200, attachment);
+    return;
+  }
+
   const contentType =
-    getOptionalString(body.contentType) ?? 'application/octet-stream';
-  const fileName = getOptionalString(body.fileName);
-  const declaredSize = getOptionalNumber(body.size);
-  const sessionId = getOptionalString(body.sessionId);
-  const streamSession = sessionId
-    ? streamSessions.get(sessionId)
-    : [...streamSessions.values()]
-        .filter(session => session.connection)
-        .sort((left, right) => right.createdAt - left.createdAt)[0];
+    getOptionalString(url.searchParams.get('contentType')) ??
+    'application/octet-stream';
+  const fileName = getOptionalString(url.searchParams.get('fileName'));
+  const declaredSize = getRequiredQueryNumber(url, 'size');
+  sessionId = getOptionalString(url.searchParams.get('sessionId'));
+  if (!sessionId) {
+    sendText(req, res, 400, 'Missing sessionId');
+    return;
+  }
+  if (declaredSize == null) {
+    sendText(req, res, 400, 'Missing size');
+    return;
+  }
+  const streamSession = streamSessions.get(sessionId);
 
   if (!streamSession?.connection) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
-  if (!dataBase64) {
-    sendText(req, res, 400, 'Missing dataBase64');
-    return;
-  }
 
-  const plaintext = Buffer.from(dataBase64, 'base64');
-  if (declaredSize != null && declaredSize !== plaintext.byteLength) {
-    sendText(req, res, 400, 'Attachment size does not match dataBase64');
-    return;
-  }
-
-  const attachment = await uploadAttachmentBytes({
+  attachment = await uploadAttachmentBytes({
     contentType,
     fileName,
-    plaintext,
+    plaintext: {
+      stream: createSizeCheckedStream(req, declaredSize),
+      size: declaredSize,
+    },
+    plaintextSize: declaredSize,
     streamSession,
   });
   sendJson(req, res, 200, attachment);
@@ -2937,66 +3543,68 @@ async function uploadAttachmentBytes({
   contentType,
   fileName,
   plaintext,
+  plaintextSize,
   streamSession,
 }: Readonly<{
   attachment?: WebAttachment;
   contentType: string;
   fileName?: string;
-  plaintext: Buffer;
+  plaintext: PlaintextSourceType;
+  plaintextSize: number;
   streamSession: MessageStreamSession;
 }>): Promise<WebAttachment> {
   const { connection } = streamSession;
   if (!connection) {
     throw new Error('Message runtime session not found');
   }
-  await mkdir(WEB_ATTACHMENT_TMP_DIR, { recursive: true });
   const keys = randomBytes(64);
-  const plaintextBytes = new Uint8Array(plaintext);
-  let encryptedPath: string | undefined;
+  const ciphertextSize = getAttachmentCiphertextSize({
+    mediaTier: MediaTier.STANDARD,
+    unpaddedPlaintextSize: plaintextSize,
+  });
+  const uploadForm = await getAttachmentUploadForm(connection, ciphertextSize);
+  const encryptedStream = new PassThrough();
+  const uploadPromise = putEncryptedAttachmentStream(
+    encryptedStream,
+    ciphertextSize,
+    uploadForm
+  );
+
+  let encrypted;
   try {
-    const encrypted = await encryptAttachmentV2ToDisk({
-      getAbsoluteAttachmentPath: relativePath =>
-        resolve(WEB_ATTACHMENT_TMP_DIR, relativePath),
+    encrypted = await encryptAttachmentV2({
       keys,
       needIncrementalMac: supportsIncrementalMac(contentType as MIMEType),
-      plaintext: { data: plaintextBytes },
+      plaintext,
+      sink: encryptedStream,
     });
-    encryptedPath = resolve(WEB_ATTACHMENT_TMP_DIR, encrypted.path);
-    const encryptedStats = await stat(encryptedPath);
-    const uploadForm = await getAttachmentUploadForm(
-      connection,
-      encrypted.ciphertextSize
-    );
-    await putEncryptedAttachment(
-      encryptedPath,
-      encryptedStats.size,
-      uploadForm
-    );
-
-    return {
-      ...attachment,
-      id: attachment?.id ?? randomUUID(),
-      dataBase64: undefined,
-      path: undefined,
-      url: undefined,
-      cdnKey: uploadForm.key,
-      cdnNumber: uploadForm.cdn,
-      keyBase64: Bytes.toBase64(keys),
-      digestBase64: Bytes.toBase64(encrypted.digest),
-      incrementalMacBase64: encrypted.incrementalMac
-        ? Bytes.toBase64(encrypted.incrementalMac)
-        : undefined,
-      chunkSize: encrypted.chunkSize,
-      size: attachment?.size ?? plaintext.byteLength,
-      contentType,
-      fileName,
-      status: 'ready',
-    };
-  } finally {
-    if (encryptedPath) {
-      await safeUnlink(encryptedPath);
-    }
+  } catch (error) {
+    encryptedStream.destroy(error instanceof Error ? error : undefined);
+    await uploadPromise.catch(() => undefined);
+    throw error;
   }
+
+  await uploadPromise;
+
+  return {
+    ...attachment,
+    id: attachment?.id ?? randomUUID(),
+    dataBase64: undefined,
+    path: undefined,
+    url: undefined,
+    cdnKey: uploadForm.key,
+    cdnNumber: uploadForm.cdn,
+    keyBase64: Bytes.toBase64(keys),
+    digestBase64: Bytes.toBase64(encrypted.digest),
+    incrementalMacBase64: encrypted.incrementalMac
+      ? Bytes.toBase64(encrypted.incrementalMac)
+      : undefined,
+    chunkSize: encrypted.chunkSize,
+    size: attachment?.size ?? plaintextSize,
+    contentType,
+    fileName,
+    status: 'ready',
+  };
 }
 
 async function resolveInlineAttachments({
@@ -3021,7 +3629,10 @@ async function resolveInlineAttachments({
       if (!attachmentWithThumbnail.dataBase64) {
         return attachmentWithThumbnail;
       }
-      const plaintext = Buffer.from(attachmentWithThumbnail.dataBase64, 'base64');
+      const plaintext = Buffer.from(
+        attachmentWithThumbnail.dataBase64,
+        'base64'
+      );
       if (
         attachmentWithThumbnail.size != null &&
         attachmentWithThumbnail.size !== plaintext.byteLength
@@ -3030,9 +3641,11 @@ async function resolveInlineAttachments({
       }
       return uploadAttachmentBytes({
         attachment: attachmentWithThumbnail,
-        contentType: attachmentWithThumbnail.contentType ?? 'application/octet-stream',
+        contentType:
+          attachmentWithThumbnail.contentType ?? 'application/octet-stream',
         fileName: attachmentWithThumbnail.fileName,
-        plaintext,
+        plaintext: { data: new Uint8Array(plaintext) },
+        plaintextSize: plaintext.byteLength,
         streamSession,
       });
     })
@@ -3043,7 +3656,8 @@ function getStreamSessionForProvisioningSession(
   session: ProvisioningSession
 ): MessageStreamSession | undefined {
   const sessionAci =
-    session.linkedPayload?.credentials.aci ?? session.linkedPayload?.account.aci;
+    session.linkedPayload?.credentials.aci ??
+    session.linkedPayload?.account.aci;
   const sessionUsername = session.linkedPayload?.credentials.username;
   return [...streamSessions.values()]
     .filter(streamSession => {
@@ -3054,7 +3668,8 @@ function getStreamSessionForProvisioningSession(
         streamSession.linkedPayload?.credentials.aci ??
         streamSession.linkedPayload?.account.aci;
       return (
-        (sessionUsername != null && streamSession.username === sessionUsername) ||
+        (sessionUsername != null &&
+          streamSession.username === sessionUsername) ||
         (sessionAci != null && streamAci === sessionAci)
       );
     })
@@ -3141,7 +3756,8 @@ async function handleMessageImportTransfer(
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = await waitForAttachmentStreamSession(sessionId ?? null);
   if (!streamSession) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3171,9 +3787,13 @@ async function handleMessageImportTransfer(
   });
 }
 
-async function handleSendReaction(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleSendReaction(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3200,7 +3820,8 @@ async function handleSendReaction(req: IncomingMessage, res: ServerResponse): Pr
       : undefined;
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
-        (recipient: unknown): recipient is string => typeof recipient === 'string'
+        (recipient: unknown): recipient is string =>
+          typeof recipient === 'string'
       )
     : [];
   const emoji = typeof body.emoji === 'string' ? body.emoji : undefined;
@@ -3267,6 +3888,7 @@ async function handleSendReaction(req: IncomingMessage, res: ServerResponse): Pr
     }
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, { ok: true, timestamp });
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3275,12 +3897,175 @@ async function handleSendReaction(req: IncomingMessage, res: ServerResponse): Pr
   }
 }
 
+async function handleLookupUsername(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const username =
+    typeof body.username === 'string' ? body.username.trim() : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!username) {
+    sendText(req, res, 400, 'Missing username');
+    return;
+  }
+
+  const normalizedUsername = username.startsWith('@')
+    ? username.slice(1)
+    : username;
+  const connection = await getBackupUnauthConnection(streamSession);
+  const aci = await connection.lookUpUsernameHash({
+    hash: usernames.hash(normalizedUsername),
+  });
+
+  sendJson(req, res, 200, {
+    aci: aci ? fromAciObject(aci) : null,
+    username: normalizedUsername,
+  });
+}
+
+async function fetchCdsiAuth(
+  streamSession: MessageStreamSession
+): Promise<ServiceAuth> {
+  if (!streamSession.connection) {
+    throw new Error(
+      'fetchCdsiAuth: message stream session is missing connection'
+    );
+  }
+
+  if (
+    streamSession.cdsiAuth &&
+    now() - streamSession.cdsiAuth.timestamp < CACHED_CDSI_AUTH_TTL_MS
+  ) {
+    return streamSession.cdsiAuth.auth;
+  }
+
+  const response = await streamSession.connection.fetch({
+    verb: 'GET',
+    path: '/v2/directory/auth',
+    headers: [],
+    timeoutMillis: 30_000,
+  });
+  const responseBody = Buffer.from(response.body ?? new Uint8Array()).toString(
+    'utf8'
+  );
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      responseBody
+        ? `directoryAuthV2 failed with status ${response.status}: ${responseBody}`
+        : `directoryAuthV2 failed with status ${response.status}`
+    );
+  }
+
+  const auth = JSON.parse(responseBody) as Partial<ServiceAuth>;
+  if (typeof auth.username !== 'string' || typeof auth.password !== 'string') {
+    throw new Error('directoryAuthV2 response is missing username or password');
+  }
+
+  streamSession.cdsiAuth = {
+    timestamp: now(),
+    auth: {
+      username: auth.username,
+      password: auth.password,
+    },
+  };
+  return streamSession.cdsiAuth.auth;
+}
+
+async function cdsiLookupWithTimeout(
+  net: ReturnType<typeof createNet>,
+  auth: ServiceAuth,
+  options: Readonly<{
+    acisAndAccessKeys: ReadonlyArray<{ aci: string; accessKey: string }>;
+    e164s: ReadonlyArray<string>;
+  }>
+) {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => {
+    abortController.abort();
+  }, CDSI_LOOKUP_TIMEOUT_MS);
+  try {
+    return await net.cdsiLookup(auth, {
+      ...options,
+      abortSignal: abortController.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function handleLookupPhoneNumbers(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  const e164s = Array.isArray(body.e164s)
+    ? body.e164s.filter(
+        (value: unknown): value is string => typeof value === 'string'
+      )
+    : [];
+  const acisAndAccessKeys = Array.isArray(body.acisAndAccessKeys)
+    ? body.acisAndAccessKeys
+        .map((value: unknown) => {
+          const record =
+            value && typeof value === 'object'
+              ? (value as Record<string, unknown>)
+              : undefined;
+          if (
+            record &&
+            typeof record.aci === 'string' &&
+            typeof record.accessKey === 'string'
+          ) {
+            return {
+              aci: record.aci,
+              accessKey: record.accessKey,
+            };
+          }
+          return undefined;
+        })
+        .filter(
+          (value): value is { aci: string; accessKey: string } => value != null
+        )
+    : [];
+  if (e164s.length === 0) {
+    sendText(req, res, 400, 'Missing e164s');
+    return;
+  }
+
+  const { Net } = await getSignalModules();
+  const net = createNet(Net);
+  const auth = await fetchCdsiAuth(streamSession);
+  const result = await cdsiLookupWithTimeout(net, auth, {
+    e164s,
+    acisAndAccessKeys,
+  });
+
+  sendJson(req, res, 200, {
+    debugPermitsUsed: result.debugPermitsUsed,
+    entries: Array.from(result.entries.entries()),
+  });
+}
+
 async function handleAttachmentBackfillRequest(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3330,6 +4115,7 @@ async function handleAttachmentBackfillRequest(
     });
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, result);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3338,9 +4124,13 @@ async function handleAttachmentBackfillRequest(
   }
 }
 
-async function handleSendEdit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleSendEdit(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3383,6 +4173,7 @@ async function handleSendEdit(req: IncomingMessage, res: ServerResponse): Promis
     });
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, result);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3396,7 +4187,8 @@ async function handleSendGroupMessage(
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3426,7 +4218,8 @@ async function handleSendGroupMessage(
       : undefined;
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
-        (recipient: unknown): recipient is string => typeof recipient === 'string'
+        (recipient: unknown): recipient is string =>
+          typeof recipient === 'string'
       )
     : [];
   const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
@@ -3479,6 +4272,7 @@ async function handleSendGroupMessage(
     });
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, message);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3518,7 +4312,9 @@ function parseWebGroupSettingsModifyAction(
   return undefined;
 }
 
-function parseWebGroupConversation(value: unknown): WebConversation | undefined {
+function parseWebGroupConversation(
+  value: unknown
+): WebConversation | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
   }
@@ -3545,12 +4341,131 @@ function parseWebConversation(value: unknown): WebConversation | undefined {
   return record as WebConversation;
 }
 
+function parseWebConversationRecord(
+  value: unknown
+): Record<string, WebConversation> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result: Record<string, WebConversation> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const conversation = parseWebConversation(item);
+    if (conversation) {
+      result[key] = conversation;
+    }
+  }
+  return result;
+}
+
+function getGroupUpdateRecipients(
+  conversation: WebConversation,
+  linkedPayload: LinkedPayloadWithProtocol
+): ReadonlyArray<string> {
+  const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  return Array.from(
+    new Set([
+      ...(conversation.membersV2 ?? []).map(member => member.aci),
+      ...(conversation.pendingMembersV2 ?? []).map(member => member.serviceId),
+    ])
+  ).filter(recipient => recipient !== ourAci);
+}
+
+async function handleCreateGroup(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const name = typeof body.name === 'string' ? body.name.trim() : undefined;
+  const conversationIds = Array.isArray(body.conversationIds)
+    ? body.conversationIds.filter(
+        (conversationId: unknown): conversationId is string =>
+          typeof conversationId === 'string'
+      )
+    : [];
+  const conversations = parseWebConversationRecord(body.conversations);
+  const expireTimer =
+    typeof body.expireTimer === 'number' ? body.expireTimer : undefined;
+  const avatar = typeof body.avatar === 'string' ? body.avatar : undefined;
+
+  if (!name) {
+    sendText(req, res, 400, 'Missing name');
+    return;
+  }
+  if (conversationIds.length === 0) {
+    sendText(req, res, 400, 'Missing conversationIds');
+    return;
+  }
+
+  streamSession.sendAttemptCount += 1;
+  streamSession.lastSendAttemptAt = now();
+  streamSession.updatedAt = now();
+
+  try {
+    const group = await createGroupConversation({
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      avatar,
+      cdnUrl: getDefaultCdnUrl(),
+      chat: streamSession.connection,
+      conversationIds,
+      conversations,
+      expireTimer,
+      linkedPayload: streamSession.linkedPayload,
+      name,
+      storageUrl: productionConfig.storageUrl,
+    });
+
+    const recipients = getGroupUpdateRecipients(
+      group,
+      streamSession.linkedPayload
+    );
+    if (group.masterKey && recipients.length > 0) {
+      try {
+        await sendGroupUpdateMessage({
+          chat: streamSession.connection,
+          groupId: String(group.groupId ?? group.id),
+          groupV2: {
+            masterKey: group.masterKey,
+            revision: group.revision ?? 0,
+          },
+          linkedPayload: streamSession.linkedPayload,
+          recipients,
+          timestamp: now(),
+        });
+      } catch (error) {
+        console.warn(
+          'handleCreateGroup: group created, but failed to send group update message',
+          errorToLogString(error)
+        );
+      }
+    }
+
+    streamSession.lastSendError = undefined;
+    streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
+    sendJson(req, res, 200, group);
+  } catch (error) {
+    streamSession.lastSendError = errorToLogString(error);
+    streamSession.updatedAt = now();
+    throw error;
+  }
+}
+
 async function handleModifyGroupMember(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3564,7 +4479,8 @@ async function handleModifyGroupMember(
     typeof body.targetServiceId === 'string' ? body.targetServiceId : undefined;
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
-        (recipient: unknown): recipient is string => typeof recipient === 'string'
+        (recipient: unknown): recipient is string =>
+          typeof recipient === 'string'
       )
     : [];
 
@@ -3634,6 +4550,7 @@ async function handleModifyGroupMember(
     }
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, result);
   } catch (error) {
     if (
@@ -3660,7 +4577,8 @@ async function handleModifyGroupSettings(
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3671,7 +4589,8 @@ async function handleModifyGroupSettings(
   const conversation = parseWebGroupConversation(body.conversation);
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
-        (recipient: unknown): recipient is string => typeof recipient === 'string'
+        (recipient: unknown): recipient is string =>
+          typeof recipient === 'string'
       )
     : [];
   const { value } = body;
@@ -3741,6 +4660,7 @@ async function handleModifyGroupSettings(
     }
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, result);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3754,7 +4674,8 @@ async function handleMessageRequestResponse(
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (!streamSession?.connection || !streamSession.linkedPayload) {
     sendText(req, res, 404, 'Message runtime session not found');
@@ -3787,6 +4708,7 @@ async function handleMessageRequestResponse(
     });
     streamSession.lastSendError = undefined;
     streamSession.updatedAt = now();
+    emitProtocolState(streamSession);
     sendJson(req, res, 200, result);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
@@ -3804,12 +4726,668 @@ async function handleMessageRequestResponse(
   }
 }
 
+async function handleWriteProfile(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = (await readJson(req)) as Partial<ProfileWriteRequestBody>;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const firstName =
+    typeof body.firstName === 'string' ? body.firstName : undefined;
+  if (!firstName) {
+    sendText(req, res, 400, 'Missing firstName');
+    return;
+  }
+
+  if (typeof body.phoneNumberSharing !== 'boolean') {
+    sendText(req, res, 400, 'Missing phoneNumberSharing');
+    return;
+  }
+
+  const familyName =
+    typeof body.familyName === 'string' ? body.familyName : undefined;
+  const aboutText =
+    typeof body.aboutText === 'string' ? body.aboutText : undefined;
+  const aboutEmoji =
+    typeof body.aboutEmoji === 'string' ? body.aboutEmoji : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  const avatarData =
+    typeof body.avatarBase64 === 'string'
+      ? Bytes.fromBase64(body.avatarBase64)
+      : undefined;
+  const profileKey = streamSession.linkedPayload.profileKeyBase64;
+  if (avatarData && !profileKey) {
+    throw new Error('writeProfile: missing profileKeyBase64');
+  }
+  const encryptedAvatarData =
+    avatarData && profileKey
+      ? encryptProfile(avatarData, Bytes.fromBase64(profileKey))
+      : undefined;
+  const currentProfile = await fetchCurrentProfileForWrite(
+    streamSession.connection,
+    streamSession.linkedPayload
+  );
+
+  const profileData = getProfileRequestData({
+    aboutEmoji,
+    aboutText,
+    avatarData,
+    familyName,
+    firstName,
+    linkedPayload: streamSession.linkedPayload,
+    paymentAddress: currentProfile.paymentAddress ?? null,
+    phoneNumberSharing: body.phoneNumberSharing,
+    removeAvatar: body.removeAvatar,
+  });
+
+  const avatarUploadHeaders = await fetchSignalJson<unknown>({
+    body: profileData,
+    chat: streamSession.connection,
+    method: 'PUT',
+    path: '/v1/profile',
+  });
+  let avatarUrlPath: string | undefined;
+  if (encryptedAvatarData) {
+    if (!isProfileAvatarUploadHeaders(avatarUploadHeaders)) {
+      throw new Error('writeProfile: missing avatar upload headers');
+    }
+    avatarUrlPath = await uploadProfileAvatar(
+      avatarUploadHeaders,
+      encryptedAvatarData
+    );
+  }
+
+  if (body.hasOtherDevices === true) {
+    await sendFetchLocalProfileSync({
+      chat: streamSession.connection,
+      linkedPayload: streamSession.linkedPayload,
+      timestamp,
+    });
+  }
+
+  const account = getProfileAccountUpdate({
+    aboutEmoji,
+    aboutText,
+    avatarUrlPath,
+    familyName,
+    firstName,
+    linkedPayload: streamSession.linkedPayload,
+    removeAvatar: body.removeAvatar,
+    timestamp,
+  });
+  streamSession.linkedPayload = {
+    ...streamSession.linkedPayload,
+    account: {
+      ...streamSession.linkedPayload.account,
+      ...account,
+    },
+    protocol: exportProtocolState(streamSession.linkedPayload),
+  } as LinkedPayloadWithProtocol;
+  streamSession.updatedAt = now();
+
+  sendJson(req, res, 200, {
+    account,
+    protocol: streamSession.linkedPayload.protocol,
+    timestamp,
+  });
+}
+
+function getRuntimeSessionForRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: JsonRecord
+): MessageStreamSession | undefined {
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  if (sessionId) {
+    const streamSession = streamSessions.get(sessionId);
+    if (!streamSession?.connection || !streamSession.linkedPayload) {
+      sendText(req, res, 404, 'Message runtime session not found');
+      return undefined;
+    }
+    return streamSession;
+  }
+
+  const openSessions = [...streamSessions.values()].filter(
+    streamSession =>
+      streamSession.status === 'open' &&
+      streamSession.connection &&
+      streamSession.linkedPayload
+  );
+  if (openSessions.length === 1) {
+    return openSessions[0];
+  }
+
+  if (openSessions.length > 1) {
+    sendText(req, res, 409, 'Message runtime session id is required');
+    return undefined;
+  }
+
+  sendText(req, res, 404, 'Message runtime session not found');
+  return undefined;
+}
+
+async function fetchSignalUsernameJson<T>({
+  body,
+  chat,
+  method,
+  path,
+  req,
+  res,
+}: Readonly<{
+  body?: unknown;
+  chat: AuthenticatedChatConnection;
+  method: 'DELETE' | 'PUT';
+  path: string;
+  req: IncomingMessage;
+  res: ServerResponse;
+}>): Promise<T | undefined> {
+  const bodyBytes =
+    body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8');
+  const response = await chat.fetch({
+    verb: method,
+    path,
+    headers: bodyBytes ? [['content-type', 'application/json']] : [],
+    body: bodyBytes,
+    timeoutMillis: 30_000,
+  });
+  const responseBody = getBodyString(response.body);
+  if (response.status < 200 || response.status >= 300) {
+    sendText(
+      req,
+      res,
+      response.status,
+      responseBody || `${path} failed with status ${response.status}`
+    );
+    return undefined;
+  }
+
+  return (responseBody ? JSON.parse(responseBody) : undefined) as T;
+}
+
+async function handleReserveUsername(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+  const { connection } = streamSession;
+
+  const usernameHashes = body.usernameHashes;
+  if (
+    !Array.isArray(usernameHashes) ||
+    usernameHashes.some(value => typeof value !== 'string')
+  ) {
+    sendText(req, res, 400, 'Missing usernameHashes');
+    return;
+  }
+
+  const result = await fetchSignalUsernameJson<{ usernameHash: string }>({
+    body: { usernameHashes },
+    chat: connection,
+    method: 'PUT',
+    path: '/v1/accounts/username_hash/reserve',
+    req,
+    res,
+  });
+  if (!result) {
+    return;
+  }
+  sendJson(req, res, 200, result);
+}
+
+function getReserveUsernameErrorFromLibSignal(
+  error: unknown
+): ReserveUsernameError | undefined {
+  if (
+    LibSignalErrorBase.is(error, LibSignalErrorCode.NicknameCannotBeEmpty) ||
+    LibSignalErrorBase.is(error, LibSignalErrorCode.NicknameTooShort)
+  ) {
+    return ReserveUsernameError.NotEnoughCharacters;
+  }
+  if (LibSignalErrorBase.is(error, LibSignalErrorCode.NicknameTooLong)) {
+    return ReserveUsernameError.TooManyCharacters;
+  }
+  if (LibSignalErrorBase.is(error, LibSignalErrorCode.CannotStartWithDigit)) {
+    return ReserveUsernameError.CheckStartingCharacter;
+  }
+  if (LibSignalErrorBase.is(error, LibSignalErrorCode.BadNicknameCharacter)) {
+    return ReserveUsernameError.CheckCharacters;
+  }
+  if (
+    LibSignalErrorBase.is(error, LibSignalErrorCode.DiscriminatorCannotBeZero)
+  ) {
+    return ReserveUsernameError.AllZeroDiscriminator;
+  }
+  if (
+    LibSignalErrorBase.is(
+      error,
+      LibSignalErrorCode.DiscriminatorCannotHaveLeadingZeros
+    )
+  ) {
+    return ReserveUsernameError.LeadingZeroDiscriminator;
+  }
+  if (
+    LibSignalErrorBase.is(
+      error,
+      LibSignalErrorCode.DiscriminatorCannotBeEmpty
+    ) ||
+    LibSignalErrorBase.is(
+      error,
+      LibSignalErrorCode.DiscriminatorCannotBeSingleDigit
+    ) ||
+    LibSignalErrorBase.is(error, LibSignalErrorCode.DiscriminatorTooLarge)
+  ) {
+    return ReserveUsernameError.NotEnoughDiscriminator;
+  }
+
+  return undefined;
+}
+
+async function handleReserveUsernameByNickname(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+
+  const nickname =
+    typeof body.nickname === 'string' ? body.nickname : undefined;
+  const customDiscriminator =
+    typeof body.customDiscriminator === 'string'
+      ? body.customDiscriminator
+      : undefined;
+  const previousUsername =
+    typeof body.previousUsername === 'string'
+      ? body.previousUsername
+      : undefined;
+  const minNicknameLength =
+    typeof body.minNicknameLength === 'number'
+      ? body.minNicknameLength
+      : undefined;
+  const maxNicknameLength =
+    typeof body.maxNicknameLength === 'number'
+      ? body.maxNicknameLength
+      : undefined;
+
+  if (!nickname || minNicknameLength == null || maxNicknameLength == null) {
+    sendText(req, res, 400, 'Missing username reservation body');
+    return;
+  }
+
+  let generatedUsernames: ReadonlyArray<string>;
+  try {
+    if (previousUsername !== undefined && !customDiscriminator) {
+      const previousNickname = getNickname(previousUsername);
+      if (
+        previousNickname !== undefined &&
+        nickname.toLowerCase() === previousNickname.toLowerCase()
+      ) {
+        const previousDiscriminator = getDiscriminator(previousUsername);
+        if (!previousDiscriminator) {
+          sendText(req, res, 400, 'Missing previous username discriminator');
+          return;
+        }
+        generatedUsernames = [`${nickname}.${previousDiscriminator}`];
+      } else {
+        generatedUsernames = usernames.generateCandidates(
+          nickname,
+          minNicknameLength,
+          maxNicknameLength
+        );
+      }
+    } else if (customDiscriminator) {
+      generatedUsernames = [
+        usernames.fromParts(
+          nickname,
+          customDiscriminator,
+          minNicknameLength,
+          maxNicknameLength
+        ).username,
+      ];
+    } else {
+      generatedUsernames = usernames.generateCandidates(
+        nickname,
+        minNicknameLength,
+        maxNicknameLength
+      );
+    }
+  } catch (error) {
+    const reserveError = getReserveUsernameErrorFromLibSignal(error);
+    if (reserveError) {
+      sendText(req, res, 400, `ReserveUsernameError:${reserveError}`);
+      return;
+    }
+    throw error;
+  }
+
+  const hashes = generatedUsernames.map(username => usernames.hash(username));
+  const result = await fetchSignalUsernameJson<{ usernameHash: string }>({
+    body: {
+      usernameHashes: hashes.map(hash => toWebSafeBase64(Bytes.toBase64(hash))),
+    },
+    chat: streamSession.connection,
+    method: 'PUT',
+    path: '/v1/accounts/username_hash/reserve',
+    req,
+    res,
+  });
+  if (!result) {
+    return;
+  }
+
+  const usernameHash = Bytes.fromBase64(fromWebSafeBase64(result.usernameHash));
+  const index = hashes.findIndex(hash => Bytes.areEqual(hash, usernameHash));
+  if (index === -1) {
+    sendText(req, res, 422, 'Reserved username hash was not requested');
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    hashBase64: Bytes.toBase64(usernameHash),
+    username: generatedUsernames[index],
+  });
+}
+
+async function handleConfirmUsername(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+  const { connection } = streamSession;
+
+  const usernameHash =
+    typeof body.usernameHash === 'string' ? body.usernameHash : undefined;
+  const zkProof = typeof body.zkProof === 'string' ? body.zkProof : undefined;
+  const encryptedUsername =
+    typeof body.encryptedUsername === 'string'
+      ? body.encryptedUsername
+      : undefined;
+  if (!usernameHash || !zkProof || !encryptedUsername) {
+    sendText(req, res, 400, 'Missing username confirmation body');
+    return;
+  }
+
+  const result = await fetchSignalUsernameJson<{ usernameLinkHandle: string }>({
+    body: {
+      encryptedUsername,
+      usernameHash,
+      zkProof,
+    },
+    chat: connection,
+    method: 'PUT',
+    path: '/v1/accounts/username_hash/confirm',
+    req,
+    res,
+  });
+  if (!result) {
+    return;
+  }
+  sendJson(req, res, 200, result);
+}
+
+async function handleConfirmUsernameReservation(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+
+  const username =
+    typeof body.username === 'string' ? body.username : undefined;
+  const hashBase64 =
+    typeof body.hashBase64 === 'string' ? body.hashBase64 : undefined;
+  const previousLinkEntropyBase64 =
+    typeof body.previousLinkEntropyBase64 === 'string'
+      ? body.previousLinkEntropyBase64
+      : undefined;
+  if (!username || !hashBase64) {
+    sendText(req, res, 400, 'Missing username confirmation body');
+    return;
+  }
+
+  const hash = Bytes.fromBase64(hashBase64);
+  if (!Bytes.areEqual(usernames.hash(username), hash)) {
+    sendText(req, res, 422, 'username hash mismatch');
+    return;
+  }
+
+  let entropy: Uint8Array<ArrayBuffer>;
+  let result: { usernameLinkHandle: string } | undefined;
+  if (previousLinkEntropyBase64) {
+    const updatedLink = usernames.createUsernameLink(
+      username,
+      Bytes.fromBase64(previousLinkEntropyBase64)
+    );
+    entropy = updatedLink.entropy;
+    result = await fetchSignalUsernameJson<{ usernameLinkHandle: string }>({
+      body: {
+        keepLinkHandle: true,
+        usernameLinkEncryptedValue: toWebSafeBase64(
+          Bytes.toBase64(updatedLink.encryptedUsername)
+        ),
+      },
+      chat: streamSession.connection,
+      method: 'PUT',
+      path: '/v1/accounts/username_link',
+      req,
+      res,
+    });
+  } else {
+    const newLink = usernames.createUsernameLink(username);
+    entropy = newLink.entropy;
+    result = await fetchSignalUsernameJson<{ usernameLinkHandle: string }>({
+      body: {
+        encryptedUsername: toWebSafeBase64(
+          Bytes.toBase64(newLink.encryptedUsername)
+        ),
+        usernameHash: toWebSafeBase64(Bytes.toBase64(hash)),
+        zkProof: toWebSafeBase64(
+          Bytes.toBase64(usernames.generateProof(username))
+        ),
+      },
+      chat: streamSession.connection,
+      method: 'PUT',
+      path: '/v1/accounts/username_hash/confirm',
+      req,
+      res,
+    });
+  }
+  if (!result) {
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    entropyBase64: Bytes.toBase64(entropy),
+    usernameLinkHandle: result.usernameLinkHandle,
+  });
+}
+
+async function handleDeleteUsername(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+  const { connection } = streamSession;
+
+  const result = await fetchSignalUsernameJson<void>({
+    chat: connection,
+    method: 'DELETE',
+    path: '/v1/accounts/username_hash',
+    req,
+    res,
+  });
+  if (result === undefined && res.headersSent) {
+    return;
+  }
+  sendJson(req, res, 200, { ok: true });
+}
+
+async function handleReplaceUsernameLink(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+  const { connection } = streamSession;
+
+  const usernameLinkEncryptedValue =
+    typeof body.usernameLinkEncryptedValue === 'string'
+      ? body.usernameLinkEncryptedValue
+      : undefined;
+  if (!usernameLinkEncryptedValue || typeof body.keepLinkHandle !== 'boolean') {
+    sendText(req, res, 400, 'Missing username link body');
+    return;
+  }
+
+  const result = await fetchSignalUsernameJson<{ usernameLinkHandle: string }>({
+    body: {
+      keepLinkHandle: body.keepLinkHandle,
+      usernameLinkEncryptedValue,
+    },
+    chat: connection,
+    method: 'PUT',
+    path: '/v1/accounts/username_link',
+    req,
+    res,
+  });
+  if (!result) {
+    return;
+  }
+  sendJson(req, res, 200, result);
+}
+
+async function handleResetUsernameLink(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession?.connection) {
+    return;
+  }
+
+  const username =
+    typeof body.username === 'string' ? body.username : undefined;
+  if (!username) {
+    sendText(req, res, 400, 'Missing username');
+    return;
+  }
+
+  const { encryptedUsername, entropy } = usernames.createUsernameLink(username);
+  const result = await fetchSignalUsernameJson<{ usernameLinkHandle: string }>({
+    body: {
+      keepLinkHandle: false,
+      usernameLinkEncryptedValue: toWebSafeBase64(
+        Bytes.toBase64(encryptedUsername)
+      ),
+    },
+    chat: streamSession.connection,
+    method: 'PUT',
+    path: '/v1/accounts/username_link',
+    req,
+    res,
+  });
+  if (!result) {
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    entropyBase64: Bytes.toBase64(entropy),
+    usernameLinkHandle: result.usernameLinkHandle,
+  });
+}
+
+async function handleSyncUsernameProfile(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const streamSession = getRuntimeSessionForRequest(req, res, body);
+  if (!streamSession) {
+    return;
+  }
+
+  if (!streamSession.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const connection = streamSession.connection;
+  const linkedPayload = streamSession.linkedPayload;
+  const username =
+    typeof body.username === 'string' ? body.username : undefined;
+  const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
+  const account: WebAccount = {
+    ...linkedPayload.account,
+    username,
+  };
+  const nextLinkedPayload = {
+    ...linkedPayload,
+    account,
+    protocol: exportProtocolState(linkedPayload),
+  } as LinkedPayloadWithProtocol;
+
+  streamSession.linkedPayload = nextLinkedPayload;
+  streamSession.updatedAt = now();
+
+  let syncError: string | undefined;
+  try {
+    await sendFetchLocalProfileSync({
+      chat: connection,
+      linkedPayload: nextLinkedPayload,
+      timestamp,
+    });
+  } catch (error) {
+    syncError = errorToLogString(error);
+    console.warn(
+      'handleSyncUsernameProfile: local username updated, but sync failed',
+      error
+    );
+  }
+
+  sendJson(req, res, 200, {
+    account,
+    protocol: nextLinkedPayload.protocol,
+    syncError,
+    timestamp,
+  });
+}
+
 async function handleContactsSync(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
   const body = await readJson(req);
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (streamSession?.connection && streamSession.linkedPayload) {
     const contacts = await syncStorageContacts({
@@ -3823,8 +5401,10 @@ async function handleContactsSync(
     return;
   }
 
-  const username = typeof body.username === 'string' ? body.username : undefined;
-  const password = typeof body.password === 'string' ? body.password : undefined;
+  const username =
+    typeof body.username === 'string' ? body.username : undefined;
+  const password =
+    typeof body.password === 'string' ? body.password : undefined;
   const storageServiceKey =
     typeof body.storageServiceKey === 'string'
       ? body.storageServiceKey
@@ -3905,7 +5485,8 @@ async function handleAttachment(
   const cdnId = url.searchParams.get('cdnId');
   const transitKey = cdnKey ?? cdnId;
   const cdnNumber = url.searchParams.get('cdnNumber') ?? '0';
-  const contentType = url.searchParams.get('contentType') ?? 'application/octet-stream';
+  const contentType =
+    url.searchParams.get('contentType') ?? 'application/octet-stream';
   const fileName = url.searchParams.get('fileName');
   const keyBase64 = url.searchParams.get('keyBase64');
   const digestBase64 = url.searchParams.get('digestBase64');
@@ -3974,12 +5555,10 @@ async function handleAttachment(
             mediaId: mediaId.string,
             streamSession,
           });
-    const resolvedLocation =
-      location ??
-      {
-        ...archiveInfo,
-        cdnNumber: await getFallbackBackupCdnNumber(streamSession),
-      };
+    const resolvedLocation = location ?? {
+      ...archiveInfo,
+      cdnNumber: await getFallbackBackupCdnNumber(streamSession),
+    };
 
     const backupReadHeaders = await getBackupCdnReadHeaders({
       cdnNumber: resolvedLocation.cdnNumber,
@@ -3994,40 +5573,32 @@ async function handleAttachment(
       mediaId: mediaId.string,
     });
 
-    sendCors(req, res);
-    res.writeHead(200, {
-      'Content-Type': contentType,
-      'Content-Length': String(backupFields.size),
-      ...(fileName
-        ? {
-            'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
-          }
-        : null),
-      'Cache-Control': 'public, max-age=3600',
-    });
-    await decryptAttachmentV2ToSink(
-      {
-        ciphertextStream: backupMediaStream,
-        idForLogging: mediaId.string,
-        integrityCheck: {
-          type: 'plaintext',
-          plaintextHash: Bytes.fromHex(backupFields.plaintextHash),
-        },
-        keysBase64: backupFields.keyBase64,
-        outerEncryption: deriveBackupMediaOuterEncryptionKeyMaterial(
-          mediaRootKey,
-          mediaId.bytes
-        ),
-        size: backupFields.size,
-        theirChunkSize: chunkSize,
-        theirIncrementalMac: incrementalMacBase64
-          ? Bytes.fromBase64(incrementalMacBase64)
-          : undefined,
-        type: 'standard',
+    const decrypted = await decryptAttachmentV2ToBuffer({
+      ciphertextStream: backupMediaStream,
+      idForLogging: mediaId.string,
+      integrityCheck: {
+        type: 'plaintext',
+        plaintextHash: Bytes.fromHex(backupFields.plaintextHash),
       },
-      res
-    );
-    res.end();
+      keysBase64: backupFields.keyBase64,
+      outerEncryption: deriveBackupMediaOuterEncryptionKeyMaterial(
+        mediaRootKey,
+        mediaId.bytes
+      ),
+      size: backupFields.size,
+      theirChunkSize: chunkSize,
+      theirIncrementalMac: incrementalMacBase64
+        ? Bytes.fromBase64(incrementalMacBase64)
+        : undefined,
+      type: 'standard',
+    });
+    sendAttachmentBytes({
+      body: decrypted,
+      contentType,
+      fileName,
+      req,
+      res,
+    });
     return;
   }
 
@@ -4042,16 +5613,64 @@ async function handleAttachment(
       return;
     }
 
-    const baseUrl = CDN_BASE_URL ?? productionConfig.cdn[cdnNumber] ?? productionConfig.cdn['0'];
+    const baseUrl =
+      CDN_BASE_URL ??
+      productionConfig.cdn[cdnNumber] ??
+      productionConfig.cdn['0'];
     if (!baseUrl) {
       sendText(req, res, 501, 'CDN base URL is not configured');
       return;
     }
 
-    const attachmentUrl = new URL(`/attachments/${encodeURIComponent(transitKey)}`, baseUrl);
+    const attachmentUrl = new URL(
+      `/attachments/${encodeURIComponent(transitKey)}`,
+      baseUrl
+    );
     const response = await fetch(attachmentUrl);
     if (!response.ok) {
       sendText(req, res, response.status, await response.text());
+      return;
+    }
+
+    if (!response.body) {
+      sendAttachmentBytes({
+        body: Buffer.alloc(0),
+        contentType,
+        fileName,
+        req,
+        res,
+      });
+      return;
+    }
+
+    if (keyBase64 && (digestBase64 || plaintextHash) && size != null) {
+      const decrypted = await decryptAttachmentV2ToBuffer({
+        ciphertextStream: Readable.fromWeb(response.body as never),
+        idForLogging: transitKey,
+        integrityCheck: digestBase64
+          ? {
+              type: 'encrypted',
+              digest: Bytes.fromBase64(digestBase64),
+            }
+          : {
+              type: 'plaintext',
+              plaintextHash: Bytes.fromHex(plaintextHash ?? ''),
+            },
+        keysBase64: keyBase64,
+        size,
+        theirChunkSize: chunkSize,
+        theirIncrementalMac: incrementalMacBase64
+          ? Bytes.fromBase64(incrementalMacBase64)
+          : undefined,
+        type: 'standard',
+      });
+      sendAttachmentBytes({
+        body: decrypted,
+        contentType,
+        fileName,
+        req,
+        res,
+      });
       return;
     }
 
@@ -4070,46 +5689,13 @@ async function handleAttachment(
         : null),
       'Cache-Control': 'public, max-age=3600',
     });
-    if (!response.body) {
-      res.end();
-      return;
-    }
-
-    if (keyBase64 && (digestBase64 || plaintextHash) && size != null) {
-      await decryptAttachmentV2ToSink(
-        {
-          ciphertextStream: Readable.fromWeb(response.body as never),
-          idForLogging: transitKey,
-          integrityCheck: digestBase64
-            ? {
-                type: 'encrypted',
-                digest: Bytes.fromBase64(digestBase64),
-              }
-            : {
-                type: 'plaintext',
-                plaintextHash: Bytes.fromHex(plaintextHash ?? ''),
-              },
-          keysBase64: keyBase64,
-          size,
-          theirChunkSize: chunkSize,
-          theirIncrementalMac: incrementalMacBase64
-            ? Bytes.fromBase64(incrementalMacBase64)
-            : undefined,
-          type: 'standard',
-        },
-        res
-      );
-      res.end();
-      return;
-    }
-
     for await (const chunk of Readable.fromWeb(response.body as never)) {
       res.write(chunk);
     }
     res.end();
   }
 
-  if (backupFields) {
+  if (backupFields && sessionId) {
     try {
       await writeBackupTierAttachment();
       return;
@@ -4123,11 +5709,18 @@ async function handleAttachment(
       }
     }
   }
+  if (backupFields && !sessionId && !transitKey) {
+    sendText(req, res, 400, 'Missing sessionId');
+    return;
+  }
 
   await writeTransitTierAttachment();
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
   sendCors(req, res);
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -4135,7 +5728,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+  const url = new URL(
+    req.url ?? '/',
+    `http://${req.headers.host ?? '127.0.0.1'}`
+  );
 
   if (req.method === 'GET' && url.pathname === '/emoji/jumbo') {
     await handleEmojiJumbo(req, res, url);
@@ -4190,9 +5786,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  const provisioningMatch = /^\/provisioning\/sessions\/([^/]+)(?:\/linked-session)?$/.exec(
-    url.pathname
-  );
+  const provisioningMatch =
+    /^\/provisioning\/sessions\/([^/]+)(?:\/linked-session)?$/.exec(
+      url.pathname
+    );
   if (req.method === 'GET' && provisioningMatch) {
     const matchedSessionId = provisioningMatch[1];
     if (!matchedSessionId) {
@@ -4274,12 +5871,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/messages/expiration-timer') {
+    await handleSendExpirationTimer(req, res);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/messages/attachment/upload') {
     await handleUploadAttachment(req, res);
     return;
   }
 
-  if (req.method === 'POST' && url.pathname === '/messages/attachment/backfill') {
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/messages/attachment/backfill'
+  ) {
     await handleAttachmentBackfillRequest(req, res);
     return;
   }
@@ -4296,6 +5901,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === 'POST' && url.pathname === '/messages/send-group') {
     await handleSendGroupMessage(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/contacts/lookup-username') {
+    await handleLookupUsername(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/contacts/lookup-phone-numbers'
+  ) {
+    await handleLookupPhoneNumbers(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/groups/create') {
+    await handleCreateGroup(req, res);
     return;
   }
 
@@ -4322,6 +5945,57 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/profile/write') {
+    await handleWriteProfile(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/reserve') {
+    await handleReserveUsername(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/username/reserve-by-nickname'
+  ) {
+    await handleReserveUsernameByNickname(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/confirm') {
+    await handleConfirmUsername(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/username/confirm-reservation'
+  ) {
+    await handleConfirmUsernameReservation(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/delete') {
+    await handleDeleteUsername(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/link') {
+    await handleReplaceUsernameLink(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/reset-link') {
+    await handleResetUsernameLink(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/username/sync-profile') {
+    await handleSyncUsernameProfile(req, res);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/messages/attachment') {
     await handleAttachment(req, res, url);
     return;
@@ -4343,12 +6017,19 @@ const server = createServer((req, res) => {
         req,
         res,
         500,
-        error instanceof Error ? error.stack ?? error.message : String(error)
+        error instanceof Error ? (error.stack ?? error.message) : String(error)
       );
     } else {
       res.end();
     }
   });
+});
+
+void cleanupExpiredAttachmentTmpDirs().catch(error => {
+  console.warn(
+    'Failed to clean expired Signal Web attachment temp files',
+    error
+  );
 });
 
 server.listen(PORT, HOST, () => {

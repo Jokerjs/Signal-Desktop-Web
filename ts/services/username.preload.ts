@@ -36,8 +36,202 @@ import { findRetryAfterTimeFromError } from '../jobs/helpers/findRetryAfterTimeF
 import * as Bytes from '../Bytes.std.ts';
 import { storageServiceUploadJob } from './storage.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
+import {
+  fromWebSafeBase64,
+  toWebSafeBase64,
+} from '../util/webSafeBase64.std.ts';
 
 const log = createLogger('username');
+
+type WebUsernameRuntime = Readonly<{
+  reserveUsername?: (
+    usernameHashes: ReadonlyArray<string>
+  ) => Promise<{ usernameHash: string }>;
+  reserveUsernameByNickname?: (
+    body: Readonly<{
+      customDiscriminator?: string;
+      maxNicknameLength: number;
+      minNicknameLength: number;
+      nickname: string;
+      previousUsername?: string;
+    }>
+  ) => Promise<{ hashBase64: string; username: string }>;
+  confirmUsername?: (
+    body: Readonly<{
+      encryptedUsername: string;
+      usernameHash: string;
+      zkProof: string;
+    }>
+  ) => Promise<{ usernameLinkHandle: string }>;
+  confirmUsernameReservation?: (
+    body: Readonly<{
+      hashBase64: string;
+      previousLinkEntropyBase64?: string;
+      username: string;
+    }>
+  ) => Promise<{ entropyBase64: string; usernameLinkHandle: string }>;
+  deleteUsername?: () => Promise<void>;
+  replaceUsernameLink?: (
+    body: Readonly<{
+      keepLinkHandle: boolean;
+      usernameLinkEncryptedValue: string;
+    }>
+  ) => Promise<{ usernameLinkHandle: string }>;
+  resetUsernameLink?: (
+    username: string
+  ) => Promise<{ entropyBase64: string; usernameLinkHandle: string }>;
+  syncUsernameProfile?: (username: string | undefined) => Promise<void>;
+}>;
+
+function getWebUsernameRuntime(): WebUsernameRuntime | undefined {
+  return (
+    window as typeof window & {
+      SignalWebRuntime?: WebUsernameRuntime;
+    }
+  ).SignalWebRuntime;
+}
+
+async function reserveUsernameHash({
+  abortSignal,
+  hashes,
+}: Readonly<{
+  abortSignal?: AbortSignal;
+  hashes: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+}>): Promise<Uint8Array<ArrayBuffer>> {
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.reserveUsername) {
+    const { usernameHash } = await runtime.reserveUsername(
+      hashes.map(hash => toWebSafeBase64(Bytes.toBase64(hash)))
+    );
+    return Bytes.fromBase64(fromWebSafeBase64(usernameHash));
+  }
+
+  const result = await doReserveUsername({
+    hashes,
+    abortSignal,
+  });
+  return result.usernameHash;
+}
+
+async function confirmUsernameHash({
+  abortSignal,
+  encryptedUsername,
+  hash,
+  proof,
+}: Readonly<{
+  abortSignal?: AbortSignal;
+  encryptedUsername: Uint8Array<ArrayBuffer>;
+  hash: Uint8Array<ArrayBuffer>;
+  proof: Uint8Array<ArrayBuffer>;
+}>): Promise<{ usernameLinkHandle: string }> {
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.confirmUsername) {
+    return runtime.confirmUsername({
+      encryptedUsername: toWebSafeBase64(Bytes.toBase64(encryptedUsername)),
+      usernameHash: toWebSafeBase64(Bytes.toBase64(hash)),
+      zkProof: toWebSafeBase64(Bytes.toBase64(proof)),
+    });
+  }
+
+  return doConfirmUsername({
+    hash,
+    proof,
+    encryptedUsername,
+    abortSignal,
+  });
+}
+
+async function replaceUsernameLinkWebAware({
+  encryptedUsername,
+  keepLinkHandle,
+}: Readonly<{
+  encryptedUsername: Uint8Array<ArrayBuffer>;
+  keepLinkHandle: boolean;
+}>): Promise<{ usernameLinkHandle: string }> {
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.replaceUsernameLink) {
+    return runtime.replaceUsernameLink({
+      keepLinkHandle,
+      usernameLinkEncryptedValue: toWebSafeBase64(
+        Bytes.toBase64(encryptedUsername)
+      ),
+    });
+  }
+
+  return replaceUsernameLink({
+    encryptedUsername,
+    keepLinkHandle,
+  });
+}
+
+async function reserveUsernameViaWebRuntime({
+  customDiscriminator,
+  nickname,
+  previousUsername,
+}: Readonly<{
+  customDiscriminator: string | undefined;
+  nickname: string;
+  previousUsername: string | undefined;
+}>): Promise<UsernameReservationType | undefined> {
+  const runtime = getWebUsernameRuntime();
+  if (!runtime?.reserveUsernameByNickname) {
+    return undefined;
+  }
+
+  const result = await runtime.reserveUsernameByNickname({
+    customDiscriminator,
+    maxNicknameLength: getMaxNickname(),
+    minNicknameLength: getMinNickname(),
+    nickname,
+    previousUsername,
+  });
+
+  return {
+    hash: Bytes.fromBase64(result.hashBase64),
+    previousUsername,
+    username: result.username,
+  };
+}
+
+function getWebReserveUsernameError(
+  error: HTTPError
+): ReserveUsernameError | undefined {
+  const message = error.message;
+  if (!message.startsWith('ReserveUsernameError:')) {
+    return undefined;
+  }
+
+  const [rawValue] = message
+    .slice('ReserveUsernameError:'.length)
+    .split(';', 1);
+
+  if (rawValue === ReserveUsernameError.NotEnoughCharacters) {
+    return ReserveUsernameError.NotEnoughCharacters;
+  }
+  if (rawValue === ReserveUsernameError.TooManyCharacters) {
+    return ReserveUsernameError.TooManyCharacters;
+  }
+  if (rawValue === ReserveUsernameError.CheckStartingCharacter) {
+    return ReserveUsernameError.CheckStartingCharacter;
+  }
+  if (rawValue === ReserveUsernameError.CheckCharacters) {
+    return ReserveUsernameError.CheckCharacters;
+  }
+  if (rawValue === ReserveUsernameError.NotEnoughDiscriminator) {
+    return ReserveUsernameError.NotEnoughDiscriminator;
+  }
+  if (rawValue === ReserveUsernameError.AllZeroDiscriminator) {
+    return ReserveUsernameError.AllZeroDiscriminator;
+  }
+  if (rawValue === ReserveUsernameError.LeadingZeroDiscriminator) {
+    return ReserveUsernameError.LeadingZeroDiscriminator;
+  }
+  if (rawValue === ReserveUsernameError.TooManyAttempts) {
+    return ReserveUsernameError.TooManyAttempts;
+  }
+
+  return undefined;
+}
 
 export type WriteUsernameOptionsType = Readonly<
   | {
@@ -83,6 +277,18 @@ export async function reserveUsername(
   }
 
   try {
+    const webReservation = await reserveUsernameViaWebRuntime({
+      customDiscriminator,
+      nickname,
+      previousUsername,
+    });
+    if (webReservation) {
+      return {
+        ok: true,
+        reservation: webReservation,
+      };
+    }
+
     if (previousUsername !== undefined && !customDiscriminator) {
       const previousNickname = getNickname(previousUsername);
 
@@ -118,7 +324,7 @@ export async function reserveUsername(
 
     const hashes = candidates.map(username => usernames.hash(username));
 
-    const { usernameHash } = await doReserveUsername({
+    const usernameHash = await reserveUsernameHash({
       hashes,
       abortSignal,
     });
@@ -138,6 +344,11 @@ export async function reserveUsername(
     };
   } catch (error) {
     if (error instanceof HTTPError) {
+      const webError = getWebReserveUsernameError(error);
+      if (webError) {
+        return { ok: false, error: webError };
+      }
+
       if (error.code === 422) {
         return { ok: false, error: ReserveUsernameError.Unprocessable };
       }
@@ -218,6 +429,12 @@ async function updateUsernameAndSyncProfile(
   // Update model, update DB
   await me.updateUsername(username);
 
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.syncUsernameProfile) {
+    await runtime.syncUsernameProfile(username);
+    return;
+  }
+
   if (!window.ConversationController.doWeHaveOtherDevices()) {
     return;
   }
@@ -249,10 +466,13 @@ export async function confirmUsername(
   }
 
   const { hash } = reservation;
-  strictAssert(
-    Bytes.areEqual(usernames.hash(username), hash),
-    'username hash mismatch'
-  );
+  const runtime = getWebUsernameRuntime();
+  if (!runtime?.confirmUsernameReservation) {
+    strictAssert(
+      Bytes.areEqual(usernames.hash(username), hash),
+      'username hash mismatch'
+    );
+  }
 
   const wasCorrupted = itemStorage.get('usernameCorrupted');
 
@@ -261,7 +481,20 @@ export async function confirmUsername(
 
     let serverIdString: string;
     let entropy: Uint8Array<ArrayBuffer>;
-    if (previousLink && isCaseChange(reservation)) {
+    if (runtime?.confirmUsernameReservation) {
+      log.info('confirmUsername: confirming via web runtime');
+
+      const result = await runtime.confirmUsernameReservation({
+        hashBase64: Bytes.toBase64(hash),
+        previousLinkEntropyBase64:
+          previousLink && isCaseChange(reservation)
+            ? Bytes.toBase64(previousLink.entropy)
+            : undefined,
+        username,
+      });
+      entropy = Bytes.fromBase64(result.entropyBase64);
+      serverIdString = result.usernameLinkHandle;
+    } else if (previousLink && isCaseChange(reservation)) {
       log.info('confirmUsername: updating link only');
 
       const updatedLink = usernames.createUsernameLink(
@@ -270,10 +503,11 @@ export async function confirmUsername(
       );
       ({ entropy } = updatedLink);
 
-      ({ usernameLinkHandle: serverIdString } = await replaceUsernameLink({
-        encryptedUsername: updatedLink.encryptedUsername,
-        keepLinkHandle: true,
-      }));
+      ({ usernameLinkHandle: serverIdString } =
+        await replaceUsernameLinkWebAware({
+          encryptedUsername: updatedLink.encryptedUsername,
+          keepLinkHandle: true,
+        }));
     } else {
       log.info('confirmUsername: confirming and replacing link');
 
@@ -282,7 +516,7 @@ export async function confirmUsername(
 
       const proof = usernames.generateProof(username);
 
-      ({ usernameLinkHandle: serverIdString } = await doConfirmUsername({
+      ({ usernameLinkHandle: serverIdString } = await confirmUsernameHash({
         hash,
         proof,
         encryptedUsername: newLink.encryptedUsername,
@@ -331,7 +565,12 @@ export async function deleteUsername(
   }
 
   await itemStorage.remove('usernameLink');
-  await doDeleteUsername(abortSignal);
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.deleteUsername) {
+    await runtime.deleteUsername();
+  } else {
+    await doDeleteUsername(abortSignal);
+  }
   await itemStorage.remove('usernameCorrupted');
   await updateUsernameAndSyncProfile(undefined);
 }
@@ -343,14 +582,26 @@ export async function resetLink(username: string): Promise<void> {
     throw new Error('Username has changed on another device');
   }
 
-  const { entropy, encryptedUsername } = usernames.createUsernameLink(username);
-
   await itemStorage.remove('usernameLink');
 
-  const { usernameLinkHandle: serverIdString } = await replaceUsernameLink({
-    encryptedUsername,
-    keepLinkHandle: false,
-  });
+  let entropy: Uint8Array<ArrayBuffer>;
+  let serverIdString: string;
+  const runtime = getWebUsernameRuntime();
+  if (runtime?.resetUsernameLink) {
+    const result = await runtime.resetUsernameLink(username);
+    entropy = Bytes.fromBase64(result.entropyBase64);
+    serverIdString = result.usernameLinkHandle;
+  } else {
+    const newLink = usernames.createUsernameLink(username);
+    ({ entropy } = newLink);
+
+    ({ usernameLinkHandle: serverIdString } = await replaceUsernameLinkWebAware(
+      {
+        encryptedUsername: newLink.encryptedUsername,
+        keepLinkHandle: false,
+      }
+    ));
+  }
 
   await itemStorage.put('usernameLink', {
     entropy,

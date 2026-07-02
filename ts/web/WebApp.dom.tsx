@@ -614,9 +614,15 @@ export function WebApp() {
   useEffect(() => {
     let cancelled = false;
     async function boot() {
-      const stored =
-        (await loadLinkedSessionRecordFromIndexedDb()) ??
-        loadLinkedSessionRecordFromStorage();
+      const indexedSession = await loadLinkedSessionRecordFromIndexedDb();
+      const storageSession = indexedSession
+        ? undefined
+        : loadLinkedSessionRecordFromStorage();
+      if (storageSession) {
+        await persistLinkedSessionRecordToIndexedDb(storageSession);
+        persistLinkedSessionToStorage(storageSession);
+      }
+      const stored = indexedSession ?? storageSession;
       if (!stored || !isLinkedSessionReady(stored)) {
         if (!cancelled) {
           setIsBooting(false);
@@ -690,6 +696,16 @@ export function WebApp() {
           void persistLinkedSessionRecordToIndexedDb(next);
           return next;
         });
+        return;
+      }
+      if (event.type === 'protocol-state') {
+        if (linkedSession) {
+          void persistLinkedSessionRecordToIndexedDb({
+            ...linkedSession,
+            lastUpdatedAt: Date.now(),
+            protocol: event.protocol,
+          });
+        }
         return;
       }
       if (event.type === 'contacts-bootstrap' && linkedSession) {

@@ -83,6 +83,15 @@ function base64ToBytes(dataBase64: string): Uint8Array<ArrayBuffer> {
   );
 }
 
+function bytesToBase64(data: Uint8Array<ArrayBuffer>): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < data.length; index += chunkSize) {
+    binary += String.fromCharCode(...data.subarray(index, index + chunkSize));
+  }
+  return globalThis.btoa(binary);
+}
+
 async function readAttachmentFromBrowserUrl(
   url: string
 ): Promise<Uint8Array<ArrayBuffer> | undefined> {
@@ -148,11 +157,25 @@ function createEncryptedReader(basePath: string): EncryptedReader {
 function createEncryptedWriterForNew(basePath: string): EncryptedWriter {
   const pathGetter = createAbsolutePathGetter(basePath);
 
-  return data =>
-    doWriteNewAttachmentData({
+  return async data => {
+    if (isBrowserRuntime()) {
+      const dataBase64 = bytesToBase64(data);
+      const browserLocalAttachment = {
+        dataBase64,
+        path: `data:application/octet-stream;base64,${dataBase64}`,
+        plaintextHash: await getPlaintextHashForInMemoryAttachment(data),
+        size: data.byteLength,
+        url: `data:application/octet-stream;base64,${dataBase64}`,
+        version: 2,
+      };
+      return browserLocalAttachment as unknown as LocalAttachmentV2Type;
+    }
+
+    return doWriteNewAttachmentData({
       data,
       getAbsoluteAttachmentPath: pathGetter,
     });
+  };
 }
 
 export const readAttachmentData = createEncryptedReader(ATTACHMENTS_PATH);

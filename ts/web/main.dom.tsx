@@ -48,6 +48,8 @@ import {
   loadContactsBootstrapForSession,
   loadLinkedSessionRecordFromIndexedDb,
   loadLinkedSessionRecordFromStorage,
+  persistLinkedSessionRecordToIndexedDb,
+  persistLinkedSessionToStorage,
 } from './persistence.dom.ts';
 import { loadWebSettings } from './runtime/webSettings.dom.ts';
 
@@ -155,9 +157,15 @@ async function buildInitialState(): Promise<{
 }> {
   await itemStorage.fetch();
 
-  const storedSession =
-    (await loadLinkedSessionRecordFromIndexedDb()) ??
-    loadLinkedSessionRecordFromStorage();
+  const indexedSession = await loadLinkedSessionRecordFromIndexedDb();
+  const storageSession = indexedSession
+    ? undefined
+    : loadLinkedSessionRecordFromStorage();
+  if (storageSession) {
+    await persistLinkedSessionRecordToIndexedDb(storageSession);
+    persistLinkedSessionToStorage(storageSession);
+  }
+  const storedSession = indexedSession ?? storageSession;
   await syncLinkedSessionUserStorage(storedSession);
   const sessionUserId = getLinkedSessionUserId(storedSession);
   const [storedShell, contacts] = await Promise.all([

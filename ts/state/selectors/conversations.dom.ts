@@ -736,6 +736,9 @@ export const getAllGroupsWithInviteAccess = createSelector(
       return (
         conversation.type === 'group' &&
         conversation.title &&
+        !conversation.left &&
+        !conversation.removalStage &&
+        !conversation.terminated &&
         conversation.canAddNewMembers
       );
     })

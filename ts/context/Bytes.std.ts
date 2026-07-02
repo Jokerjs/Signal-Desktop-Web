@@ -12,7 +12,14 @@ export class Bytes {
   }
 
   public fromBase64url(value: string): Uint8Array<ArrayBuffer> {
-    return Buffer.from(value, 'base64url');
+    const paddedValue = value.padEnd(
+      value.length + ((4 - (value.length % 4)) % 4),
+      '='
+    );
+    return Buffer.from(
+      paddedValue.replaceAll('-', '+').replaceAll('_', '/'),
+      'base64'
+    );
   }
 
   public fromHex(value: string): Uint8Array<ArrayBuffer> {
@@ -33,7 +40,11 @@ export class Bytes {
   }
 
   public toBase64url(data: Uint8Array<ArrayBuffer>): string {
-    return Buffer.from(data).toString('base64url');
+    return Buffer.from(data)
+      .toString('base64')
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replace(/=+$/u, '');
   }
 
   public toHex(data: Uint8Array<ArrayBuffer>): string {

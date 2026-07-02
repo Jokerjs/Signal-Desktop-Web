@@ -27,10 +27,31 @@ import { itemStorage } from '../textsecure/Storage.preload.ts';
 
 const log = createLogger('writeProfile');
 
+type SignalWebRuntimeProfileWriter = typeof window & {
+  SignalWebRuntime?: {
+    writeProfile?: (
+      conversation: ConversationType,
+      options: AvatarUpdateOptionsType
+    ) => Promise<void>;
+  };
+};
+
 export async function writeProfile(
   conversation: ConversationType,
   options: AvatarUpdateOptionsType
 ): Promise<void> {
+  strictAssert(
+    normalizeProfileName(conversation.firstName) != null,
+    'writeProfile: Cannot set an empty profile name'
+  );
+
+  const webProfileWriter = (window as SignalWebRuntimeProfileWriter)
+    .SignalWebRuntime?.writeProfile;
+  if (webProfileWriter) {
+    await webProfileWriter(conversation, options);
+    return;
+  }
+
   // Before we write anything we request the user's profile so that we can
   // have an up-to-date paymentAddress to be able to include it when we write
   const model = window.ConversationController.get(conversation.id);
@@ -53,11 +74,6 @@ export async function writeProfile(
     firstName,
     badges,
   } = conversation;
-
-  strictAssert(
-    normalizeProfileName(firstName) != null,
-    'writeProfile: Cannot set an empty profile name'
-  );
 
   let avatarUpdate: AvatarUpdateType;
   if (options.keepAvatar) {

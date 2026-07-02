@@ -5,7 +5,7 @@ import { usernames } from '@signalapp/libsignal-client';
 
 import type { UserNotFoundModalStateType } from '../state/ducks/globalModals.preload.ts';
 import { createLogger } from '../logging/log.std.ts';
-import type { AciString } from '../types/ServiceId.std.ts';
+import type { AciString, PniString } from '../types/ServiceId.std.ts';
 import * as Errors from '../types/errors.std.ts';
 import { ToastType } from '../types/Toast.dom.tsx';
 import { strictAssert } from './assert.std.ts';
@@ -48,6 +48,12 @@ type FoundUsernameType = {
   username: string;
 };
 
+function isSignalWebRuntime(): boolean {
+  return Boolean(
+    (window as typeof window & { SignalWebRuntime?: unknown }).SignalWebRuntime
+  );
+}
+
 export async function lookupConversationWithoutServiceId(
   options: LookupConversationWithoutServiceIdOptionsType
 ): Promise<string | undefined> {
@@ -71,8 +77,32 @@ export async function lookupConversationWithoutServiceId(
   try {
     let conversationId: string | undefined;
     if (options.type === 'e164') {
+      const doLookup = isSignalWebRuntime()
+        ? async ({
+            acisAndAccessKeys,
+            e164s,
+          }: Parameters<typeof cdsLookup>[0]) => {
+            const { lookupPhoneNumbers } = await import('../web/api.dom.ts');
+            const result = await lookupPhoneNumbers({
+              acisAndAccessKeys: acisAndAccessKeys ?? [],
+              e164s,
+            });
+            return {
+              debugPermitsUsed: result.debugPermitsUsed,
+              entries: new Map(
+                result.entries.map(([e164, entry]) => [
+                  e164,
+                  {
+                    aci: entry.aci as AciString | undefined,
+                    pni: entry.pni as PniString | undefined,
+                  },
+                ])
+              ),
+            };
+          }
+        : cdsLookup;
       const { entries: serverLookup, transformedE164s } =
-        await getServiceIdsForE164s(cdsLookup, [options.e164]);
+        await getServiceIdsForE164s(doLookup, [options.e164]);
       const e164ToUse = transformedE164s.get(options.e164) ?? options.e164;
 
       const maybePair = serverLookup.get(e164ToUse);
@@ -88,7 +118,9 @@ export async function lookupConversationWithoutServiceId(
         conversationId = conversation?.id;
       }
     } else {
-      const foundUsername = await checkForUsername(options.username);
+      const foundUsername = isSignalWebRuntime()
+        ? await checkForUsernameInWeb(options.username)
+        : await checkForUsername(options.username);
       if (foundUsername) {
         const convo = window.ConversationController.lookupOrCreate({
           serviceId: foundUsername.aci,
@@ -136,6 +168,22 @@ export async function lookupConversationWithoutServiceId(
   } finally {
     setIsFetchingUUID(identifier, false);
   }
+}
+
+async function checkForUsernameInWeb(
+  username: string
+): Promise<FoundUsernameType | undefined> {
+  const { lookupUsername } = await import('../web/api.dom.ts');
+  const account = await lookupUsername({ username });
+  if (!account.aci) {
+    log.error("checkForUsernameInWeb: Returned account didn't include a uuid");
+    return;
+  }
+
+  return {
+    aci: account.aci as AciString,
+    username: account.username,
+  };
 }
 
 async function checkForUsername(

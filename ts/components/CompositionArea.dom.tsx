@@ -624,6 +624,7 @@ export const CompositionArea = memo(function CompositionArea({
   }, [setLarge]);
 
   const shouldShowMicrophone =
+    isActive &&
     !large &&
     draftEditMessage == null &&
     !hasDraft({

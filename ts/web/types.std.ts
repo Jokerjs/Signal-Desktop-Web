@@ -17,15 +17,26 @@ import type { PinnedMessage } from '../types/PinnedMessage.std.ts';
 import type { ServiceIdString } from '../types/ServiceId.std.ts';
 import type { GroupV2ChangeType } from '../types/groups.std.ts';
 import type { StoryDistributionIdString } from '../types/StoryDistributionId.std.ts';
+import type { Emoji } from '../axo/emoji.std.ts';
+import type {
+  ConversationColorType,
+  CustomColorType,
+} from '../types/Colors.std.ts';
+import type { DurationInSeconds } from '../util/durations/index.std.ts';
 
 export type WebAccount = Readonly<{
   aci?: string;
+  about?: string;
+  aboutEmoji?: Emoji.Variant;
   pni?: string;
   number?: string;
   phoneNumber?: string;
   title?: string;
   profileName?: string;
   profileFamilyName?: string;
+  firstName?: string;
+  familyName?: string;
+  localProfileUpdatedAt?: number;
   username?: string;
   avatarUrl?: string;
   avatarUrlPath?: string;
@@ -68,13 +79,25 @@ export type ProtocolState = Readonly<{
   preKeys: ReadonlyArray<unknown>;
   signedPreKeys: ReadonlyArray<unknown>;
   kyberPreKeys: ReadonlyArray<unknown>;
-  sessions: ReadonlyArray<unknown>;
-  senderKeys: ReadonlyArray<unknown>;
+  sessions: ReadonlyArray<ProtocolSessionRecord>;
+  senderKeys: ReadonlyArray<ProtocolSenderKeyRecord>;
 }>;
 
 export type IdentityKeyPair = Readonly<{
   publicKey?: string;
   privateKey?: string;
+}>;
+
+export type ProtocolSessionRecord = Readonly<{
+  namespace: string;
+  addressKey: string;
+  recordBase64: string;
+}>;
+
+export type ProtocolSenderKeyRecord = Readonly<{
+  namespace: string;
+  senderKey: string;
+  recordBase64: string;
 }>;
 
 export type LinkedSessionRecord = Readonly<{
@@ -308,7 +331,9 @@ export type WebMessage = Readonly<Partial<Omit<
   deletedForEveryoneByAdminAci?: string;
   deletedForEveryoneTimestamp?: number;
   expirationTimerUpdate?: {
-    expireTimer?: number;
+    expireTimer?: DurationInSeconds;
+    fromSync?: boolean;
+    source?: string;
     sourceServiceId?: string;
   };
   groupV2Change?: GroupV2ChangeType;
@@ -324,10 +349,15 @@ export type WebConversation = Readonly<{
   id: string;
   type?: 'direct' | 'group';
   conversationType?: 'direct' | 'group';
+  about?: string;
+  aboutEmoji?: Emoji.Variant;
+  name?: string;
   title?: string;
   titleNoDefault?: string;
+  titleNoNickname?: string;
   searchableTitle?: string;
   serviceId?: string;
+  pni?: string;
   groupId?: string;
   masterKey?: string;
   publicParams?: string;
@@ -340,14 +370,27 @@ export type WebConversation = Readonly<{
   description?: string;
   phoneNumber?: string;
   e164?: string;
+  expireTimer?: DurationInSeconds;
+  expireTimerVersion?: number;
   profileName?: string;
   profileFamilyName?: string;
+  firstName?: string;
+  familyName?: string;
+  nicknameGivenName?: string;
+  nicknameFamilyName?: string;
+  note?: string;
+  systemGivenName?: string;
+  systemFamilyName?: string;
+  systemNickname?: string;
   profileKey?: string;
   username?: string;
   avatarUrl?: string;
   avatarUrlPath?: string;
   remoteAvatarUrl?: string;
   color?: string;
+  conversationColor?: ConversationColorType;
+  customColor?: CustomColorType;
+  customColorId?: string;
   lastUpdated?: number;
   lastMessage?: Readonly<
     | {
@@ -382,6 +425,8 @@ export type WebConversation = Readonly<{
   messagesDeleted?: boolean;
   left?: boolean;
   markedUnread?: boolean;
+  muteExpiresAt?: number;
+  dontNotifyForMentionsIfMuted?: boolean;
   acceptedMessageRequest?: boolean;
   announcementsOnly?: boolean;
   messageCount?: number;
@@ -395,6 +440,9 @@ export type WebConversation = Readonly<{
   draftBodyRanges?: unknown;
   draftEditMessage?: unknown;
   quotedMessageId?: string;
+  capabilities?: Readonly<{
+    attachmentBackfill?: boolean;
+  }>;
 }>;
 
 export type WebStoryDistributionList = Readonly<{
@@ -464,6 +512,7 @@ type MessageStreamEventPayload =
     }>
   | Readonly<{ type: 'contacts'; contacts: ContactsBootstrap }>
   | Readonly<{ type: 'linked-session-updated'; linkedPayload: LinkedPayload }>
+  | Readonly<{ type: 'protocol-state'; protocol: ProtocolState }>
   | Readonly<{ type: 'contacts-bootstrap'; data: ContactsBootstrap }>
   | Readonly<{ type: 'chat-shell'; state: ChatShellState }>
   | Readonly<{ type: 'conversation'; conversation: WebConversation }>

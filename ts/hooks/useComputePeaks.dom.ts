@@ -13,6 +13,7 @@ import type { PeakType } from '../types/Audio.dom.tsx';
 const { noop } = lodash;
 
 const log = createLogger('useComputePeaks');
+const AUDIO_WAVEFORM_UI_TIMEOUT = 20_000;
 
 type WaveformData = {
   peaks: ReadonlyArray<PeakType>;
@@ -75,6 +76,13 @@ export function useComputePeaks({
   const onCorruptedRef = useRef(onCorrupted);
   onCorruptedRef.current = onCorrupted;
 
+  useEffect(() => {
+    setWaveformData(getCachedWaveformData(audioUrl, barCount, activeDuration));
+    // Changing the active duration should not restart waveform computation.
+    // The downloaded audio URL and the bar count define the actual waveform.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioUrl, barCount]);
+
   // This effect loads audio file and computes its RMS peak for displaying the
   // waveform.
   useEffect(() => {
@@ -100,6 +108,15 @@ export function useComputePeaks({
     log.info('MessageAudio: loading audio and computing waveform');
 
     let canceled = false;
+    let didFinish = false;
+    const timeout = window.setTimeout(() => {
+      if (didFinish || canceled) {
+        return;
+      }
+      canceled = true;
+      log.error('MessageAudio: computePeaks timed out, marking as corrupted');
+      onCorruptedRef.current();
+    }, AUDIO_WAVEFORM_UI_TIMEOUT);
 
     void (async () => {
       try {
@@ -121,11 +138,15 @@ export function useComputePeaks({
         );
 
         onCorruptedRef.current();
+      } finally {
+        didFinish = true;
+        window.clearTimeout(timeout);
       }
     })();
 
     return () => {
       canceled = true;
+      window.clearTimeout(timeout);
     };
   }, [activeDuration, audioUrl, barCount]);
 

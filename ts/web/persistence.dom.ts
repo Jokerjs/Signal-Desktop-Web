@@ -227,19 +227,23 @@ export function loadLinkedSessionRecordFromStorage():
   }
 }
 
+function removeLinkedSessionRecordFromLocalStorage(userId: string | undefined): void {
+  if (userId) {
+    window.localStorage.removeItem(
+      getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE)
+    );
+  }
+  window.localStorage.removeItem(LEGACY_LINKED_SESSION_STORAGE_KEY);
+}
+
 export function persistLinkedSessionToStorage(
   linkedSession: LinkedSessionRecord | undefined
 ): void {
   try {
     if (!linkedSession) {
       const activeUserId = getActiveLinkedSessionUserIdFromStorage();
-      if (activeUserId) {
-        window.localStorage.removeItem(
-          getUserScopedStorageKey(activeUserId, LINKED_SESSION_STORAGE_KEY_BASE)
-        );
-      }
+      removeLinkedSessionRecordFromLocalStorage(activeUserId);
       window.localStorage.removeItem(ACTIVE_LINKED_SESSION_USER_ID_STORAGE_KEY);
-      window.localStorage.removeItem(LEGACY_LINKED_SESSION_STORAGE_KEY);
       return;
     }
 
@@ -248,13 +252,8 @@ export function persistLinkedSessionToStorage(
       return;
     }
 
-    const { protocol: _protocol, ...storedLinkedSession } = linkedSession;
     window.localStorage.setItem(ACTIVE_LINKED_SESSION_USER_ID_STORAGE_KEY, userId);
-    window.localStorage.setItem(
-      getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE),
-      JSON.stringify(storedLinkedSession)
-    );
-    window.localStorage.removeItem(LEGACY_LINKED_SESSION_STORAGE_KEY);
+    removeLinkedSessionRecordFromLocalStorage(userId);
   } catch {
   }
 }
@@ -281,10 +280,9 @@ export async function persistLinkedSessionRecordToIndexedDb(
       return;
     }
 
-    const { protocol: _protocol, ...storedSession } = linkedSession;
     sessionStore.delete(CURRENT_LINKED_SESSION_ID);
     sessionStore.put({
-      ...storedSession,
+      ...linkedSession,
       id: getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE),
     });
     await transactionToPromise(transaction);
@@ -304,17 +302,12 @@ export async function loadLinkedSessionRecordFromIndexedDb(): Promise<
     const activeUserId = getActiveLinkedSessionUserIdFromStorage();
     const transaction = database.transaction(SESSION_STORE_NAME, 'readonly');
     const sessionStore = transaction.objectStore(SESSION_STORE_NAME);
-    let storedSession: Omit<LinkedSessionRecord, 'protocol'> | undefined;
+    let storedSession: LinkedSessionRecord | undefined;
     if (activeUserId) {
       storedSession = await requestToPromise(
         sessionStore.get(
           getUserScopedStorageKey(activeUserId, LINKED_SESSION_STORAGE_KEY_BASE)
         )
-      );
-    }
-    if (!storedSession) {
-      storedSession = await requestToPromise(
-        sessionStore.get(CURRENT_LINKED_SESSION_ID)
       );
     }
     await transactionToPromise(transaction);
@@ -323,9 +316,9 @@ export async function loadLinkedSessionRecordFromIndexedDb(): Promise<
     }
     const linkedSession = {
       ...storedSession,
-      protocol: createProtocolStateFromLinkedPayload(
-        storedSession.linkedPayload
-      ),
+      protocol:
+        storedSession.protocol ??
+        createProtocolStateFromLinkedPayload(storedSession.linkedPayload),
     };
     return isLinkedSessionReady(linkedSession) ? linkedSession : undefined;
   } finally {
@@ -348,19 +341,11 @@ function getScopedChatShellStorageKey(sessionAci: string): string {
   return getUserScopedStorageKey(sessionAci, CHAT_SHELL_STORAGE_KEY_BASE);
 }
 
-function persistChatShellStateToLocalStorage(
-  chatShellState: ChatShellState,
-  sessionAci: string
-): void {
+function removeChatShellStateFromLocalStorage(sessionAci: string): void {
   try {
     const scopedKey = getScopedChatShellStorageKey(sessionAci);
-    const stored: StoredChatShellState = {
-      version: 4,
-      sessionAci: scopedKey,
-      state: chatShellState,
-      updatedAt: Date.now(),
-    };
-    window.localStorage.setItem(scopedKey, JSON.stringify(stored));
+    window.localStorage.removeItem(scopedKey);
+    window.localStorage.removeItem(sessionAci);
   } catch {
   }
 }
@@ -475,9 +460,6 @@ export async function persistChatShellStateToStorage(
   sessionAci: string | undefined
 ): Promise<void> {
   const normalizedSessionAci = getSessionKey(sessionAci);
-  if (normalizedSessionAci) {
-    persistChatShellStateToLocalStorage(chatShellState, normalizedSessionAci);
-  }
   const database = await openRenderPersistenceDatabase();
   if (!normalizedSessionAci || !database) {
     return;
@@ -491,6 +473,7 @@ export async function persistChatShellStateToStorage(
       updatedAt: Date.now(),
     });
     await transactionToPromise(transaction);
+    removeChatShellStateFromLocalStorage(normalizedSessionAci);
   } finally {
     database.close();
   }
@@ -500,10 +483,10 @@ export async function loadChatShellStateForSession(
   sessionAci: string | undefined
 ): Promise<ChatShellState | undefined> {
   const normalizedSessionAci = getSessionKey(sessionAci);
+  const database = await openRenderPersistenceDatabase();
   const localStored = normalizedSessionAci
     ? loadChatShellStateFromLocalStorage(normalizedSessionAci)
     : undefined;
-  const database = await openRenderPersistenceDatabase();
   if (!normalizedSessionAci || !database) {
     return localStored?.state
       ? recoverRetriableAttachmentStates(localStored.state)
@@ -518,15 +501,70 @@ export async function loadChatShellStateForSession(
       (await requestToPromise(store.get(normalizedSessionAci)));
     await transactionToPromise(transaction);
     const indexedStored = indexedDbStored as StoredChatShellState | undefined;
-    if (
-      localStored &&
-      (!indexedStored || localStored.updatedAt >= indexedStored.updatedAt)
-    ) {
-      return recoverRetriableAttachmentStates(localStored.state);
+    if (indexedStored?.state) {
+      removeChatShellStateFromLocalStorage(normalizedSessionAci);
+      return recoverRetriableAttachmentStates(indexedStored.state);
     }
-    return indexedStored?.state
-      ? recoverRetriableAttachmentStates(indexedStored.state)
-      : undefined;
+    if (localStored?.state) {
+      const recovered = recoverRetriableAttachmentStates(localStored.state);
+      const writeTransaction = database.transaction(
+        CHAT_SHELL_STORE_NAME,
+        'readwrite'
+      );
+      writeTransaction.objectStore(CHAT_SHELL_STORE_NAME).put({
+        version: 4,
+        sessionAci: scopedKey,
+        state: recovered,
+        updatedAt: Date.now(),
+      });
+      await transactionToPromise(writeTransaction);
+      removeChatShellStateFromLocalStorage(normalizedSessionAci);
+      return recovered;
+    }
+    return undefined;
+  } finally {
+    database.close();
+  }
+}
+
+export async function clearChatShellStateForSession(
+  sessionAci: string | undefined
+): Promise<void> {
+  const normalizedSessionAci = getSessionKey(sessionAci);
+  if (!normalizedSessionAci) {
+    return;
+  }
+
+  const chatShellStorageKey = getScopedChatShellStorageKey(normalizedSessionAci);
+  const contactsBootstrapStorageKey = getUserScopedStorageKey(
+    normalizedSessionAci,
+    CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE
+  );
+  removeChatShellStateFromLocalStorage(normalizedSessionAci);
+  try {
+    window.localStorage.removeItem(contactsBootstrapStorageKey);
+  } catch {
+  }
+
+  const database = await openRenderPersistenceDatabase();
+  if (!database) {
+    return;
+  }
+
+  try {
+    const transaction = database.transaction(
+      [CHAT_SHELL_STORE_NAME, CONTACTS_BOOTSTRAP_STORE_NAME],
+      'readwrite'
+    );
+    transaction.objectStore(CHAT_SHELL_STORE_NAME).delete(chatShellStorageKey);
+    transaction.objectStore(CHAT_SHELL_STORE_NAME).delete(normalizedSessionAci);
+    transaction
+      .objectStore(CONTACTS_BOOTSTRAP_STORE_NAME)
+      .delete(contactsBootstrapStorageKey);
+    transaction
+      .objectStore(CONTACTS_BOOTSTRAP_STORE_NAME)
+      .delete(normalizedSessionAci);
+    await transactionToPromise(transaction);
   } finally {
     database.close();
   }

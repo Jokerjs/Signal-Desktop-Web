@@ -12,7 +12,7 @@ import {
 } from 'react';
 import classNames from 'classnames';
 import lodash from 'lodash';
-import { Manager, Reference, Popper } from 'react-popper';
+import { usePopper } from 'react-popper';
 import type { StrictModifiers } from '@popperjs/core';
 import { createPortal } from 'react-dom';
 import type { Theme } from '../util/theme.std.ts';
@@ -120,12 +120,59 @@ export function Tooltip({
 }: PropsType): JSX.Element {
   const timeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
   const [active, setActive] = useState(false);
+  const [referenceElement, setReferenceElement] =
+    useState<HTMLSpanElement | null>(null);
+  const [popperElement, setPopperElement] = useState<HTMLDivElement | null>(
+    null
+  );
+  const [arrowElement, setArrowElement] = useState<HTMLDivElement | null>(null);
 
   const showTooltip = active || Boolean(sticky);
+  const popperPlacement = direction ?? TooltipPlacement.Bottom;
+  const popper = usePopper(referenceElement, popperElement, {
+    placement: popperPlacement,
+    modifiers: [
+      offsetDistanceModifier(12),
+      {
+        name: 'arrow',
+        options: {
+          element: arrowElement,
+        },
+      },
+      ...popperModifiers,
+    ],
+  });
 
   const tooltipThemeClassName = theme
     ? `module-tooltip--${themeClassName(theme)}`
     : undefined;
+
+  useEffect(() => {
+    const update = popper.update;
+
+    if (!showTooltip || !update) {
+      return noop;
+    }
+
+    let firstFrame: number | undefined;
+    let secondFrame: number | undefined;
+
+    firstFrame = requestAnimationFrame(() => {
+      void update();
+      secondFrame = requestAnimationFrame(() => {
+        void update();
+      });
+    });
+
+    return () => {
+      if (firstFrame != null) {
+        cancelAnimationFrame(firstFrame);
+      }
+      if (secondFrame != null) {
+        cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [popper.update, showTooltip]);
 
   function handleHoverChanged(hovering: boolean) {
     // Don't accept updates that aren't valid anymore
@@ -167,49 +214,42 @@ export function Tooltip({
   }
 
   return (
-    <Manager>
-      <Reference>
-        {({ ref }) => (
-          <TooltipEventWrapper
-            className={wrapperClassName}
-            ref={ref}
-            onHoverChanged={handleHoverChanged}
-          >
-            {children}
-          </TooltipEventWrapper>
-        )}
-      </Reference>
-      {createPortal(
-        <Popper
-          placement={direction}
-          modifiers={[offsetDistanceModifier(12), ...popperModifiers]}
-        >
-          {({ arrowProps, placement, ref, style }) =>
-            showTooltip && (
-              <div
-                className={classNames(
-                  'module-tooltip',
-                  tooltipThemeClassName,
-                  className
-                )}
-                ref={ref}
-                style={style}
-                data-placement={placement}
-              >
-                {content}
-                {!hideArrow ? (
-                  <div
-                    className="module-tooltip-arrow"
-                    ref={arrowProps.ref}
-                    style={arrowProps.style}
-                  />
-                ) : null}
-              </div>
-            )
-          }
-        </Popper>,
-        document.body
-      )}
-    </Manager>
+    <>
+      <TooltipEventWrapper
+        className={wrapperClassName}
+        ref={setReferenceElement}
+        onHoverChanged={handleHoverChanged}
+      >
+        {children}
+      </TooltipEventWrapper>
+      {showTooltip
+        ? createPortal(
+            <div
+              className={classNames(
+                'module-tooltip',
+                tooltipThemeClassName,
+                className
+              )}
+              ref={setPopperElement}
+              style={popper.styles.popper}
+              data-placement={
+                popper.attributes.popper?.['data-popper-placement'] ??
+                popperPlacement
+              }
+              {...popper.attributes.popper}
+            >
+              {content}
+              {!hideArrow ? (
+                <div
+                  className="module-tooltip-arrow"
+                  ref={setArrowElement}
+                  style={popper.styles.arrow}
+                />
+              ) : null}
+            </div>,
+            document.body
+          )
+        : null}
+    </>
   );
 }

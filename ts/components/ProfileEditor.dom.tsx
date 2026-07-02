@@ -242,6 +242,38 @@ export function ProfileEditor({
     return Emoji.ignorePreferredSkinTone(stagedProfile.aboutEmoji);
   }, [stagedProfile.aboutEmoji]);
 
+  useEffect(() => {
+    if (editState === ProfileEditorPage.ProfileName) {
+      return;
+    }
+
+    setFullName({
+      familyName,
+      firstName,
+    });
+    setStagedProfile(profileData => ({
+      ...profileData,
+      familyName,
+      firstName,
+    }));
+  }, [editState, familyName, firstName]);
+
+  useEffect(() => {
+    if (editState === ProfileEditorPage.Bio) {
+      return;
+    }
+
+    setFullBio({
+      aboutEmoji,
+      aboutText,
+    });
+    setStagedProfile(profileData => ({
+      ...profileData,
+      aboutEmoji,
+      aboutText,
+    }));
+  }, [aboutEmoji, aboutText, editState]);
+
   // Reset username edit state when leaving
   useEffect(() => {
     return () => {
@@ -867,6 +899,7 @@ function UsernameLinkTooltip({
     config: { mass: 1, tension: 280, friction: 25 },
     delay: 200,
   });
+
   const tooltip = (
     <animated.div
       className="ProfileEditor__username-link__tooltip__container"

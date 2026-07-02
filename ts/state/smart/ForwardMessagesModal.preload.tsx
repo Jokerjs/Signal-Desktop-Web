@@ -132,6 +132,9 @@ function SmartForwardMessagesModalInner({
       conversationIds: ReadonlyArray<string>,
       finalDrafts: ReadonlyArray<MessageForwardDraft>
     ) => {
+      closeModal();
+      forwardMessagesProps?.onForward?.();
+
       try {
         const messages = await Promise.all(
           finalDrafts.map(async (draft): Promise<ForwardMessageData> => {
@@ -157,20 +160,10 @@ function SmartForwardMessagesModalInner({
           }
         ).SignalWebRuntime?.forwardMessages?.(conversationIds, finalDrafts);
         if (didForwardInWeb) {
-          closeModal();
-          forwardMessagesProps?.onForward?.();
           return;
         }
 
-        const didForwardSuccessfully = await maybeForwardMessages(
-          messages,
-          conversationIds
-        );
-
-        if (didForwardSuccessfully) {
-          closeModal();
-          forwardMessagesProps?.onForward?.();
-        }
+        await maybeForwardMessages(messages, conversationIds);
       } catch (err) {
         log.warn('doForwardMessage', Errors.toLogFormat(err));
       }
