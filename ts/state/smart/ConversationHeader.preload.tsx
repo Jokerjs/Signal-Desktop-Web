@@ -68,6 +68,7 @@ function renderPinnedMessagesBar(): JSX.Element {
 }
 
 export type OwnProps = {
+  hideOutgoingCallButtons?: boolean;
   id: string;
 };
 
@@ -106,6 +107,7 @@ const useOutgoingCallButtonStyle = (
 };
 
 export const SmartConversationHeader = memo(function SmartConversationHeader({
+  hideOutgoingCallButtons,
   id,
 }: OwnProps) {
   const conversationSelector = useSelector(getConversationSelector);
@@ -329,7 +331,11 @@ export const SmartConversationHeader = memo(function SmartConversationHeader({
       onViewConversationDetails={onViewConversationDetails}
       onViewAllMedia={onViewAllMedia}
       onViewUserStories={onViewUserStories}
-      outgoingCallButtonStyle={outgoingCallButtonStyle}
+      outgoingCallButtonStyle={
+        hideOutgoingCallButtons
+          ? OutgoingCallButtonStyle.None
+          : outgoingCallButtonStyle
+      }
       theme={theme}
       contactSpoofingWarning={contactSpoofingWarning}
       renderCollidingAvatars={renderCollidingAvatars}

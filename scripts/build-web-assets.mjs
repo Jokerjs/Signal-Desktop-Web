@@ -11,7 +11,7 @@ const outDir = join(root, 'web-dist');
 await mkdir(outDir, { recursive: true });
 await mkdir(join(outDir, 'stylesheets'), { recursive: true });
 
-for (const file of ['runtime-config.js', 'web.css']) {
+for (const file of ['runtime-config.js', 'web.css', 'chrome108-fallback.css']) {
   await copyFile(join(root, 'web', file), join(outDir, file));
 }
 
@@ -21,6 +21,10 @@ await writeFile(
   join(outDir, 'index.html'),
   indexHtml
     .replace('./web.css"', `./web.css?v=${assetVersion}"`)
+    .replace(
+      './chrome108-fallback.css"',
+      `./chrome108-fallback.css?v=${assetVersion}"`
+    )
     .replace('./render.bundle.js"', `./render.bundle.js?v=${assetVersion}"`)
 );
 

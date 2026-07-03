@@ -12,10 +12,14 @@ import { renderClearingDataView } from '../../shims/renderClearingDataView.prelo
 
 type SmartRelinkDialogProps = Readonly<{
   containerWidthBreakpoint: WidthBreakpoint;
+  relinkDeviceOverride?: () => void;
+  renderClearingDataViewOverride?: () => void;
 }>;
 
 export const SmartRelinkDialog = memo(function SmartRelinkDialog({
   containerWidthBreakpoint,
+  relinkDeviceOverride,
+  renderClearingDataViewOverride,
 }: SmartRelinkDialogProps) {
   const i18n = useSelector(getIntl);
   const { relinkDevice, reregister } = useNetworkActions();
@@ -25,9 +29,11 @@ export const SmartRelinkDialog = memo(function SmartRelinkDialog({
     <DialogRelink
       i18n={i18n}
       containerWidthBreakpoint={containerWidthBreakpoint}
-      relinkDevice={relinkDevice}
-      renderClearingDataView={renderClearingDataView}
-      reregister={reregister}
+      relinkDevice={relinkDeviceOverride ?? relinkDevice}
+      renderClearingDataView={
+        renderClearingDataViewOverride ?? renderClearingDataView
+      }
+      reregister={relinkDeviceOverride ?? reregister}
       weArePrimaryDevice={weArePrimaryDevice}
     />
   );

@@ -17,6 +17,7 @@ import {
   sendGroupTextMessage,
   sendMessageRequestResponseSync,
   updateConversationArchive,
+  updateConversationMarkedUnread,
   updateConversationMute,
   updateConversationPin,
 } from '../api.dom.ts';
@@ -1738,7 +1739,20 @@ class WebConversationModel {
   }
 
   public setMarkedUnread(markedUnread: boolean): void {
-    this.set('markedUnread', markedUnread);
+    if (Boolean(this.attributes.markedUnread) === markedUnread) {
+      return;
+    }
+
+    this.set({ markedUnread });
+    void updateConversationMarkedUnread({
+      conversationId: this.id,
+      markedUnread,
+    }).catch(error => {
+      console.error(
+        'setMarkedUnread: failed to sync marked unread state to storage service',
+        error
+      );
+    });
   }
 
   public setArchived(isArchived: boolean): void {

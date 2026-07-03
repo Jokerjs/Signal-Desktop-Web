@@ -85,6 +85,7 @@ import { importEphemeralBackup } from './WebBackupImportBridge.node.ts';
 import {
   syncStorageContacts,
   updateStorageConversationArchive,
+  updateStorageConversationMarkedUnread,
   updateStorageConversationMute,
   updateStoragePinnedConversations,
 } from './WebStorageContactsSync.node.ts';
@@ -5556,6 +5557,43 @@ async function handleConversationMute(
   sendJson(req, res, 200, result);
 }
 
+async function handleConversationMarkedUnread(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const conversationId =
+    typeof body.conversationId === 'string' ? body.conversationId : undefined;
+  const markedUnread =
+    typeof body.markedUnread === 'boolean' ? body.markedUnread : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!conversationId || markedUnread == null) {
+    sendText(req, res, 400, 'Missing conversationId or markedUnread');
+    return;
+  }
+
+  const result = await updateStorageConversationMarkedUnread({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    chat: streamSession.connection,
+    conversationId,
+    linkedPayload: streamSession.linkedPayload,
+    markedUnread,
+    storageUrl: productionConfig.storageUrl,
+  });
+  await sendFetchStorageManifestSync({
+    chat: streamSession.connection,
+    linkedPayload: streamSession.linkedPayload,
+    timestamp: now(),
+  });
+  sendJson(req, res, 200, result);
+}
+
 async function handleConversationPin(
   req: IncomingMessage,
   res: ServerResponse
@@ -6069,6 +6107,14 @@ async function handleRequest(
 
   if (req.method === 'POST' && url.pathname === '/conversations/mute') {
     await handleConversationMute(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/conversations/marked-unread'
+  ) {
+    await handleConversationMarkedUnread(req, res);
     return;
   }
 

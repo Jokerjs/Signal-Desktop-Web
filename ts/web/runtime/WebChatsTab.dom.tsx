@@ -27,6 +27,7 @@ import { AttachmentList } from '../../components/conversation/AttachmentList.dom
 import { ConversationView } from '../../components/conversation/ConversationView.dom.tsx';
 import { useContactNameData } from '../../components/conversation/ContactName.dom.tsx';
 import { MessageRequestActions } from '../../components/conversation/MessageRequestActions.dom.tsx';
+import { DialogRelink } from '../../components/DialogRelink.dom.tsx';
 import { Quote } from '../../components/conversation/Quote.dom.tsx';
 import SelectModeActions from '../../components/conversation/SelectModeActions.dom.tsx';
 import { ForwardMessagesModalType } from '../../components/ForwardMessagesModal.dom.tsx';
@@ -36,6 +37,7 @@ import { FunPicker } from '../../components/fun/FunPicker.dom.tsx';
 import type { FunEmojiSelection } from '../../components/fun/panels/FunPanelEmojis.dom.tsx';
 import type { FunStickerSelection } from '../../components/fun/panels/FunPanelStickers.dom.tsx';
 import type { NavTabPanelProps } from '../../components/NavTabs.dom.tsx';
+import type { WidthBreakpoint } from '../../components/_util.std.ts';
 import { AxoDropdownMenu } from '../../axo/AxoDropdownMenu.dom.tsx';
 import { AxoIconButton } from '../../axo/AxoIconButton.dom.tsx';
 import type { DraftEditMessageType } from '../../model-types.d.ts';
@@ -67,6 +69,7 @@ import { getPreferredBadgeSelector } from '../../state/selectors/badges.preload.
 import { getComposerStateForConversationIdSelector } from '../../state/selectors/composer.preload.ts';
 import {
   getConversationSelector,
+  getLeftPaneLists,
   getMessages,
   getOtherTabsUnreadStats,
   getSelectedMessageIds,
@@ -172,7 +175,9 @@ function canvasToJpegBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
 async function getVideoDraftMetadata(
   file: File,
   url: string
-): Promise<Pick<WebAttachment, 'thumbnail' | 'thumbnailUrl' | 'width' | 'height'>> {
+): Promise<
+  Pick<WebAttachment, 'thumbnail' | 'thumbnailUrl' | 'width' | 'height'>
+> {
   return new Promise(resolve => {
     const video = document.createElement('video');
     video.muted = true;
@@ -287,8 +292,74 @@ function getWebQuoteForSend(
   } as unknown as WebMessage['quote'];
 }
 
-function renderLeftPane(props: NavTabPanelProps) {
-  return <SmartLeftPane {...props} />;
+type WebRelinkDialogProps = Readonly<{
+  containerWidthBreakpoint: WidthBreakpoint;
+  onRelinkDevice: () => void;
+}>;
+
+function WebRelinkDialog({
+  containerWidthBreakpoint,
+  onRelinkDevice,
+}: WebRelinkDialogProps): JSX.Element {
+  const i18n = useSelector(getIntl);
+
+  return (
+    <DialogRelink
+      containerWidthBreakpoint={containerWidthBreakpoint}
+      i18n={i18n}
+      relinkDevice={onRelinkDevice}
+      renderClearingDataView={onRelinkDevice}
+      reregister={onRelinkDevice}
+      weArePrimaryDevice={false}
+    />
+  );
+}
+
+function WebLeftPane({
+  forceRelinkDialog,
+  onRelinkDevice,
+  ...props
+}: NavTabPanelProps &
+  Readonly<{
+    forceRelinkDialog: boolean;
+    onRelinkDevice: () => void;
+  }>): JSX.Element {
+  const { conversations, pinnedConversations } = useSelector(getLeftPaneLists);
+  const leftPaneLayoutKey = useMemo(
+    () =>
+      [
+        pinnedConversations.map(conversation => conversation.id).join(','),
+        conversations.length,
+        pinnedConversations.length > 0 && conversations.length > 0
+          ? 'with-chat-header'
+          : 'without-chat-header',
+      ].join('|'),
+    [conversations, pinnedConversations]
+  );
+
+  return (
+    <SmartLeftPane
+      key={leftPaneLayoutKey}
+      forceRelinkDialog={forceRelinkDialog}
+      renderRelinkDialogOverride={dialogProps => (
+        <WebRelinkDialog
+          {...dialogProps}
+          onRelinkDevice={onRelinkDevice}
+        />
+      )}
+      {...props}
+    />
+  );
+}
+
+function renderLeftPane(
+  props: NavTabPanelProps,
+  options: Readonly<{
+    forceRelinkDialog: boolean;
+    onRelinkDevice: () => void;
+  }>
+): JSX.Element {
+  return <WebLeftPane {...props} {...options} />;
 }
 
 function renderMiniPlayer(): JSX.Element {
@@ -472,7 +543,8 @@ function WebCompositionArea({
           ...uploadedAttachment,
           id: uploadedAttachment?.id ?? attachment.id,
           clientUuid: attachment.clientUuid ?? uploadedAttachment?.clientUuid,
-          contentType: attachment.contentType ?? uploadedAttachment?.contentType,
+          contentType:
+            attachment.contentType ?? uploadedAttachment?.contentType,
           fileName:
             attachment.fileName === undefined
               ? uploadedAttachment?.fileName
@@ -566,126 +638,226 @@ function WebCompositionArea({
     };
   }, [draftEditMessage]);
 
-	  const send = useCallback((
-	    message: string,
-	    timestamp: number,
-	    attachmentOverride?: ReadonlyArray<WebAttachment>
-	  ): boolean => {
-    if (isSending) {
-      return false;
-    }
-    const body = message.trim();
-    const attachments = attachmentOverride ?? pendingAttachments;
-    const credentials = linkedSession.credentials;
-    if ((!body && attachments.length === 0) || !credentials) {
-      return false;
-    }
+  const send = useCallback(
+    (
+      message: string,
+      timestamp: number,
+      attachmentOverride?: ReadonlyArray<WebAttachment>
+    ): boolean => {
+      if (isSending) {
+        return false;
+      }
+      const body = message.trim();
+      const attachments = attachmentOverride ?? pendingAttachments;
+      const credentials = linkedSession.credentials;
+      if ((!body && attachments.length === 0) || !credentials) {
+        return false;
+      }
 
-    const conversation = shell.conversationLookup[conversationId];
-    if (!conversation) {
-      return false;
-    }
+      const conversation = shell.conversationLookup[conversationId];
+      if (!conversation) {
+        return false;
+      }
 
-	    setIsSending(true);
+      setIsSending(true);
 
-	    void (async () => {
-	      try {
-        if (draftEditMessage) {
-          const updatedAt = Date.now();
-          const targetMessage = shell.messages.find(
-            item => item.id === draftEditMessage.targetMessageId
-          );
-          if (!targetMessage) {
-            throw new Error('Web edit failed: target message was not found');
-          }
-          if (
-            conversation.type === 'group' ||
-            conversation.conversationType === 'group'
-          ) {
-            throw new Error('Web group message edit is not wired to the bridge yet');
-          }
-          await sendDirectEditMessage({
-            runtimeSessionId: messageRuntimeSessionId,
-            destinationServiceId: conversation.serviceId ?? conversation.id,
-            body,
-            targetTimestamp: targetMessage.timestamp,
-            timestamp: updatedAt,
-          });
-          setShell(current => {
-            const existingMessage = current.messages.find(
+      void (async () => {
+        try {
+          if (draftEditMessage) {
+            const updatedAt = Date.now();
+            const targetMessage = shell.messages.find(
               item => item.id === draftEditMessage.targetMessageId
             );
-            if (!existingMessage) {
-              return current;
+            if (!targetMessage) {
+              throw new Error('Web edit failed: target message was not found');
             }
-            const previousEditHistory = existingMessage.editHistory ?? [];
-            const originalMessageHistory =
-              previousEditHistory.length === 0
-                ? [
-                    {
-                      body: existingMessage.body,
-                      timestamp: existingMessage.timestamp,
-                      received_at:
-                        existingMessage.receivedAt ?? existingMessage.timestamp,
-                      received_at_ms:
-                        existingMessage.receivedAt ?? existingMessage.timestamp,
-                      serverTimestamp: existingMessage.timestamp,
-                    },
-                  ]
-                : previousEditHistory;
-            const updatedMessage: WebMessage = {
-              ...existingMessage,
+            if (
+              conversation.type === 'group' ||
+              conversation.conversationType === 'group'
+            ) {
+              throw new Error(
+                'Web group message edit is not wired to the bridge yet'
+              );
+            }
+            await sendDirectEditMessage({
+              runtimeSessionId: messageRuntimeSessionId,
+              destinationServiceId: conversation.serviceId ?? conversation.id,
               body,
-              editHistory: [
-                {
-                  body,
-                  timestamp: updatedAt,
-                  received_at: updatedAt,
-                  received_at_ms: updatedAt,
-                  serverTimestamp: updatedAt,
+              targetTimestamp: targetMessage.timestamp,
+              timestamp: updatedAt,
+            });
+            setShell(current => {
+              const existingMessage = current.messages.find(
+                item => item.id === draftEditMessage.targetMessageId
+              );
+              if (!existingMessage) {
+                return current;
+              }
+              const previousEditHistory = existingMessage.editHistory ?? [];
+              const originalMessageHistory =
+                previousEditHistory.length === 0
+                  ? [
+                      {
+                        body: existingMessage.body,
+                        timestamp: existingMessage.timestamp,
+                        received_at:
+                          existingMessage.receivedAt ??
+                          existingMessage.timestamp,
+                        received_at_ms:
+                          existingMessage.receivedAt ??
+                          existingMessage.timestamp,
+                        serverTimestamp: existingMessage.timestamp,
+                      },
+                    ]
+                  : previousEditHistory;
+              const updatedMessage: WebMessage = {
+                ...existingMessage,
+                body,
+                editHistory: [
+                  {
+                    body,
+                    timestamp: updatedAt,
+                    received_at: updatedAt,
+                    received_at_ms: updatedAt,
+                    serverTimestamp: updatedAt,
+                  },
+                  ...originalMessageHistory,
+                ],
+                editMessageTimestamp: updatedAt,
+                editMessageReceivedAt: updatedAt,
+                editMessageReceivedAtMs: updatedAt,
+                timestamp: existingMessage.timestamp,
+              };
+              const currentConversation =
+                current.conversationLookup[conversationId] ?? conversation;
+              const isNewestInConversation = current.messages.every(item => {
+                return (
+                  item.conversationId !== conversationId ||
+                  item.id === existingMessage.id ||
+                  compareWebMessages(item, existingMessage) <= 0
+                );
+              });
+              const nextShell = {
+                ...current,
+                messages: current.messages.map(item =>
+                  item.id === draftEditMessage.targetMessageId
+                    ? updatedMessage
+                    : item
+                ),
+                conversationLookup: {
+                  ...current.conversationLookup,
+                  [conversationId]: {
+                    ...currentConversation,
+                    draftBodyRanges: undefined,
+                    draftEditMessage: undefined,
+                    ...(isNewestInConversation
+                      ? {
+                          lastMessage: getWebConversationLastMessage(
+                            updatedMessage,
+                            credentials.aci
+                          ),
+                          lastUpdated: updatedAt,
+                          snippet:
+                            getWebMessagePreviewText(updatedMessage) ||
+                            currentConversation.snippet,
+                        }
+                      : null),
+                  },
                 },
-                ...originalMessageHistory,
-              ],
-              editMessageTimestamp: updatedAt,
-              editMessageReceivedAt: updatedAt,
-              editMessageReceivedAtMs: updatedAt,
-              timestamp: existingMessage.timestamp,
-            };
+              };
+              setWebRuntimeChatShell(nextShell);
+              void persistChatShellStateToStorage(
+                nextShell,
+                linkedSession.credentials?.aci
+              );
+              registerMessageInCache(updatedMessage);
+              window.reduxActions?.conversations?.messageChanged?.(
+                updatedMessage.id,
+                updatedMessage.conversationId,
+                toDesktopMessage(updatedMessage)
+              );
+              const nextConversation =
+                nextShell.conversationLookup[conversationId];
+              if (nextConversation) {
+                window.reduxActions?.conversations?.conversationsUpdated?.([
+                  toDesktopConversation(
+                    nextConversation,
+                    linkedSession
+                  ) as never,
+                ]);
+              }
+              return nextShell;
+            });
+            discardEditMessage(conversationId);
+            inputApi.current?.reset();
+            setDraftText('');
+            setDirty(false);
+            setSendCounter(current => current + 1);
+            return;
+          }
+
+          if (isLeftGroup) {
+            showToast({ toastType: ToastType.LeftGroup });
+            return;
+          }
+          const isSendTargetGroupConversation =
+            conversation.type === 'group' ||
+            conversation.conversationType === 'group';
+          const destinationServiceId =
+            conversation.serviceId ?? conversation.id;
+          const localMessageDestinationId = isSendTargetGroupConversation
+            ? (conversation.groupId ?? conversation.id)
+            : destinationServiceId;
+          const localMessageId = `sent:${localMessageDestinationId}:${timestamp}`;
+          const quote = getWebQuoteForSend(quotedMessage);
+          const submittedAttachmentIds = new Set(
+            attachments.map(attachment => attachment.id).filter(Boolean)
+          );
+          const optimisticMessage: WebMessage = {
+            id: localMessageId,
+            attachments,
+            body,
+            conversationId,
+            direction: 'outgoing',
+            isViewOnce: isViewOnceActive,
+            receivedAt: timestamp,
+            sourceServiceId: credentials.aci,
+            status: 'queued',
+            timestamp,
+            quote,
+          };
+
+          setShell(current => {
             const currentConversation =
               current.conversationLookup[conversationId] ?? conversation;
-            const isNewestInConversation = current.messages.every(item => {
-              return (
-                item.conversationId !== conversationId ||
-                item.id === existingMessage.id ||
-                compareWebMessages(item, existingMessage) <= 0
-              );
-            });
+            const lastMessage = getWebConversationLastMessage(
+              optimisticMessage,
+              credentials.aci
+            );
+            const previewText = getWebMessagePreviewText(optimisticMessage);
+            const updatedConversation = {
+              ...currentConversation,
+              activeAt: timestamp,
+              hasMessages: true,
+              inboxPosition: timestamp,
+              lastMessage,
+              lastMessageReceivedAt: timestamp,
+              lastMessageReceivedAtMs: timestamp,
+              lastUpdated: timestamp,
+              messageCount: (currentConversation.messageCount ?? 0) + 1,
+              sentMessageCount: (currentConversation.sentMessageCount ?? 0) + 1,
+              snippet: previewText || currentConversation.snippet,
+              timestamp,
+            };
             const nextShell = {
               ...current,
-              messages: current.messages.map(item =>
-                item.id === draftEditMessage.targetMessageId
-                  ? updatedMessage
-                  : item
-              ),
+              messages: [
+                ...current.messages.filter(item => item.id !== localMessageId),
+                optimisticMessage,
+              ].sort(compareWebMessages),
               conversationLookup: {
                 ...current.conversationLookup,
-                [conversationId]: {
-                  ...currentConversation,
-                  draftBodyRanges: undefined,
-                  draftEditMessage: undefined,
-                  ...(isNewestInConversation
-                    ? {
-                        lastMessage: getWebConversationLastMessage(
-                          updatedMessage,
-                          credentials.aci
-                        ),
-                        lastUpdated: updatedAt,
-                        snippet:
-                          getWebMessagePreviewText(updatedMessage) ||
-                          currentConversation.snippet,
-                      }
-                    : null),
-                },
+                [conversationId]: updatedConversation,
               },
             };
             setWebRuntimeChatShell(nextShell);
@@ -693,315 +865,239 @@ function WebCompositionArea({
               nextShell,
               linkedSession.credentials?.aci
             );
-            registerMessageInCache(updatedMessage);
-            window.reduxActions?.conversations?.messageChanged?.(
-              updatedMessage.id,
-              updatedMessage.conversationId,
-              toDesktopMessage(updatedMessage)
-            );
-            const nextConversation = nextShell.conversationLookup[conversationId];
-            if (nextConversation) {
-              window.reduxActions?.conversations?.conversationsUpdated?.([
-                toDesktopConversation(nextConversation, linkedSession) as never,
-              ]);
-            }
+            window.reduxActions?.conversations?.conversationsUpdated?.([
+              toDesktopConversation(
+                updatedConversation,
+                linkedSession
+              ) as never,
+            ]);
             return nextShell;
           });
-          discardEditMessage(conversationId);
+          registerMessageInCache(optimisticMessage);
+          window.reduxActions?.conversations?.messagesAdded?.({
+            conversationId: optimisticMessage.conversationId,
+            isActive: document.visibilityState === 'visible',
+            isJustSent: true,
+            isNewMessage: true,
+            messages: [toDesktopMessage(optimisticMessage)],
+          });
           inputApi.current?.reset();
           setDraftText('');
           setDirty(false);
           setSendCounter(current => current + 1);
-          return;
-        }
+          setIsViewOnce(false);
+          if (!attachmentOverride && submittedAttachmentIds.size > 0) {
+            setPendingAttachments(current =>
+              current.filter(
+                attachment => !submittedAttachmentIds.has(attachment.id)
+              )
+            );
+          }
 
-        if (isLeftGroup) {
-          showToast({ toastType: ToastType.LeftGroup });
-          return;
-        }
-        const isSendTargetGroupConversation =
-          conversation.type === 'group' ||
-          conversation.conversationType === 'group';
-        const destinationServiceId = conversation.serviceId ?? conversation.id;
-	        const localMessageDestinationId = isSendTargetGroupConversation
-	          ? (conversation.groupId ?? conversation.id)
-	          : destinationServiceId;
-	        const localMessageId = `sent:${localMessageDestinationId}:${timestamp}`;
-	        const quote = getWebQuoteForSend(quotedMessage);
-	        const submittedAttachmentIds = new Set(
-	          attachments.map(attachment => attachment.id).filter(Boolean)
-	        );
-	        const optimisticMessage: WebMessage = {
-	          id: localMessageId,
-	          attachments,
-	          body,
-	          conversationId,
-	          direction: 'outgoing',
-	          isViewOnce: isViewOnceActive,
-	          receivedAt: timestamp,
-	          sourceServiceId: credentials.aci,
-	          status: 'queued',
-	          timestamp,
-	          quote,
-	        };
+          const remoteAttachments = await uploadAttachmentsForSend(attachments);
 
-        setShell(current => {
-          const currentConversation =
-            current.conversationLookup[conversationId] ?? conversation;
-          const lastMessage = getWebConversationLastMessage(
-            optimisticMessage,
-            credentials.aci
-          );
-          const previewText = getWebMessagePreviewText(optimisticMessage);
-          const updatedConversation = {
-            ...currentConversation,
-            activeAt: timestamp,
-            hasMessages: true,
-            inboxPosition: timestamp,
-            lastMessage,
-            lastMessageReceivedAt: timestamp,
-            lastMessageReceivedAtMs: timestamp,
-            lastUpdated: timestamp,
-            messageCount: (currentConversation.messageCount ?? 0) + 1,
-            sentMessageCount: (currentConversation.sentMessageCount ?? 0) + 1,
-            snippet: previewText || currentConversation.snippet,
-            timestamp,
-          };
-          const nextShell = {
-            ...current,
-            messages: [
-              ...current.messages.filter(item => item.id !== localMessageId),
-              optimisticMessage,
-            ].sort(compareWebMessages),
-            conversationLookup: {
-              ...current.conversationLookup,
-              [conversationId]: updatedConversation,
-            },
-          };
-          setWebRuntimeChatShell(nextShell);
-          void persistChatShellStateToStorage(
-            nextShell,
-            linkedSession.credentials?.aci
-          );
-          window.reduxActions?.conversations?.conversationsUpdated?.([
-            toDesktopConversation(updatedConversation, linkedSession) as never,
-          ]);
-          return nextShell;
-        });
-        registerMessageInCache(optimisticMessage);
-        window.reduxActions?.conversations?.messagesAdded?.({
-          conversationId: optimisticMessage.conversationId,
-          isActive: document.visibilityState === 'visible',
-          isJustSent: true,
-          isNewMessage: true,
-          messages: [toDesktopMessage(optimisticMessage)],
-        });
-	      inputApi.current?.reset();
-	      setDraftText('');
-	      setDirty(false);
-	      setSendCounter(current => current + 1);
-	      setIsViewOnce(false);
-	      if (!attachmentOverride && submittedAttachmentIds.size > 0) {
-	        setPendingAttachments(current =>
-	          current.filter(attachment => !submittedAttachmentIds.has(attachment.id))
-	        );
-	      }
-
-        const remoteAttachments = await uploadAttachmentsForSend(attachments);
-
-        const sent = isSendTargetGroupConversation
-          ? await (async () => {
-              return sendGroupTextMessage({
+          const sent = isSendTargetGroupConversation
+            ? await (async () => {
+                return sendGroupTextMessage({
+                  attachments: remoteAttachments,
+                  runtimeSessionId: messageRuntimeSessionId,
+                  groupId: conversation.groupId ?? conversation.id,
+                  body,
+                  isViewOnce: isViewOnceActive,
+                  quote,
+                  timestamp,
+                  groupV2:
+                    conversation.masterKey &&
+                    typeof conversation.revision === 'number'
+                      ? {
+                          masterKey: conversation.masterKey,
+                          revision: conversation.revision,
+                        }
+                      : undefined,
+                  recipients: conversation.membersV2?.map(member => member.aci),
+                });
+              })()
+            : await sendDirectTextMessage({
                 attachments: remoteAttachments,
                 runtimeSessionId: messageRuntimeSessionId,
-                groupId: conversation.groupId ?? conversation.id,
+                destinationServiceId,
                 body,
                 isViewOnce: isViewOnceActive,
-                quote,
                 timestamp,
-                groupV2:
-                  conversation.masterKey && typeof conversation.revision === 'number'
-                    ? {
-                        masterKey: conversation.masterKey,
-                        revision: conversation.revision,
-                      }
-                    : undefined,
-                recipients: conversation.membersV2?.map(member => member.aci),
+                quote,
               });
-            })()
-	          : await sendDirectTextMessage({
-	              attachments: remoteAttachments,
-	              runtimeSessionId: messageRuntimeSessionId,
-	              destinationServiceId,
-	              body,
-              isViewOnce: isViewOnceActive,
-              timestamp,
-              quote,
-            });
 
-        const normalized: WebMessage = {
-          ...sent,
-          conversationId,
-          body,
-          direction: 'outgoing',
-          timestamp,
-          status: sent.status ?? 'sent',
-	          attachments: sent.attachments ?? remoteAttachments,
-          quote: sent.quote ?? quote,
-          isViewOnce: sent.isViewOnce ?? isViewOnceActive,
-        };
-        let didReplaceLocalMessage = false;
-        setShell(current => {
-          const currentConversation =
-            current.conversationLookup[conversationId] ?? conversation;
-          didReplaceLocalMessage = current.messages.some(
-            item => item.id === normalized.id
-          );
-          const lastMessage = getWebConversationLastMessage(
-            normalized,
-            credentials.aci
-          );
-          const previewText = getWebMessagePreviewText(normalized);
-          const updatedConversation = {
-            ...currentConversation,
-            activeAt: timestamp,
-            hasMessages: true,
-            inboxPosition: timestamp,
-            lastMessage,
-            lastMessageReceivedAt: timestamp,
-            lastMessageReceivedAtMs: normalized.receivedAt ?? timestamp,
-            lastUpdated: timestamp,
-            messageCount:
-              (currentConversation.messageCount ?? 0) +
-              (didReplaceLocalMessage ? 0 : 1),
-            sentMessageCount:
-              (currentConversation.sentMessageCount ?? 0) +
-              (didReplaceLocalMessage ? 0 : 1),
-            snippet: previewText || currentConversation.snippet,
+          const normalized: WebMessage = {
+            ...sent,
+            conversationId,
+            body,
+            direction: 'outgoing',
+            timestamp,
+            status: sent.status ?? 'sent',
+            attachments: sent.attachments ?? remoteAttachments,
+            quote: sent.quote ?? quote,
+            isViewOnce: sent.isViewOnce ?? isViewOnceActive,
+          };
+          let didReplaceLocalMessage = false;
+          setShell(current => {
+            const currentConversation =
+              current.conversationLookup[conversationId] ?? conversation;
+            didReplaceLocalMessage = current.messages.some(
+              item => item.id === normalized.id
+            );
+            const lastMessage = getWebConversationLastMessage(
+              normalized,
+              credentials.aci
+            );
+            const previewText = getWebMessagePreviewText(normalized);
+            const updatedConversation = {
+              ...currentConversation,
+              activeAt: timestamp,
+              hasMessages: true,
+              inboxPosition: timestamp,
+              lastMessage,
+              lastMessageReceivedAt: timestamp,
+              lastMessageReceivedAtMs: normalized.receivedAt ?? timestamp,
+              lastUpdated: timestamp,
+              messageCount:
+                (currentConversation.messageCount ?? 0) +
+                (didReplaceLocalMessage ? 0 : 1),
+              sentMessageCount:
+                (currentConversation.sentMessageCount ?? 0) +
+                (didReplaceLocalMessage ? 0 : 1),
+              snippet: previewText || currentConversation.snippet,
+              timestamp,
+            };
+            const nextShell = {
+              ...current,
+              messages: [
+                ...current.messages.filter(item => item.id !== normalized.id),
+                normalized,
+              ].sort(compareWebMessages),
+              conversationLookup: {
+                ...current.conversationLookup,
+                [conversationId]: updatedConversation,
+              },
+            };
+            setWebRuntimeChatShell(nextShell);
+            void persistChatShellStateToStorage(
+              nextShell,
+              linkedSession.credentials?.aci
+            );
+            window.reduxActions?.conversations?.conversationsUpdated?.([
+              toDesktopConversation(
+                updatedConversation,
+                linkedSession
+              ) as never,
+            ]);
+            return nextShell;
+          });
+          registerMessageInCache(normalized);
+          if (quotedMessage) {
+            setQuoteByMessageId(conversationId, undefined);
+          }
+          if (didReplaceLocalMessage) {
+            window.reduxActions?.conversations?.messageChanged?.(
+              normalized.id,
+              normalized.conversationId,
+              toDesktopMessage(normalized)
+            );
+          } else {
+            window.reduxActions?.conversations?.messagesAdded?.({
+              conversationId: normalized.conversationId,
+              isActive: document.visibilityState === 'visible',
+              isJustSent: true,
+              isNewMessage: true,
+              messages: [toDesktopMessage(normalized)],
+            });
+          }
+          if (sent.attachments && attachments.length > 0) {
+            revokePendingAttachmentUrls(attachments);
+          }
+          if (!attachmentOverride && submittedAttachmentIds.size > 0) {
+            setPendingAttachments(current =>
+              current.filter(
+                attachment => !submittedAttachmentIds.has(attachment.id)
+              )
+            );
+          }
+          setIsViewOnce(false);
+          setDirty(false);
+        } catch (error) {
+          const isGroupConversation =
+            conversation.type === 'group' ||
+            conversation.conversationType === 'group';
+          const failedMessageDestinationId = isGroupConversation
+            ? (conversation.groupId ?? conversation.id)
+            : (conversation.serviceId ?? conversation.id);
+          const failedMessageId = `sent:${failedMessageDestinationId}:${timestamp}`;
+          const failedMessage: WebMessage = {
+            id: failedMessageId,
+            attachments,
+            body,
+            conversationId,
+            direction: 'outgoing',
+            isViewOnce: isViewOnceActive,
+            quote: getWebQuoteForSend(quotedMessage),
+            receivedAt: timestamp,
+            sourceServiceId: credentials.aci,
+            status: 'error',
             timestamp,
           };
-          const nextShell = {
-            ...current,
-            messages: [
-              ...current.messages.filter(item => item.id !== normalized.id),
-              normalized,
-            ].sort(compareWebMessages),
-            conversationLookup: {
-              ...current.conversationLookup,
-              [conversationId]: updatedConversation,
-            },
-          };
-          setWebRuntimeChatShell(nextShell);
-          void persistChatShellStateToStorage(
-            nextShell,
-            linkedSession.credentials?.aci
-          );
-          window.reduxActions?.conversations?.conversationsUpdated?.([
-            toDesktopConversation(updatedConversation, linkedSession) as never,
-          ]);
-          return nextShell;
-        });
-        registerMessageInCache(normalized);
-        if (quotedMessage) {
-          setQuoteByMessageId(conversationId, undefined);
-        }
-        if (didReplaceLocalMessage) {
-          window.reduxActions?.conversations?.messageChanged?.(
-            normalized.id,
-            normalized.conversationId,
-            toDesktopMessage(normalized)
-          );
-        } else {
-          window.reduxActions?.conversations?.messagesAdded?.({
-            conversationId: normalized.conversationId,
-            isActive: document.visibilityState === 'visible',
-            isJustSent: true,
-            isNewMessage: true,
-            messages: [toDesktopMessage(normalized)],
+          setShell(current => {
+            if (!current.messages.some(item => item.id === failedMessageId)) {
+              return current;
+            }
+            const nextShell = {
+              ...current,
+              messages: current.messages.map(item =>
+                item.id === failedMessageId ? failedMessage : item
+              ),
+            };
+            setWebRuntimeChatShell(nextShell);
+            void persistChatShellStateToStorage(
+              nextShell,
+              linkedSession.credentials?.aci
+            );
+            return nextShell;
           });
-        }
-	        if (sent.attachments && attachments.length > 0) {
-	          revokePendingAttachmentUrls(attachments);
-	        }
-	        if (!attachmentOverride && submittedAttachmentIds.size > 0) {
-	          setPendingAttachments(current =>
-	            current.filter(attachment => !submittedAttachmentIds.has(attachment.id))
-	          );
-	        }
-	        setIsViewOnce(false);
-	        setDirty(false);
-      } catch (error) {
-        const isGroupConversation =
-          conversation.type === 'group' || conversation.conversationType === 'group';
-        const failedMessageDestinationId = isGroupConversation
-          ? (conversation.groupId ?? conversation.id)
-          : (conversation.serviceId ?? conversation.id);
-        const failedMessageId = `sent:${failedMessageDestinationId}:${timestamp}`;
-        const failedMessage: WebMessage = {
-          id: failedMessageId,
-          attachments,
-          body,
-          conversationId,
-          direction: 'outgoing',
-          isViewOnce: isViewOnceActive,
-          quote: getWebQuoteForSend(quotedMessage),
-          receivedAt: timestamp,
-          sourceServiceId: credentials.aci,
-          status: 'error',
-          timestamp,
-        };
-        setShell(current => {
-          if (!current.messages.some(item => item.id === failedMessageId)) {
-            return current;
-          }
-          const nextShell = {
-            ...current,
-            messages: current.messages.map(item =>
-              item.id === failedMessageId ? failedMessage : item
-            ),
-          };
-          setWebRuntimeChatShell(nextShell);
-          void persistChatShellStateToStorage(
-            nextShell,
-            linkedSession.credentials?.aci
+          registerMessageInCache(failedMessage);
+          window.reduxActions?.conversations?.messageChanged?.(
+            failedMessage.id,
+            failedMessage.conversationId,
+            toDesktopMessage(failedMessage)
           );
-          return nextShell;
-        });
-        registerMessageInCache(failedMessage);
-        window.reduxActions?.conversations?.messageChanged?.(
-          failedMessage.id,
-          failedMessage.conversationId,
-          toDesktopMessage(failedMessage)
-        );
-        inputApi.current?.setContents(body, undefined, true);
-        setDraftText(body);
-        setDirty(Boolean(body) || attachments.length > 0);
-        console.error('Failed to send web message', error);
-      } finally {
-        setIsSending(false);
-      }
-    })();
+          inputApi.current?.setContents(body, undefined, true);
+          setDraftText(body);
+          setDirty(Boolean(body) || attachments.length > 0);
+          console.error('Failed to send web message', error);
+        } finally {
+          setIsSending(false);
+        }
+      })();
 
-    return true;
-  }, [
-    conversationId,
-    conversation,
-    discardEditMessage,
-    draftEditMessage,
-    isLeftGroup,
-    isSending,
-    linkedSession,
-    messageRuntimeSessionId,
-	    pendingAttachments,
-	    setShell,
-	    shell,
-	    showToast,
-	    quotedMessage,
-	    revokePendingAttachmentUrls,
-	    uploadAttachmentsForSend,
-	    isViewOnceActive,
-	    setQuoteByMessageId,
-	  ]);
+      return true;
+    },
+    [
+      conversationId,
+      conversation,
+      discardEditMessage,
+      draftEditMessage,
+      isLeftGroup,
+      isSending,
+      linkedSession,
+      messageRuntimeSessionId,
+      pendingAttachments,
+      setShell,
+      shell,
+      showToast,
+      quotedMessage,
+      revokePendingAttachmentUrls,
+      uploadAttachmentsForSend,
+      isViewOnceActive,
+      setQuoteByMessageId,
+    ]
+  );
 
   const handleForceSend = useCallback(() => {
     setLarge(false);
@@ -1030,7 +1126,9 @@ function WebCompositionArea({
       return;
     }
     if (!navigator.mediaDevices?.getUserMedia) {
-      console.error('Web voice note recording requires browser microphone access');
+      console.error(
+        'Web voice note recording requires browser microphone access'
+      );
       return;
     }
 
@@ -1106,10 +1204,7 @@ function WebCompositionArea({
           type: AUDIO_MPEG,
         });
         const url = URL.createObjectURL(blob);
-        const duration = Math.max(
-          1,
-          Math.ceil((stoppedAt - startedAt) / 1000)
-        );
+        const duration = Math.max(1, Math.ceil((stoppedAt - startedAt) / 1000));
         const uploadedAttachment = await uploadMessageAttachment({
           file,
           runtimeSessionId: messageRuntimeSessionId,
@@ -1213,17 +1308,20 @@ function WebCompositionArea({
     []
   );
 
-  const removePendingAttachment = useCallback((attachmentId: string | undefined) => {
-    setPendingAttachments(current =>
-      current.filter(attachment => {
-        if (attachment.id === attachmentId) {
-          revokePendingAttachmentUrls([attachment]);
-          return false;
-        }
-        return true;
-      })
-    );
-  }, [revokePendingAttachmentUrls]);
+  const removePendingAttachment = useCallback(
+    (attachmentId: string | undefined) => {
+      setPendingAttachments(current =>
+        current.filter(attachment => {
+          if (attachment.id === attachmentId) {
+            revokePendingAttachmentUrls([attachment]);
+            return false;
+          }
+          return true;
+        })
+      );
+    },
+    [revokePendingAttachmentUrls]
+  );
 
   if (isRecordingVoiceNote) {
     return (
@@ -1316,13 +1414,13 @@ function WebCompositionArea({
           isSending={false}
           convertDraftBodyRangesIntoHydrated={() => undefined}
           onClose={() => setAttachmentToEdit(null)}
-	          onDone={({
-	            caption,
-	            data,
-	            contentType,
-	            blurHash,
-	            isViewOnce: editorIsViewOnce,
-	          }) => {
+          onDone={({
+            caption,
+            data,
+            contentType,
+            blurHash,
+            isViewOnce: editorIsViewOnce,
+          }) => {
             void (async () => {
               const blob = new Blob([data], { type: contentType });
               const url = URL.createObjectURL(blob);
@@ -1351,21 +1449,21 @@ function WebCompositionArea({
                     ...imageDimensions,
                   };
                 })
-	              );
-	              setIsViewOnce(Boolean(editorIsViewOnce));
-	              setAttachmentToEdit(null);
+              );
+              setIsViewOnce(Boolean(editorIsViewOnce));
+              setAttachmentToEdit(null);
               setDirty(true);
               if (caption) {
                 setDraftText(caption);
                 inputApi.current?.setContents(caption, undefined, true);
               }
             })();
-	          }}
-	          onSelectEmoji={handleEmoji}
-	          onTextTooLong={() => undefined}
-	          isViewOnce={isViewOnceActive}
-	          showViewOnceToggle={showViewOnceToggle}
-	          ourConversationId={ourConversationId}
+          }}
+          onSelectEmoji={handleEmoji}
+          onTextTooLong={() => undefined}
+          isViewOnce={isViewOnceActive}
+          showViewOnceToggle={showViewOnceToggle}
+          ourConversationId={ourConversationId}
           platform={platform}
           emojiSkinToneDefault={null}
           sortedGroupMembers={null}
@@ -1515,8 +1613,7 @@ function WebCompositionArea({
             showViewOnceButton={showViewOnceToggle}
             isViewOnceActive={isViewOnceActive}
             onToggleViewOnce={() => setIsViewOnce(current => !current)}
-          >
-          </CompositionInput>
+          ></CompositionInput>
         </div>
         {!large && !draftEditMessage ? (
           <div className="CompositionArea__button-cell">
@@ -1547,31 +1644,32 @@ function WebCompositionArea({
             </AxoDropdownMenu.Root>
           </div>
         ) : null}
-        {!large ? (
-          editMessageFragment ?? (shouldShowMicrophone ? (
-            <div className="CompositionArea__button-cell">
-              <AudioCapture
-                conversationId={conversationId}
-                draftAttachments={[]}
-                i18n={i18n}
-                showToast={showToast}
-                warmupRecording={() => undefined}
-                startRecording={startRecording}
-              />
-            </div>
-          ) : (
-            <div className="CompositionArea__button-cell">
-              <AxoIconButton.Root
-                symbol="send-fill"
-                variant="primary"
-                size="md"
-                label={i18n('icu:sendMessageToContact')}
-                disabled={isSending}
-                onClick={handleForceSend}
-              />
-            </div>
-          ))
-        ) : null}
+        {!large
+          ? (editMessageFragment ??
+            (shouldShowMicrophone ? (
+              <div className="CompositionArea__button-cell">
+                <AudioCapture
+                  conversationId={conversationId}
+                  draftAttachments={[]}
+                  i18n={i18n}
+                  showToast={showToast}
+                  warmupRecording={() => undefined}
+                  startRecording={startRecording}
+                />
+              </div>
+            ) : (
+              <div className="CompositionArea__button-cell">
+                <AxoIconButton.Root
+                  symbol="send-fill"
+                  variant="primary"
+                  size="md"
+                  label={i18n('icu:sendMessageToContact')}
+                  disabled={isSending}
+                  onClick={handleForceSend}
+                />
+              </div>
+            )))
+          : null}
       </div>
       {large ? (
         <div className="CompositionArea__row CompositionArea__row--control-row">
@@ -1679,7 +1777,7 @@ function WebConversation({
         />
       )}
       renderConversationHeader={conversationId => (
-        <SmartConversationHeader id={conversationId} />
+        <SmartConversationHeader id={conversationId} hideOutgoingCallButtons />
       )}
       renderTimeline={conversationId => <SmartTimeline id={conversationId} />}
       renderPanel={conversationId =>
@@ -1693,13 +1791,17 @@ function WebConversation({
 }
 
 export const WebChatsTab = memo(function WebChatsTab({
+  isRelinkRequired,
   linkedSession,
   messageRuntimeSessionId,
+  onRelinkDevice,
   shell,
   setShell,
 }: Readonly<{
+  isRelinkRequired: boolean;
   linkedSession: LinkedSessionRecord;
   messageRuntimeSessionId?: string;
+  onRelinkDevice: () => void;
   shell: ChatShellState;
   setShell: Dispatch<SetStateAction<ChatShellState>>;
 }>): JSX.Element {
@@ -1764,7 +1866,12 @@ export const WebChatsTab = memo(function WebChatsTab({
           setShell={setShell}
         />
       )}
-      renderLeftPane={renderLeftPane}
+      renderLeftPane={props =>
+        renderLeftPane(props, {
+          forceRelinkDialog: isRelinkRequired,
+          onRelinkDevice,
+        })
+      }
       renderMiniPlayer={renderMiniPlayer}
       selectedConversationId={selectedConversationId}
       showWhatsNewModal={() => undefined}

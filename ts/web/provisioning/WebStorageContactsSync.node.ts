@@ -64,6 +64,15 @@ type UpdateStorageConversationMuteOptions = Readonly<{
   storageUrl: string;
 }>;
 
+type UpdateStorageConversationMarkedUnreadOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  conversationId: string;
+  linkedPayload: LinkedPayload;
+  markedUnread: boolean;
+  storageUrl: string;
+}>;
+
 type UpdateStoragePinnedConversationsOptions = Readonly<{
   allowInsecureTls?: boolean;
   chat: AuthenticatedChatConnection;
@@ -1107,6 +1116,63 @@ export async function updateStorageConversationMute({
   } else {
     throw new Error(
       `updateStorageConversationMute: unsupported storage record for ${conversationId}`
+    );
+  }
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: target.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: target.type,
+  });
+}
+
+export async function updateStorageConversationMarkedUnread({
+  allowInsecureTls,
+  chat,
+  conversationId,
+  linkedPayload,
+  markedUnread,
+  storageUrl,
+}: UpdateStorageConversationMarkedUnreadOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const target = findStorageConversationRecord({
+    conversationId,
+    linkedPayload,
+    records: state.records,
+    recordsByKey: state.recordsByKey,
+  });
+  if (!target) {
+    throw new Error(
+      `updateStorageConversationMarkedUnread: storage record not found for ${conversationId}`
+    );
+  }
+
+  const updatedRecord = cloneStorageRecord(target.record);
+  if (updatedRecord.record?.contact) {
+    updatedRecord.record.contact.markedUnread = markedUnread;
+  } else if (updatedRecord.record?.groupV2) {
+    updatedRecord.record.groupV2.markedUnread = markedUnread;
+  } else if (updatedRecord.record?.account) {
+    updatedRecord.record.account.noteToSelfMarkedUnread = markedUnread;
+  } else {
+    throw new Error(
+      `updateStorageConversationMarkedUnread: unsupported storage record for ${conversationId}`
     );
   }
 

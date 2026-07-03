@@ -176,6 +176,7 @@ function mergeConversationForBootstrap({
         lastMessageReceivedAt: undefined,
         lastMessageReceivedAtMs: undefined,
         lastUpdated: undefined,
+        markedUnread: existing.markedUnread,
         messageCount: 0,
         messagesDeleted: true,
         sentMessageCount: existing.sentMessageCount,
@@ -203,6 +204,7 @@ function mergeConversationForBootstrap({
     lastMessageReceivedAt: existing.lastMessageReceivedAt,
     lastMessageReceivedAtMs: existing.lastMessageReceivedAtMs,
     lastUpdated: existing.lastUpdated,
+    markedUnread: existing.markedUnread,
     messageCount: existing.messageCount,
     messagesDeleted: existing.messagesDeleted,
     sentMessageCount: existing.sentMessageCount,
@@ -1186,6 +1188,7 @@ export function toDesktopConversation(
     lastMessageReceivedAt: conversation.lastMessageReceivedAt,
     lastMessageReceivedAtMs: conversation.lastMessageReceivedAtMs,
     lastUpdated: conversation.lastUpdated,
+    markedUnread: conversation.markedUnread,
     messageCount: conversation.messageCount,
     messageCountBeforeMessageRequests:
       conversation.messageCountBeforeMessageRequests,

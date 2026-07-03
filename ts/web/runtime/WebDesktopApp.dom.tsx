@@ -82,6 +82,7 @@ import {
   loadChatShellStateForSession,
   loadContactsBootstrapForSession,
   loadLinkedSessionRecordFromIndexedDb,
+  clearWebPersistence,
   persistLinkedSessionRecordToIndexedDb,
   persistLinkedSessionToStorage,
   persistChatShellStateToStorage,
@@ -406,7 +407,20 @@ function shouldImportBackup(
 }
 
 function isDeviceDelinkedError(error: string | undefined): boolean {
-  return Boolean(error?.includes(DEVICE_DELINKED_ERROR));
+  const normalizedError = error?.toLowerCase();
+  return Boolean(
+    normalizedError != null &&
+      (normalizedError.includes(DEVICE_DELINKED_ERROR.toLowerCase()) ||
+        normalizedError.includes('devicedelinked') ||
+        normalizedError.includes('device delinked') ||
+        normalizedError.includes('deregistered') ||
+        normalizedError.includes('no longer authorized') ||
+        normalizedError.includes('unauthorized') ||
+        normalizedError === 'failed to open message stream: 401' ||
+        normalizedError === 'failed to open message stream: 403' ||
+        normalizedError.includes('request failed with status 401') ||
+        normalizedError.includes('request failed with status 403'))
+  );
 }
 
 export async function syncLinkedSessionUserStorage(
@@ -593,12 +607,16 @@ function updateNoteToSelfProfile(
 }
 
 function WebInbox({
+  isRelinkRequired,
   linkedSession,
   messageRuntimeSessionId,
+  onRelinkDevice,
   shell,
   setShell,
 }: Readonly<{
+  isRelinkRequired: boolean;
   linkedSession: LinkedSessionRecord;
+  onRelinkDevice: () => void;
   shell: ChatShellState;
   setShell: Dispatch<SetStateAction<ChatShellState>>;
   messageRuntimeSessionId?: string;
@@ -613,7 +631,9 @@ function WebInbox({
       onToggleNavTabsCollapse={toggleNavTabsCollapse}
       renderChatsTab={() => (
         <WebChatsTab
+          isRelinkRequired={isRelinkRequired}
           linkedSession={linkedSession}
+          onRelinkDevice={onRelinkDevice}
           shell={shell}
           setShell={setShell}
           messageRuntimeSessionId={messageRuntimeSessionId}
@@ -631,16 +651,20 @@ function WebInbox({
 function WebDesktopAppBody({
   appState,
   backupImportScreenState,
+  isRelinkRequired,
   linkedSession,
   messageRuntimeSessionId,
+  onRelinkDevice,
   reloadLinkedSession,
   setShell,
   shell,
 }: Readonly<{
   appState: StateType['app'];
   backupImportScreenState?: BackupImportScreenState;
+  isRelinkRequired: boolean;
   linkedSession?: LinkedSessionRecord;
   messageRuntimeSessionId?: string;
+  onRelinkDevice: () => void;
   reloadLinkedSession: () => Promise<void>;
   setShell: Dispatch<SetStateAction<ChatShellState>>;
   shell: ChatShellState;
@@ -671,7 +695,9 @@ function WebDesktopAppBody({
           renderInbox={() =>
             linkedSession ? (
               <WebInbox
+                isRelinkRequired={isRelinkRequired}
                 linkedSession={linkedSession}
+                onRelinkDevice={onRelinkDevice}
                 shell={shell}
                 setShell={setShell}
                 messageRuntimeSessionId={messageRuntimeSessionId}
@@ -1694,6 +1720,7 @@ export function WebDesktopApp({
     useState<string>();
   const [backupImportScreenState, setBackupImportScreenState] =
     useState<BackupImportScreenState>();
+  const [isRelinkRequired, setIsRelinkRequired] = useState(false);
 
   useEffect(() => {
     linkedSessionRef.current = linkedSession;
@@ -3226,6 +3253,7 @@ export function WebDesktopApp({
   const reloadLinkedSession = useCallback(async () => {
     const nextLinkedSession = await loadLinkedSessionRecordFromIndexedDb();
     setLinkedSession(nextLinkedSession);
+    setIsRelinkRequired(false);
     if (nextLinkedSession?.credentials?.aci) {
       setupWebGlobals({
         i18n: window.SignalContext.i18n,
@@ -3271,6 +3299,24 @@ export function WebDesktopApp({
       dispatchShell(nextLinkedSession, nextShell);
     }
   }, [handleConversationChange, messageRuntimeSessionId]);
+
+  const relinkDevice = useCallback(() => {
+    void (async () => {
+      await Registration.remove();
+      await clearWebPersistence();
+      window.location.reload();
+    })();
+  }, []);
+
+  const handleDeviceDelinked = useCallback(() => {
+    setMessageRuntimeSessionId(undefined);
+    setIsRelinkRequired(true);
+    void Registration.remove();
+    window.reduxActions?.network?.setNetworkStatus?.({
+      isOnline: false,
+      socketStatus: SocketStatus.CLOSED,
+    });
+  }, []);
 
   useEffect(() => {
     const initialStreamLinkedSession = linkedSessionRef.current;
@@ -3347,14 +3393,7 @@ export function WebDesktopApp({
       } else if (event.type === 'transport-status') {
         if (isDeviceDelinkedError(event.error)) {
           abortController.abort();
-          setMessageRuntimeSessionId(undefined);
-          setLinkedSession(undefined);
-          persistLinkedSessionToStorage(undefined);
-          void persistLinkedSessionRecordToIndexedDb(undefined);
-          window.reduxActions?.network?.setNetworkStatus?.({
-            isOnline: false,
-            socketStatus: SocketStatus.CLOSED,
-          });
+          handleDeviceDelinked();
           return;
         }
         window.reduxActions?.network?.setNetworkStatus?.({
@@ -3368,6 +3407,9 @@ export function WebDesktopApp({
                   ? SocketStatus.CLOSED
                   : SocketStatus.CLOSED,
         });
+        if (event.status === 'closed' || event.status === 'error') {
+          throw new Error(event.error ?? `Message stream ${event.status}`);
+        }
         if (event.status === 'open' && runtimeSessionId) {
           const nowMs = Date.now();
           const hasRecentContactsSync =
@@ -4118,6 +4160,11 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'error') {
+        if (isDeviceDelinkedError(event.error)) {
+          abortController.abort();
+          handleDeviceDelinked();
+          return;
+        }
         console.error('Message stream event error', event.error);
       }
     };
@@ -4136,6 +4183,14 @@ export function WebDesktopApp({
           reconnectDelay = MESSAGE_STREAM_RECONNECT_INITIAL_DELAY;
         } catch (error) {
           if (abortController.signal.aborted) {
+            return;
+          }
+          if (
+            isDeviceDelinkedError(
+              error instanceof Error ? error.message : String(error)
+            )
+          ) {
+            handleDeviceDelinked();
             return;
           }
           console.error('Message stream failed', error);
@@ -4158,7 +4213,7 @@ export function WebDesktopApp({
     return () => {
       abortController.abort();
     };
-  }, [messageStreamSessionKey]);
+  }, [handleDeviceDelinked, messageStreamSessionKey]);
 
   const appState = {
     ...store.getState().app,
@@ -4175,8 +4230,10 @@ export function WebDesktopApp({
         <WebDesktopAppBody
           appState={appState}
           backupImportScreenState={backupImportScreenState}
+          isRelinkRequired={isRelinkRequired}
           linkedSession={linkedSession}
           messageRuntimeSessionId={messageRuntimeSessionId}
+          onRelinkDevice={relinkDevice}
           reloadLinkedSession={reloadLinkedSession}
           setShell={setShell}
           shell={shell}

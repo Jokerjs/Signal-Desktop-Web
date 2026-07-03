@@ -132,6 +132,16 @@ import { SmartNotificationProfilesMenu } from './NotificationProfilesMenu.preloa
 import { getActiveProfile } from '../selectors/notificationProfiles.dom.ts';
 import type { StateSelector } from '../types.std.ts';
 
+type RelinkDialogProps = Readonly<{
+  containerWidthBreakpoint: WidthBreakpoint;
+}>;
+
+type SmartLeftPaneProps = NavTabPanelProps &
+  Readonly<{
+    forceRelinkDialog?: boolean;
+    renderRelinkDialogOverride?: (props: RelinkDialogProps) => JSX.Element;
+  }>;
+
 function renderMessageSearchResult(id: string): JSX.Element {
   return <SmartMessageSearchResult id={id} />;
 }
@@ -141,17 +151,15 @@ function renderConversationListItemContextMenu(
   return <SmartLeftPaneConversationListItemContextMenu {...props} />;
 }
 function renderNetworkStatus(
-  props: Readonly<{ containerWidthBreakpoint: WidthBreakpoint }>
+  props: RelinkDialogProps
 ): JSX.Element {
   return <SmartNetworkStatus {...props} />;
 }
-function renderRelinkDialog(
-  props: Readonly<{ containerWidthBreakpoint: WidthBreakpoint }>
-): JSX.Element {
+function renderRelinkDialog(props: RelinkDialogProps): JSX.Element {
   return <SmartRelinkDialog {...props} />;
 }
 function renderUpdateDialog(
-  props: Readonly<{ containerWidthBreakpoint: WidthBreakpoint }>
+  props: RelinkDialogProps
 ): JSX.Element {
   return <SmartUpdateDialog {...props} />;
 }
@@ -305,10 +313,12 @@ async function saveAlerts(alerts: ServerAlertsType): Promise<void> {
 }
 
 export const SmartLeftPane = memo(function SmartLeftPane({
+  forceRelinkDialog,
   hasFailedStorySends,
   hasPendingUpdate,
   otherTabsUnreadStats,
-}: NavTabPanelProps) {
+  renderRelinkDialogOverride,
+}: SmartLeftPaneProps) {
   const challengeStatus = useSelector(getChallengeStatus);
   const composerStep = useSelector(getComposerStep);
   const crashReportCount = useSelector(getCrashReportCount);
@@ -425,7 +435,9 @@ export const SmartLeftPane = memo(function SmartLeftPane({
     unsupportedOSDialogType = 'warning';
   }
 
-  const hasRelinkDialog = !isRegistrationDone();
+  const hasRelinkDialog = Boolean(forceRelinkDialog) || !isRegistrationDone();
+  const hasNetworkDialogForLeftPane =
+    hasNetworkDialog && !Boolean(forceRelinkDialog);
 
   const renderToastManager =
     composerStep == null && !showArchived && !hasSearchQuery
@@ -460,7 +472,7 @@ export const SmartLeftPane = memo(function SmartLeftPane({
       hasAnyCurrentCustomChatFolders={hasAnyCurrentCustomChatFolders}
       hasExpiredDialog={hasExpiredDialog}
       hasFailedStorySends={hasFailedStorySends}
-      hasNetworkDialog={hasNetworkDialog}
+      hasNetworkDialog={hasNetworkDialogForLeftPane}
       hasPendingUpdate={hasPendingUpdate}
       hasRelinkDialog={hasRelinkDialog}
       hasUpdateDialog={hasUpdateDialog}
@@ -491,7 +503,7 @@ export const SmartLeftPane = memo(function SmartLeftPane({
       }
       renderNetworkStatus={renderNetworkStatus}
       renderNotificationProfilesMenu={renderNotificationProfilesMenu}
-      renderRelinkDialog={renderRelinkDialog}
+      renderRelinkDialog={renderRelinkDialogOverride ?? renderRelinkDialog}
       renderToastManager={renderToastManager}
       renderUnsupportedOSDialog={renderUnsupportedOSDialog}
       renderUpdateDialog={renderUpdateDialog}

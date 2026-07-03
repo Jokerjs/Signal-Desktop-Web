@@ -1,0 +1,2573 @@
+/*
+ * Temporary Web fallback for Chrome 108.
+ *
+ * Keep this file loaded after the normal Web styles. Each block is guarded by
+ * feature queries where practical, so newer Chrome versions keep using the
+ * upstream rules.
+ */
+
+@supports not (float: inline-end) {
+  .x,
+  .full-screen-flow .nav .apple,
+  .module-message__metadata--inline,
+  .LeftPaneDialog__close-button {
+    float: right;
+  }
+
+  .app-loading-screen .dot-container .dot,
+  .full-screen-flow .nav .android,
+  .full-screen-flow .nav .label,
+  .full-screen-flow .nav .body {
+    float: left;
+  }
+
+  [dir='rtl'] .x,
+  [dir='rtl'] .full-screen-flow .nav .apple,
+  [dir='rtl'] .module-message__metadata--inline,
+  [dir='rtl'] .LeftPaneDialog__close-button {
+    float: left;
+  }
+
+  [dir='rtl'] .app-loading-screen .dot-container .dot,
+  [dir='rtl'] .full-screen-flow .nav .android,
+  [dir='rtl'] .full-screen-flow .nav .label,
+  [dir='rtl'] .full-screen-flow .nav .body {
+    float: right;
+  }
+}
+
+@supports not (word-break: auto-phrase) {
+  .module-message__link-preview__description,
+  .module-message__text,
+  .module-composition-input__input,
+  .module-quote__primary__text {
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+}
+
+@supports not (width: calc-size(fit-content, size)) {
+  .w-\[calc-size\(fit-content\,min\(max\(200px\,size\)\,100\%\)\)\] {
+    width: fit-content;
+    min-width: min(200px, 100%);
+    max-width: 100%;
+  }
+
+  .w-\[calc-size\(fit-content\,min\(max\(300px\,size\)\,100\%\)\)\] {
+    width: fit-content;
+    min-width: min(300px, 100%);
+    max-width: 100%;
+  }
+
+  .w-\[calc-size\(fit-content\,min\(max\(400px\,size\)\,100\%\)\)\] {
+    width: fit-content;
+    min-width: min(400px, 100%);
+    max-width: 100%;
+  }
+
+  .w-\[calc-size\(fit-content\,min\(max\(500px\,size\)\,100\%\)\)\] {
+    width: fit-content;
+    min-width: min(500px, 100%);
+    max-width: 100%;
+  }
+
+  .w-\[calc-size\(fit-content\,min\(max\(600px\,size\)\,100\%\)\)\] {
+    width: fit-content;
+    min-width: min(600px, 100%);
+    max-width: 100%;
+  }
+
+  .min-w-\[calc-size\(fit-content\,min\(20ch\,size\)\)\] {
+    min-width: min(20ch, 100%);
+  }
+}
+
+@supports not (field-sizing: content) {
+  .field-sizing-content {
+    width: auto;
+  }
+
+  .TextAttachment__text__textarea {
+    min-height: 1em;
+  }
+}
+
+@supports not (text-wrap: balance) {
+  .CallsList__EmptyState,
+  .FunResults__Header,
+  .text-balance,
+  .text-pretty {
+    text-wrap: normal;
+  }
+}
+
+@supports not (grid-template-columns: subgrid) {
+  .FunGrid__Row {
+    grid-template-columns: repeat(
+      var(--fun-grid-container-column-count),
+      var(--fun-grid-container-cell-width)
+    );
+  }
+
+  .grid-cols-subgrid {
+    grid-template-columns: inherit;
+  }
+}
+
+@supports not (width: round(1px, 1px)) {
+  .FunStaticEmoji--Blot {
+    margin-bottom: calc(-0.4em + 3px);
+  }
+
+  .FunInlineEmoji {
+    width: var(--fun-inline-emoji-size, 1em);
+    height: var(--fun-inline-emoji-size, 1em);
+    font-size: var(--fun-inline-emoji-size, 1.4em);
+    line-height: var(--fun-inline-emoji-size, 1em);
+  }
+}
+
+@supports not (container-type: scroll-state) {
+  .container-scrollable\:\*\:w-full > *,
+  .container-scrollable\:\[\&\>button\]\:w-full > button {
+    width: 100%;
+  }
+}
+
+/* Generated from manifest.css, tailwind.css, and web.css. */
+
+@supports not (color: light-dark(#000, #fff)) {
+  :root,
+  :host {
+    --color-label-primary: rgba(0, 0, 0, 0.85);
+    --color-label-secondary: rgba(0, 0, 0, 0.55);
+    --color-label-placeholder: rgba(0, 0, 0, 0.3);
+    --color-label-disabled: rgba(0, 0, 0, 0.2);
+    --color-label-primary-inverted: rgba(255, 255, 255, 0.85);
+    --color-label-disabled-inverted: rgba(255, 255, 255, 0.2);
+    --color-label-primary-on-color: #fff;
+    --color-label-secondary-on-color: rgba(255, 255, 255, 0.8);
+    --color-label-disabled-on-color: rgba(255, 255, 255, 0.35);
+    --color-color-label-primary: #030ffc;
+    --color-color-label-primary-disabled: rgba(3, 15, 252, 0.25);
+    --color-color-label-light: #99a1ff;
+    --color-color-label-light-disabled: rgba(153, 161, 255, 0.25);
+    --color-color-label-affirmative: #00ad17;
+    --color-color-label-affirmative-disabled: rgba(0, 173, 23, 0.25);
+    --color-color-label-destructive: #f21602;
+    --color-color-label-destructive-disabled: rgba(242, 22, 2, 0.25);
+    --color-background-primary: #ffffff;
+    --color-background-secondary: #f6f6f6;
+    --color-background-overlay: rgba(0, 0, 0, 0.2);
+    --color-elevated-background-primary: #fafafa;
+    --color-elevated-background-secondary: #f2f2f2;
+    --color-elevated-background-tertiary: #eaeaea;
+    --color-elevated-background-quaternary: #2a2a2a;
+    --color-fill-primary: #ffffff;
+    --color-fill-primary-pressed: #f6f6f6;
+    --color-fill-secondary: rgba(128, 128, 128, 0.12);
+    --color-fill-secondary-pressed: rgba(128, 128, 128, 0.2);
+    --color-fill-selected: rgba(128, 128, 128, 0.25);
+    --color-fill-inverted: #424242;
+    --color-fill-inverted-pressed: #4e4e4e;
+    --color-fill-floating: #ffffff;
+    --color-fill-floating-pressed: #f6f6f6;
+    --color-fill-on-media: rgba(0, 0, 0, 0.75);
+    --color-message-fill-incoming-primary: #eaeaea;
+    --color-message-fill-incoming-secondary: rgba(255, 255, 255, 0.8);
+    --color-message-fill-incoming-secondary-pressed: rgba(255, 255, 255, 0.72);
+    --color-message-fill-outgoing-primary: #2267f5;
+    --color-message-fill-outgoing-secondary: rgba(255, 255, 255, 0.2);
+    --color-message-fill-outgoing-secondary-pressed: rgba(255, 255, 255, 0.12);
+    --color-message-fill-outgoing-tertiary: rgba(255, 255, 255, 0.2);
+    --color-color-fill-primary: #4655ff;
+    --color-color-fill-primary-pressed: #3b4af4;
+    --color-color-fill-affirmative: #02c028;
+    --color-color-fill-affirmative-pressed: #00b324;
+    --color-color-fill-warning: #ffcc00;
+    --color-color-fill-destructive: #fd2512;
+    --color-color-fill-destructive-pressed: #eb1300;
+    --color-border-primary: rgba(0, 0, 0, 0.16);
+    --color-border-secondary: rgba(0, 0, 0, 0.08);
+    --color-border-focused: #c1c7fe;
+    --color-border-selected: #4655ff;
+    --color-border-error: #fd2512;
+    --color-shadow-elevation-1: rgba(0, 0, 0, 0.08);
+    --color-shadow-elevation-2: rgba(0, 0, 0, 0.08);
+    --color-shadow-elevation-3: rgba(0, 0, 0, 0.1);
+    --color-shadow-elevation-4: rgba(0, 0, 0, 0.12);
+    --color-shadow-outline: rgba(0, 0, 0, 0.12);
+    --color-shadow-highlight: transparent;
+    --color-legacy-conversation-header-bg: #fff;
+    --color-legacy-signal-conversation-bg: #f6f7ff;
+    --color-legacy-official-chat-badge-bg: rgba(70, 85, 255, 0.12);
+    --color-legacy-official-chat-badge-text: #030ffc;
+    --color-legacy-signal-chat-message-bg: #8889b4;
+    --color-legacy-warning-badge: #c84118;
+    --tw-inset-shadow: inset 0 0.5px 1px 0
+      var(--tw-inset-shadow-color, rgba(0, 0, 0, 0.12));
+    --tw-shadow-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .dark-theme {
+    --color-label-primary: rgba(255, 255, 255, 0.85);
+    --color-label-secondary: rgba(255, 255, 255, 0.55);
+    --color-label-placeholder: rgba(255, 255, 255, 0.3);
+    --color-label-disabled: rgba(255, 255, 255, 0.2);
+    --color-label-primary-inverted: #000;
+    --color-label-disabled-inverted: rgba(0, 0, 0, 0.2);
+    --color-label-primary-on-color: rgba(255, 255, 255, 0.9);
+    --color-label-secondary-on-color: rgba(255, 255, 255, 0.7);
+    --color-label-disabled-on-color: rgba(255, 255, 255, 0.3);
+    --color-color-label-primary: #99a1ff;
+    --color-color-label-primary-disabled: rgba(153, 161, 255, 0.25);
+    --color-color-label-light: #99a1ff;
+    --color-color-label-light-disabled: rgba(153, 161, 255, 0.25);
+    --color-color-label-affirmative: #30d150;
+    --color-color-label-affirmative-disabled: rgba(48, 209, 80, 0.25);
+    --color-color-label-destructive: #ff4a3a;
+    --color-color-label-destructive-disabled: rgba(255, 74, 58, 0.25);
+    --color-background-primary: #1a1a1a;
+    --color-background-secondary: #262626;
+    --color-background-overlay: rgba(0, 0, 0, 0.4);
+    --color-elevated-background-primary: #2a2a2a;
+    --color-elevated-background-secondary: #323232;
+    --color-elevated-background-tertiary: #3a3a3a;
+    --color-elevated-background-quaternary: #424242;
+    --color-fill-primary: rgba(128, 128, 128, 0.2);
+    --color-fill-primary-pressed: rgba(128, 128, 128, 0.28);
+    --color-fill-secondary: rgba(128, 128, 128, 0.2);
+    --color-fill-secondary-pressed: rgba(128, 128, 128, 0.28);
+    --color-fill-selected: rgba(128, 128, 128, 0.32);
+    --color-fill-inverted: #dedede;
+    --color-fill-inverted-pressed: #cacaca;
+    --color-fill-floating: #2a2a2a;
+    --color-fill-floating-pressed: #323232;
+    --color-fill-on-media: rgba(0, 0, 0, 0.75);
+    --color-message-fill-incoming-primary: #3a3a3a;
+    --color-message-fill-incoming-secondary: rgba(255, 255, 255, 0.2);
+    --color-message-fill-incoming-secondary-pressed: rgba(255, 255, 255, 0.28);
+    --color-message-fill-outgoing-primary: #2267f5;
+    --color-message-fill-outgoing-secondary: rgba(255, 255, 255, 0.2);
+    --color-message-fill-outgoing-secondary-pressed: rgba(255, 255, 255, 0.28);
+    --color-message-fill-outgoing-tertiary: rgba(255, 255, 255, 0.2);
+    --color-color-fill-primary: #5563ff;
+    --color-color-fill-primary-pressed: #4856f2;
+    --color-color-fill-affirmative: #02c529;
+    --color-color-fill-affirmative-pressed: #00b725;
+    --color-color-fill-warning: #ffd60a;
+    --color-color-fill-destructive: #fb4332;
+    --color-color-fill-destructive-pressed: #e93120;
+    --color-border-primary: rgba(255, 255, 255, 0.16);
+    --color-border-secondary: rgba(255, 255, 255, 0.08);
+    --color-border-focused: #c1c7fe;
+    --color-border-selected: #5563ff;
+    --color-border-error: #fb4332;
+    --color-shadow-elevation-1: rgba(0, 0, 0, 0.16);
+    --color-shadow-elevation-2: rgba(0, 0, 0, 0.16);
+    --color-shadow-elevation-3: rgba(0, 0, 0, 0.2);
+    --color-shadow-elevation-4: rgba(0, 0, 0, 0.24);
+    --color-shadow-outline: transparent;
+    --color-shadow-highlight: rgba(255, 255, 255, 0.08);
+    --color-legacy-conversation-header-bg: #121212;
+    --color-legacy-signal-conversation-bg: #2f3240;
+    --color-legacy-official-chat-badge-bg: rgba(73, 82, 248, 0.4);
+    --color-legacy-official-chat-badge-text: #c2c5fe;
+    --color-legacy-signal-chat-message-bg: #444664;
+    --color-legacy-warning-badge: #eb977d;
+    --tw-inset-shadow: inset 0 0.5px 1px 0
+      var(--tw-inset-shadow-color, rgba(0, 0, 0, 0.12));
+    --tw-shadow-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .module-message__text--delete-for-everyone {
+    color: #5e5e5e;
+  }
+
+  .module-message__metadata {
+    color: #5e5e5e;
+  }
+
+  .module-message__metadata--outline-only-bubble,
+  .module-message__metadata--sticker {
+    color: #5e5e5e;
+  }
+
+  .module-message__metadata--with-image-no-caption {
+    color: #ffffff;
+  }
+
+  .module-message__metadata__status-icon--with-image-no-caption {
+    color: #ffffff;
+  }
+
+  .module-conversation-list__item--contact-or-conversation:hover:not(
+      :disabled,
+      .module-conversation-list__item--contact-or-conversation--disabled,
+      .module-conversation-list__item--contact-or-conversation--is-selected
+    ),
+  .module-conversation-list__item--contact-or-conversation[data-axo-contextmenu-state='open'] {
+    background-color: #e9e9e9;
+  }
+
+  .module-conversation-list__item--contact-or-conversation:hover:not(
+      :disabled,
+      .module-conversation-list__item--contact-or-conversation--disabled,
+      .module-conversation-list__item--contact-or-conversation--is-selected
+    )
+    .module-conversation-list__item--contact-or-conversation__unread-indicator,
+  .module-conversation-list__item--contact-or-conversation[data-axo-contextmenu-state='open']
+    .module-conversation-list__item--contact-or-conversation__unread-indicator {
+    border-color: #e9e9e9;
+  }
+
+  .keyboard-mode
+    .module-conversation-list__item--contact-or-conversation:focus:not(
+      :disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--is-selected
+    ) {
+    background-color: #e9e9e9;
+  }
+
+  .keyboard-mode
+    .module-conversation-list__item--contact-or-conversation:focus:not(
+      :disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--is-selected
+    )
+    .module-conversation-list__item--contact-or-conversation__unread-indicator {
+    border-color: #e9e9e9;
+  }
+
+  .module-conversation-list__generic-checkbox-icon {
+    background-color: rgba(0, 0, 0, 0.06);
+  }
+
+  .module-conversation-list__generic-checkbox-icon--contact::before {
+    background-color: #000000;
+  }
+
+  .module-conversation-list__generic-checkbox-icon--group::before {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--profile {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--verified {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--blocked {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--message-request {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--no-dms {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--connections {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--chat-x {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--person {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--phone {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--group {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--about {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--note {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--group-question {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--direct-question {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--label {
+    background-color: #000000;
+  }
+
+  .AboutContactModal__row__icon--qr-code {
+    background-color: #000000;
+  }
+
+  .BackupMediaDownloadProgressSettings__description {
+    color: #5e5e5e;
+  }
+
+  .CallsNewCall__ItemActionButtonTooltip .module-tooltip-arrow::before {
+    border-color: #f0f0f0;
+  }
+
+  .CallLinkDetails__ApproveAllMembersDisabledTooltip
+    .module-tooltip-arrow::before,
+  .CallLinkDetails__DeleteLinkTooltip .module-tooltip-arrow::before {
+    border-color: #f0f0f0;
+  }
+
+  .module-composition-input__view-once-placeholder {
+    color: #848484;
+  }
+
+  .ConversationDetails-membership-list__add-members-icon,
+  .ConversationDetails-membership-list__add-to-group-icon,
+  .ConversationDetails-groups__add-members-icon,
+  .ConversationDetails-groups__add-to-group-icon {
+    background: #f6f6f6;
+  }
+
+  .ConversationDetails-membership-list__add-members-icon::before,
+  .ConversationDetails-membership-list__add-to-group-icon::before,
+  .ConversationDetails-groups__add-members-icon::before,
+  .ConversationDetails-groups__add-to-group-icon::before {
+    background-color: #000000;
+  }
+
+  .mouse-mode .ConversationDetails-membership-list__member-label-button:hover {
+    background-color: #f6f6f6;
+  }
+
+  .ConversationDetails-membership-list__member-label-button {
+    color: rgba(0, 0, 0, 0.55);
+  }
+
+  .ConversationDetails__pending--info {
+    color: #5e5e5e;
+  }
+
+  .ConversationDetails-icon__icon--color::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--timer::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--notifications::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--mute::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--media::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--mention::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--lock::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--archive::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--approve::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--approveAllMembers::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--bell::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--link::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--share::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--reset::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--trash::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--delete::after {
+    background-color: #f44336;
+  }
+
+  .ConversationDetails-icon__icon--invites::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--edit::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--forward::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--down {
+    background-color: #f6f6f6;
+  }
+
+  .ConversationDetails-icon__icon--down::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--leave::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--block::after {
+    background-color: #f44336;
+  }
+
+  .ConversationDetails-icon__icon--unblock::after {
+    background-color: #2c6bed;
+  }
+
+  .ConversationDetails-icon__icon--verify::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--help::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--invite::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--official::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--heart::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--tag::after {
+    background-color: #3b3b3b;
+  }
+
+  .ConversationDetails-icon__icon--spam::after {
+    background-color: #f44336;
+  }
+
+  .ConversationDetails-icon__icon--terminate::after {
+    background-color: #f44336;
+  }
+
+  .ConversationDetails-panel-row__root--button[data-hovered]:not(:disabled) {
+    background-color: #f6f6f6;
+  }
+
+  .ConversationDetails-panel-row__info {
+    color: #5e5e5e;
+  }
+
+  .ConversationDetails-panel-section__root:not(:first-child)::before {
+    border-top-color: #dedede;
+  }
+
+  .ConversationDetails__CallHistoryGroup__ItemIcon--Audio {
+    background-color: #000000;
+  }
+
+  .ConversationDetails__CallHistoryGroup__ItemIcon--Video {
+    background-color: #000000;
+  }
+
+  .ConversationDetails__CallHistoryGroup__ItemIcon--Adhoc {
+    background-color: #000000;
+  }
+
+  .ConversationDetails--nickname-actions::before {
+    background-color: #000000;
+  }
+
+  .ConversationDetails--nickname-actions--delete {
+    background-color: #000000;
+  }
+
+  .CriticalIdlePrimaryDeviceModal__description {
+    color: #5e5e5e;
+  }
+
+  .DonationThanksModal__title {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .DonationThanksModal__description {
+    color: #1b1b1b;
+  }
+
+  .DonationThanksModal__separator {
+    background-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .DonationThanksModal__toggle-text {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .DonationThanksModal__help-text {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .DonationForm .DonationForm__CurrencySelect.module-select select {
+    border-color: #b9b9b9;
+  }
+
+  .DonationForm__HelpFooter {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .DonationAmountPicker__PresetButton,
+  .DonationForm .DonationForm__CurrencySelect.module-select select,
+  .DonationForm.PreferencesDonations .DonationAmountPicker__CustomInput,
+  .DonationForm.PreferencesDonations
+    .DonationAmountPicker__CustomInput--selected,
+  .DonationForm.PreferencesDonations
+    .DonationAmountPicker__CustomInput--with-error {
+    background-color: #ffffff;
+    border-color: #b9b9b9;
+  }
+
+  .DonationAmountPicker__CustomInput:not(:focus)::placeholder {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .DonationCardForm__Info {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .DonationCardForm_Field input {
+    background-color: #ffffff;
+  }
+
+  .DonationCardForm_Label,
+  .DonationCardForm_Field input {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .DonationProgressModal__text {
+    color: #5e5e5e;
+  }
+
+  .FunButton[aria-expanded='true'] {
+    background: #e9e9e9;
+  }
+
+  .FunGifPreview__Backdrop {
+    background: #e9e9e9;
+  }
+
+  .FunGifPreview__ErrorIcon {
+    background-color: #b9b9b9;
+  }
+
+  .FunGrid__HeaderText {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunGrid__HeaderButton:hover,
+  .FunGrid__HeaderButton:focus {
+    background: #f6f6f6;
+  }
+
+  .FunGrid__HeaderIcon--More {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunGrid__HeaderPopoverDialog {
+    background: #ffffff;
+  }
+
+  .FunGrid__HeaderPopoverHeader {
+    color: #1b1b1b;
+  }
+
+  .FunItem__Button {
+    border: 1px solid #ffffff;
+  }
+
+  .FunItem__Button:hover,
+  .FunItem__Button:focus {
+    background: #f6f6f6;
+  }
+
+  .FunPanelEmojis__CustomizePreferredReactionsButton:hover,
+  .FunPanelEmojis__CustomizePreferredReactionsButton:focus {
+    background: #f6f6f6;
+  }
+
+  .FunPanelEmojis__CustomizePreferredReactionsButton__Icon {
+    background-color: #3b3b3b;
+  }
+
+  .FunPanelEmojis__CellPopoverDialog {
+    background: #ffffff;
+  }
+
+  .FunPanelEmojis__CellPopoverOverlayArrow svg {
+    fill: #ffffff;
+  }
+
+  .FunResults__Header {
+    color: #1b1b1b;
+  }
+
+  .FunResults__Button {
+    background: #f6f6f6;
+    color: #000000;
+  }
+
+  .FunPopover__Dialog {
+    background: #ffffff;
+  }
+
+  .FunScroller__Hint.FunScroller__Hint--Top {
+    background-image: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.08),
+      transparent
+    );
+  }
+
+  .FunScroller__Hint.FunScroller__Hint--Bottom {
+    background-image: linear-gradient(to top, rgba(0, 0, 0, 0.08), transparent);
+  }
+
+  .FunScroller__Viewport {
+    scrollbar-color: #b9b9b9 transparent;
+  }
+
+  .FunSearch__Icon {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSearch__Input {
+    color: #000000;
+    background: #e9e9e9;
+  }
+
+  .FunSearch__ClearButton {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSearch__Clear:hover .FunSearch__ClearButton,
+  .FunSearch__Clear:focus .FunSearch__ClearButton {
+    color: #3b3b3b;
+  }
+
+  .FunSkinTones__ListBoxItem:hover .FunSkinTones__ListBoxItemButton,
+  .FunSkinTones__ListBoxItem:focus .FunSkinTones__ListBoxItemButton {
+    background: #f6f6f6;
+  }
+
+  .FunSkinTones__ListBoxItem[data-selected='true']
+    .FunSkinTones__ListBoxItemButton {
+    background: #e9e9e9;
+  }
+
+  .FunSubNav__Scroller::before {
+    background: linear-gradient(to right, #ffffff 20%, transparent);
+  }
+
+  .FunSubNav__Scroller::after {
+    background: linear-gradient(to left, #ffffff 20%, transparent);
+  }
+
+  .FunSubNav__ScrollerMask--Left {
+    background: linear-gradient(to right, #ffffff 20%, transparent);
+  }
+
+  .FunSubNav__ScrollerMask--Right {
+    background: linear-gradient(to left, #ffffff 20%, transparent);
+  }
+
+  .FunSubNav__Button:hover {
+    background: #f6f6f6;
+  }
+
+  .FunSubNav__ListBoxItem:hover .FunSubNav__ListBoxItem__Button {
+    background: #f6f6f6;
+  }
+
+  .FunSubNav__ListBoxItem__ButtonIndicator {
+    background: #e9e9e9;
+  }
+
+  .FunSubNav__Icon--Recents {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--SmileysAndPeople {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--AnimalsAndNature {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--FoodAndDrink {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Activities {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--TravelAndPlaces {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Objects {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Symbols {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Flags {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Plus {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Trending {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Celebrate {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Love {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--ThumbsUp {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Surprised {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Excited {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Sad {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunSubNav__Icon--Angry {
+    background-color: rgba(0, 0, 0, 0.5);
+  }
+
+  .FunTabs__TabButton {
+    color: #1b1b1b;
+  }
+
+  .FunTabs__Tab:hover .FunTabs__TabButton,
+  .FunTabs__Tab:focus .FunTabs__TabButton {
+    background: #f6f6f6;
+  }
+
+  .FunTabs__TabButtonIndicator {
+    background: #e9e9e9;
+  }
+
+  .FunTabs__TabPanelInner {
+    background: #ffffff;
+  }
+
+  .FunTooltip {
+    background: #ffffff;
+    color: rgba(0, 0, 0, 0.8);
+  }
+
+  .InAnotherCallTooltip .module-tooltip-arrow::before {
+    border-color: #f0f0f0;
+  }
+
+  .LowDiskSpaceBackupImportModal__description {
+    color: #5e5e5e;
+  }
+
+  .Preferences__flow-value,
+  .Preferences__flow-description {
+    color: #5e5e5e;
+  }
+
+  .Preferences--backups-summary__container {
+    background-color: #f6f6f6;
+  }
+
+  .Preferences--backups-summary__type {
+    color: #5e5e5e;
+  }
+
+  .Preferences--backups-summary__note {
+    color: #5e5e5e;
+  }
+
+  .Preferences--backup-details__value {
+    color: #5e5e5e;
+  }
+
+  .Preferences--LocalBackupsSetupScreenBody {
+    color: #5e5e5e;
+  }
+
+  .Preferences--LocalBackupsConfirmKeyModalBody {
+    color: #5e5e5e;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__Item--Button:hover
+    .Preferences__ChatFolders__ChatSelection__ItemContent,
+  .Preferences__ChatFolders__ChatSelection__Item--Button
+    .Preferences__ChatFolders__ChatSelection__ItemContent[data-axo-contextmenu-state='open'],
+  .Preferences__ChatFolders__ChatSelection__Item--Clickable:hover
+    .Preferences__ChatFolders__ChatSelection__ItemContent,
+  .Preferences__ChatFolders__ChatSelection__Item--Clickable
+    .Preferences__ChatFolders__ChatSelection__ItemContent[data-axo-contextmenu-state='open'] {
+    background: #f6f6f6;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar {
+    background: #e9e9e9;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar--Add::before {
+    background-color: #3b3b3b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar--Folder::before {
+    background-color: #3b3b3b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar--UnreadChats::before {
+    background-color: #3b3b3b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar--DirectChats::before {
+    background-color: #3b3b3b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemAvatar--GroupChats::before {
+    background-color: #3b3b3b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemTitle {
+    color: #1b1b1b;
+  }
+
+  .Preferences__ChatFolders__ChatSelection__ItemDescription {
+    color: #5e5e5e;
+  }
+
+  .PreferencesDonations__description {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations__separator {
+    background-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .PreferencesDonations__section-header {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .PreferencesDonations__list-item:hover {
+    background: #f6f6f6;
+  }
+
+  .PreferencesDonations__list-item__icon--receipts::before {
+    background-color: #3b3b3b;
+  }
+
+  .PreferencesDonations__list-item__icon--faqs::before {
+    background-color: #3b3b3b;
+  }
+
+  .PreferencesDonations__list-item__text {
+    color: #1b1b1b;
+  }
+
+  .PreferencesDonations__list-item__chevron::before {
+    background-color: #848484;
+  }
+
+  .PreferencesDonations__list-item__open::before {
+    background-color: #848484;
+  }
+
+  .PreferencesDonations__mobile-info {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations--receiptList__info__text {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations--receiptList__year-header {
+    color: rgba(0, 0, 0, 0.85);
+    background-color: #ffffff;
+  }
+
+  .PreferencesDonations--receiptList__receipt-item:hover {
+    background-color: #f6f6f6;
+  }
+
+  .keyboard-mode .PreferencesDonations--receiptList__receipt-item:focus {
+    background-color: #f6f6f6;
+  }
+
+  .PreferencesDonations--receiptList__receipt-item__date {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .PreferencesDonations--receiptList__receipt-item__type {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations--receiptList__receipt-item__amount {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations--receiptList__empty-state__title {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations--receiptList__empty-state__description {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations__ReceiptModal__amount {
+    color: #1b1b1b;
+  }
+
+  .PreferencesDonations__ReceiptModal__separator {
+    background-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .PreferencesDonations__ReceiptModal__detail-label {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .PreferencesDonations__ReceiptModal__detail-value {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .PreferencesDonations__badge:hover {
+    background: #f0f0f0;
+  }
+
+  .PreferencesDonations__badge {
+    background: #f6f6f6;
+    border-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .PreferencesDonations__badge-label {
+    color: rgba(0, 0, 0, 0.85);
+  }
+
+  .PreferencesDonations__badge-processing-info {
+    color: rgba(0, 0, 0, 0.5);
+  }
+
+  .ProfileNameWarningModal .ProfileNameWarningModal__header-icon {
+    background-color: #000000;
+  }
+
+  .RemoteMegaphoneTooltip .module-tooltip-arrow::before {
+    border-color: #f0f0f0;
+  }
+
+  .SafetyTipsModal__DotsButton::before {
+    background: rgba(0, 0, 0, 0.08);
+  }
+
+  .SafetyTipsModal__DotsButton:not([data-state='active']):hover::before,
+  .SafetyTipsModal__DotsButton:not([data-state='active']):focus::before {
+    background: rgba(0, 0, 0, 0.3);
+  }
+
+  .SafetyTipsModal__DotsButton[data-state='active']::before {
+    background: rgba(0, 0, 0, 0.85);
+  }
+
+  .bg-color-fill-destructive\/10 {
+    background-color: rgba(253, 37, 18, 0.1);
+  }
+
+  .bg-color-fill-primary-pressed\/20 {
+    background-color: rgba(59, 74, 244, 0.2);
+  }
+
+  .bg-color-fill-primary\/10 {
+    background-color: rgba(70, 85, 255, 0.1);
+  }
+
+  .bg-legacy-warning-badge\/12 {
+    background-color: rgba(200, 65, 24, 0.12);
+  }
+
+  .group-enabled\:group-active\:bg-color-fill-destructive\/15:is(
+      :where(.group):enabled *
+    ):is(:where(.group):active *) {
+    background-color: rgba(253, 37, 18, 0.15);
+  }
+
+  .group-enabled\:group-active\:bg-color-fill-primary\/15:is(
+      :where(.group):enabled *
+    ):is(:where(.group):active *) {
+    background-color: rgba(70, 85, 255, 0.15);
+  }
+
+  .dark-theme .module-message__text--delete-for-everyone {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .module-message__metadata {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .module-message__metadata--outline-only-bubble,
+  .dark-theme .module-message__metadata--sticker {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .module-message__metadata--with-image-no-caption {
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .dark-theme .module-message__metadata__status-icon--with-image-no-caption {
+    color: #f6f6f6;
+  }
+
+  .dark-theme
+    .module-conversation-list__item--contact-or-conversation:hover:not(
+      :disabled,
+      .module-conversation-list__item--contact-or-conversation--disabled,
+      .module-conversation-list__item--contact-or-conversation--is-selected
+    ),
+  .dark-theme
+    .module-conversation-list__item--contact-or-conversation[data-axo-contextmenu-state='open'] {
+    background-color: #3b3b3b;
+  }
+
+  .dark-theme
+    .module-conversation-list__item--contact-or-conversation:hover:not(
+      :disabled,
+      .module-conversation-list__item--contact-or-conversation--disabled,
+      .module-conversation-list__item--contact-or-conversation--is-selected
+    )
+    .module-conversation-list__item--contact-or-conversation__unread-indicator,
+  .dark-theme
+    .module-conversation-list__item--contact-or-conversation[data-axo-contextmenu-state='open']
+    .module-conversation-list__item--contact-or-conversation__unread-indicator {
+    border-color: #3b3b3b;
+  }
+
+  .dark-theme
+    .keyboard-mode
+    .module-conversation-list__item--contact-or-conversation:focus:not(
+      :disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--is-selected
+    ) {
+    background-color: #3b3b3b;
+  }
+
+  .dark-theme
+    .keyboard-mode
+    .module-conversation-list__item--contact-or-conversation:focus:not(
+      :disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--disabled,
+      .keyboard-mode
+        .module-conversation-list__item--contact-or-conversation--is-selected
+    )
+    .module-conversation-list__item--contact-or-conversation__unread-indicator {
+    border-color: #3b3b3b;
+  }
+
+  .dark-theme .module-conversation-list__generic-checkbox-icon {
+    background-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme
+    .module-conversation-list__generic-checkbox-icon--contact::before {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .module-conversation-list__generic-checkbox-icon--group::before {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--profile {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--verified {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--blocked {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--message-request {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--no-dms {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--connections {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--chat-x {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--person {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--phone {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--group {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--about {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--note {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--group-question {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--direct-question {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--label {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .AboutContactModal__row__icon--qr-code {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .BackupMediaDownloadProgressSettings__description {
+    color: #b9b9b9;
+  }
+
+  .dark-theme
+    .CallsNewCall__ItemActionButtonTooltip
+    .module-tooltip-arrow::before {
+    border-color: #2e2e2e;
+  }
+
+  .dark-theme
+    .CallLinkDetails__ApproveAllMembersDisabledTooltip
+    .module-tooltip-arrow::before,
+  .dark-theme
+    .CallLinkDetails__DeleteLinkTooltip
+    .module-tooltip-arrow::before {
+    border-color: #2e2e2e;
+  }
+
+  .dark-theme .module-composition-input__view-once-placeholder {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .ConversationDetails-membership-list__add-members-icon,
+  .dark-theme .ConversationDetails-membership-list__add-to-group-icon,
+  .dark-theme .ConversationDetails-groups__add-members-icon,
+  .dark-theme .ConversationDetails-groups__add-to-group-icon {
+    background: #1b1b1b;
+  }
+
+  .dark-theme .ConversationDetails-membership-list__add-members-icon::before,
+  .dark-theme .ConversationDetails-membership-list__add-to-group-icon::before,
+  .dark-theme .ConversationDetails-groups__add-members-icon::before,
+  .dark-theme .ConversationDetails-groups__add-to-group-icon::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme
+    .mouse-mode
+    .ConversationDetails-membership-list__member-label-button:hover {
+    background-color: #1b1b1b;
+  }
+
+  .dark-theme .ConversationDetails-membership-list__member-label-button {
+    color: rgba(255, 255, 255, 0.55);
+  }
+
+  .dark-theme .ConversationDetails__pending--info {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--color::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--timer::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--notifications::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--mute::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--media::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--mention::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--lock::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--archive::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--approve::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--approveAllMembers::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--bell::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--link::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--share::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--reset::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--trash::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--delete::after {
+    background-color: #f44336;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--invites::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--edit::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--forward::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--down {
+    background-color: #1b1b1b;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--down::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--leave::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--block::after {
+    background-color: #f44336;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--unblock::after {
+    background-color: #2c6bed;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--verify::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--help::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--invite::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--official::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--heart::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--tag::after {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--spam::after {
+    background-color: #f44336;
+  }
+
+  .dark-theme .ConversationDetails-icon__icon--terminate::after {
+    background-color: #f44336;
+  }
+
+  .dark-theme
+    .ConversationDetails-panel-row__root--button[data-hovered]:not(:disabled) {
+    background-color: #1b1b1b;
+  }
+
+  .dark-theme .ConversationDetails-panel-row__info {
+    color: #b9b9b9;
+  }
+
+  .dark-theme
+    .ConversationDetails-panel-section__root:not(:first-child)::before {
+    border-top-color: #4a4a4a;
+  }
+
+  .dark-theme .ConversationDetails__CallHistoryGroup__ItemIcon--Audio {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails__CallHistoryGroup__ItemIcon--Video {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails__CallHistoryGroup__ItemIcon--Adhoc {
+    background-color: #dedede;
+  }
+
+  .dark-theme .ConversationDetails--nickname-actions::before {
+    background-color: #ffffff;
+  }
+
+  .dark-theme .ConversationDetails--nickname-actions--delete {
+    background-color: #ffffff;
+  }
+
+  .dark-theme .CriticalIdlePrimaryDeviceModal__description {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .DonationThanksModal__title {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .DonationThanksModal__description {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .DonationThanksModal__separator {
+    background-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .DonationThanksModal__toggle-text {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .DonationThanksModal__help-text {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .DonationForm .DonationForm__CurrencySelect.module-select select {
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .DonationForm__HelpFooter {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .DonationAmountPicker__PresetButton,
+  .dark-theme .DonationForm .DonationForm__CurrencySelect.module-select select,
+  .dark-theme
+    .DonationForm.PreferencesDonations
+    .DonationAmountPicker__CustomInput,
+  .dark-theme
+    .DonationForm.PreferencesDonations
+    .DonationAmountPicker__CustomInput--selected,
+  .dark-theme
+    .DonationForm.PreferencesDonations
+    .DonationAmountPicker__CustomInput--with-error {
+    background-color: #262626;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .DonationAmountPicker__CustomInput:not(:focus)::placeholder {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .DonationCardForm__Info {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .DonationCardForm_Field input {
+    background-color: #262626;
+  }
+
+  .dark-theme .DonationCardForm_Label,
+  .dark-theme .DonationCardForm_Field input {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .DonationProgressModal__text {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .FunButton[aria-expanded='true'] {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunGifPreview__Backdrop {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunGifPreview__ErrorIcon {
+    background-color: #848484;
+  }
+
+  .dark-theme .FunGrid__HeaderText {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunGrid__HeaderButton:hover,
+  .dark-theme .FunGrid__HeaderButton:focus {
+    background: #343434;
+  }
+
+  .dark-theme .FunGrid__HeaderIcon--More {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunGrid__HeaderPopoverDialog {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunGrid__HeaderPopoverHeader {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .FunItem__Button {
+    border: 1px solid #3b3b3b;
+  }
+
+  .dark-theme .FunItem__Button:hover,
+  .dark-theme .FunItem__Button:focus {
+    background: #343434;
+  }
+
+  .dark-theme .FunPanelEmojis__CustomizePreferredReactionsButton:hover,
+  .dark-theme .FunPanelEmojis__CustomizePreferredReactionsButton:focus {
+    background: #343434;
+  }
+
+  .dark-theme .FunPanelEmojis__CustomizePreferredReactionsButton__Icon {
+    background-color: #dedede;
+  }
+
+  .dark-theme .FunPanelEmojis__CellPopoverDialog {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunPanelEmojis__CellPopoverOverlayArrow svg {
+    fill: #3b3b3b;
+  }
+
+  .dark-theme .FunResults__Header {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .FunResults__Button {
+    background: #343434;
+    color: #e9e9e9;
+  }
+
+  .dark-theme .FunPopover__Dialog {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunScroller__Hint.FunScroller__Hint--Top {
+    background-image: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.12),
+      transparent
+    );
+  }
+
+  .dark-theme .FunScroller__Hint.FunScroller__Hint--Bottom {
+    background-image: linear-gradient(to top, rgba(0, 0, 0, 0.12), transparent);
+  }
+
+  .dark-theme .FunScroller__Viewport {
+    scrollbar-color: #848484 transparent;
+  }
+
+  .dark-theme .FunSearch__Icon {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSearch__Input {
+    color: #ffffff;
+    background: #2e2e2e;
+  }
+
+  .dark-theme .FunSearch__ClearButton {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSearch__Clear:hover .FunSearch__ClearButton,
+  .dark-theme .FunSearch__Clear:focus .FunSearch__ClearButton {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .FunSkinTones__ListBoxItem:hover .FunSkinTones__ListBoxItemButton,
+  .dark-theme
+    .FunSkinTones__ListBoxItem:focus
+    .FunSkinTones__ListBoxItemButton {
+    background: #343434;
+  }
+
+  .dark-theme
+    .FunSkinTones__ListBoxItem[data-selected='true']
+    .FunSkinTones__ListBoxItemButton {
+    background: #5e5e5e;
+  }
+
+  .dark-theme .FunSubNav__Scroller::before {
+    background: linear-gradient(to right, #3b3b3b 20%, transparent);
+  }
+
+  .dark-theme .FunSubNav__Scroller::after {
+    background: linear-gradient(to left, #3b3b3b 20%, transparent);
+  }
+
+  .dark-theme .FunSubNav__ScrollerMask--Left {
+    background: linear-gradient(to right, #3b3b3b 20%, transparent);
+  }
+
+  .dark-theme .FunSubNav__ScrollerMask--Right {
+    background: linear-gradient(to left, #3b3b3b 20%, transparent);
+  }
+
+  .dark-theme .FunSubNav__Button:hover {
+    background: #343434;
+  }
+
+  .dark-theme .FunSubNav__ListBoxItem:hover .FunSubNav__ListBoxItem__Button {
+    background: #343434;
+  }
+
+  .dark-theme .FunSubNav__ListBoxItem__ButtonIndicator {
+    background: #5e5e5e;
+  }
+
+  .dark-theme .FunSubNav__Icon--Recents {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--SmileysAndPeople {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--AnimalsAndNature {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--FoodAndDrink {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Activities {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--TravelAndPlaces {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Objects {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Symbols {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Flags {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Plus {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Trending {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Celebrate {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Love {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--ThumbsUp {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Surprised {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Excited {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Sad {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunSubNav__Icon--Angry {
+    background-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .FunTabs__TabButton {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .FunTabs__Tab:hover .FunTabs__TabButton,
+  .dark-theme .FunTabs__Tab:focus .FunTabs__TabButton {
+    background: #343434;
+  }
+
+  .dark-theme .FunTabs__TabButtonIndicator {
+    background: #5e5e5e;
+  }
+
+  .dark-theme .FunTabs__TabPanelInner {
+    background: #3b3b3b;
+  }
+
+  .dark-theme .FunTooltip {
+    background: #3b3b3b;
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .dark-theme .InAnotherCallTooltip .module-tooltip-arrow::before {
+    border-color: #2e2e2e;
+  }
+
+  .dark-theme .LowDiskSpaceBackupImportModal__description {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences__flow-value,
+  .dark-theme .Preferences__flow-description {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences--backups-summary__container {
+    background-color: #2e2e2e;
+  }
+
+  .dark-theme .Preferences--backups-summary__type {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences--backups-summary__note {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences--backup-details__value {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences--LocalBackupsSetupScreenBody {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .Preferences--LocalBackupsConfirmKeyModalBody {
+    color: #b9b9b9;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__Item--Button:hover
+    .Preferences__ChatFolders__ChatSelection__ItemContent,
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__Item--Button
+    .Preferences__ChatFolders__ChatSelection__ItemContent[data-axo-contextmenu-state='open'],
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__Item--Clickable:hover
+    .Preferences__ChatFolders__ChatSelection__ItemContent,
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__Item--Clickable
+    .Preferences__ChatFolders__ChatSelection__ItemContent[data-axo-contextmenu-state='open'] {
+    background: #2e2e2e;
+  }
+
+  .dark-theme .Preferences__ChatFolders__ChatSelection__ItemAvatar {
+    background: #1b1b1b;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__ItemAvatar--Add::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__ItemAvatar--Folder::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__ItemAvatar--UnreadChats::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__ItemAvatar--DirectChats::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme
+    .Preferences__ChatFolders__ChatSelection__ItemAvatar--GroupChats::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme .Preferences__ChatFolders__ChatSelection__ItemTitle {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .Preferences__ChatFolders__ChatSelection__ItemDescription {
+    color: #b9b9b9;
+  }
+
+  .dark-theme .PreferencesDonations__description {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations__separator {
+    background-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .PreferencesDonations__section-header {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .PreferencesDonations__list-item:hover {
+    background: #2e2e2e;
+  }
+
+  .dark-theme .PreferencesDonations__list-item__icon--receipts::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme .PreferencesDonations__list-item__icon--faqs::before {
+    background-color: #dedede;
+  }
+
+  .dark-theme .PreferencesDonations__list-item__text {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .PreferencesDonations__list-item__chevron::before {
+    background-color: #b9b9b9;
+  }
+
+  .dark-theme .PreferencesDonations__list-item__open::before {
+    background-color: #b9b9b9;
+  }
+
+  .dark-theme .PreferencesDonations__mobile-info {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__info__text {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__year-header {
+    color: rgba(255, 255, 255, 0.85);
+    background-color: #121212;
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__receipt-item:hover {
+    background-color: #2e2e2e;
+  }
+
+  .dark-theme
+    .keyboard-mode
+    .PreferencesDonations--receiptList__receipt-item:focus {
+    background-color: #2e2e2e;
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__receipt-item__date {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__receipt-item__type {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__receipt-item__amount {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__empty-state__title {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations--receiptList__empty-state__description {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations__ReceiptModal__amount {
+    color: #e9e9e9;
+  }
+
+  .dark-theme .PreferencesDonations__ReceiptModal__separator {
+    background-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .PreferencesDonations__ReceiptModal__detail-label {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .PreferencesDonations__ReceiptModal__detail-value {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .dark-theme .PreferencesDonations__badge:hover {
+    background: #2e2e2e;
+  }
+
+  .dark-theme .PreferencesDonations__badge {
+    background: #262626;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dark-theme .PreferencesDonations__badge-label {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .PreferencesDonations__badge-processing-info {
+    color: rgba(255, 255, 255, 0.55);
+  }
+
+  .dark-theme .ProfileNameWarningModal .ProfileNameWarningModal__header-icon {
+    background-color: #e9e9e9;
+  }
+
+  .dark-theme .RemoteMegaphoneTooltip .module-tooltip-arrow::before {
+    border-color: #2e2e2e;
+  }
+
+  .dark-theme .SafetyTipsModal__DotsButton::before {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .dark-theme
+    .SafetyTipsModal__DotsButton:not([data-state='active']):hover::before,
+  .dark-theme
+    .SafetyTipsModal__DotsButton:not([data-state='active']):focus::before {
+    background: rgba(255, 255, 255, 0.3);
+  }
+
+  .dark-theme .SafetyTipsModal__DotsButton[data-state='active']::before {
+    background: rgba(255, 255, 255, 0.85);
+  }
+
+  .dark-theme .bg-color-fill-destructive\/10 {
+    background-color: rgba(251, 67, 50, 0.1);
+  }
+
+  .dark-theme .bg-color-fill-primary-pressed\/20 {
+    background-color: rgba(72, 86, 242, 0.2);
+  }
+
+  .dark-theme .bg-color-fill-primary\/10 {
+    background-color: rgba(85, 99, 255, 0.1);
+  }
+
+  .dark-theme .bg-legacy-warning-badge\/12 {
+    background-color: rgba(235, 151, 125, 0.12);
+  }
+
+  .dark-theme
+    .group-enabled\:group-active\:bg-color-fill-destructive\/15:is(
+      :where(.group):enabled *
+    ):is(:where(.group):active *) {
+    background-color: rgba(251, 67, 50, 0.15);
+  }
+
+  .dark-theme
+    .group-enabled\:group-active\:bg-color-fill-primary\/15:is(
+      :where(.group):enabled *
+    ):is(:where(.group):active *) {
+    background-color: rgba(85, 99, 255, 0.15);
+  }
+
+  .bg-\[\#000\]\/12 {
+    background-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .bg-\[\#000\]\/20 {
+    background-color: rgba(0, 0, 0, 0.2);
+  }
+
+  .bg-\[black\]\/70 {
+    background-color: rgba(0, 0, 0, 0.7);
+  }
+
+  @media (hover: hover) {
+    .hover\:bg-\[\#000\]\/40:hover {
+      background-color: rgba(0, 0, 0, 0.4);
+    }
+  }
+
+  @media (width >= 40rem) {
+    .container {
+      max-width: 40rem;
+    }
+  }
+
+  @media (width >= 48rem) {
+    .container {
+      max-width: 48rem;
+    }
+  }
+
+  @media (width >= 64rem) {
+    .container {
+      max-width: 64rem;
+    }
+  }
+
+  @media (width >= 80rem) {
+    .container {
+      max-width: 80rem;
+    }
+  }
+
+  @media (width >= 96rem) {
+    .container {
+      max-width: 96rem;
+    }
+  }
+
+  :where(.space-y-2 > :not(:last-child)) {
+    --tw-space-y-reverse: 0;
+    margin-block-start: calc(
+      calc(var(--spacing) * 2) * var(--tw-space-y-reverse)
+    );
+    margin-block-end: calc(
+      calc(var(--spacing) * 2) * calc(1 - var(--tw-space-y-reverse))
+    );
+  }
+
+  :where(.space-y-3 > :not(:last-child)) {
+    --tw-space-y-reverse: 0;
+    margin-block-start: calc(
+      calc(var(--spacing) * 3) * var(--tw-space-y-reverse)
+    );
+    margin-block-end: calc(
+      calc(var(--spacing) * 3) * calc(1 - var(--tw-space-y-reverse))
+    );
+  }
+
+  :where(.space-y-9 > :not(:last-child)) {
+    --tw-space-y-reverse: 0;
+    margin-block-start: calc(
+      calc(var(--spacing) * 9) * var(--tw-space-y-reverse)
+    );
+    margin-block-end: calc(
+      calc(var(--spacing) * 9) * calc(1 - var(--tw-space-y-reverse))
+    );
+  }
+
+  :where(.space-y-16 > :not(:last-child)) {
+    --tw-space-y-reverse: 0;
+    margin-block-start: calc(
+      calc(var(--spacing) * 16) * var(--tw-space-y-reverse)
+    );
+    margin-block-end: calc(
+      calc(var(--spacing) * 16) * calc(1 - var(--tw-space-y-reverse))
+    );
+  }
+
+  .bg-linear-0 {
+    --tw-gradient-position: 0deg in oklab;
+  }
+
+  .bg-linear-to-b {
+    --tw-gradient-position: to bottom in oklab;
+  }
+
+  .bg-linear-to-l {
+    --tw-gradient-position: to left in oklab;
+  }
+
+  .bg-linear-to-r {
+    --tw-gradient-position: to right in oklab;
+  }
+
+  .bg-linear-to-t {
+    --tw-gradient-position: to top in oklab;
+  }
+
+  :is(.\*\:relative > *) {
+    position: relative;
+  }
+
+  :is(.\*\:z-20 > *) {
+    z-index: 20;
+  }
+
+  :is(.\*\:w-full > *) {
+    width: 100%;
+  }
+
+  :is(.\*\*\:text-label-primary-on-color\! *) {
+    color: var(--color-label-primary-on-color) !important;
+  }
+
+  .not-hover\:not-focus-within\:scrollbar-thumb-transparent:not(*:hover):not(
+      *:focus-within
+    ) {
+    --tw-scrollbar-thumb: transparent;
+    scrollbar-color: var(--tw-scrollbar-thumb) var(--tw-scrollbar-track);
+    --tw-scrollbar-thumb: var(--color-transparent);
+    scrollbar-color: var(--tw-scrollbar-thumb, var(--default-scrollbar-thumb))
+      var(--tw-scrollbar-track, var(--default-scrollbar-track));
+  }
+
+  @media not (hover: hover) {
+    .not-hover\:not-focus-within\:scrollbar-thumb-transparent:not(
+      *:focus-within
+    ) {
+      --tw-scrollbar-thumb: transparent;
+      scrollbar-color: var(--tw-scrollbar-thumb) var(--tw-scrollbar-track);
+      --tw-scrollbar-thumb: var(--color-transparent);
+      scrollbar-color: var(--tw-scrollbar-thumb, var(--default-scrollbar-thumb))
+        var(--tw-scrollbar-track, var(--default-scrollbar-track));
+    }
+  }
+
+  .not-dark\:hidden:not(*:where(.dark-theme, .dark-theme *)) {
+    display: none;
+  }
+
+  @media not (forced-colors: active) {
+    .not-forced-colors\:outline-none {
+      --tw-outline-style: none;
+      outline-style: none;
+    }
+  }
+
+  @media (hover: hover) {
+    .group-hover\:opacity-100:is(:where(.group):hover *) {
+      opacity: 100%;
+    }
+  }
+
+  @media (hover: hover) {
+    .group-not-aria-disabled\/action\:group-hover\/action\:bg-background-secondary:is(
+        :where(.group\/action):not(*[aria-disabled='true']) *
+      ):is(:where(.group\/action):hover *) {
+      background-color: var(--color-background-secondary);
+    }
+  }
+
+  @media (hover: hover) {
+    .group-not-aria-disabled\/action\:group-hover\/action\:text-label-primary:is(
+        :where(.group\/action):not(*[aria-disabled='true']) *
+      ):is(:where(.group\/action):hover *) {
+      color: var(--color-label-primary);
+    }
+  }
+
+  .group-focus-visible\/action\:outline-focus-ring:is(
+    :where(.group\/action):focus-visible *
+  ) {
+    outline-style: solid;
+    outline-color: var(
+      --axo-outline-focus-ring-color,
+      var(--color-border-focused)
+    );
+    outline-width: 2.5px;
+  }
+
+  .group-focus-visible\/clear\:outline-focus-ring:is(
+    :where(.group\/clear):focus-visible *
+  ) {
+    outline-style: solid;
+    outline-color: var(
+      --axo-outline-focus-ring-color,
+      var(--color-border-focused)
+    );
+    outline-width: 2.5px;
+  }
+
+  .group-active\:bg-fill-secondary-pressed:is(:where(.group):active *) {
+    background-color: var(--color-fill-secondary-pressed);
+  }
+
+  @media (hover: hover) {
+    .group-enabled\:group-hover\:opacity-100:is(:where(.group):enabled *):is(
+        :where(.group):hover *
+      ) {
+      opacity: 100%;
+    }
+  }
+
+  @media (hover: hover) {
+    .group-enabled\:group-hover\:\[--axo-select-trigger-mask-start\:transparent\]:is(
+        :where(.group):enabled *
+      ):is(:where(.group):hover *) {
+      --axo-select-trigger-mask-start: transparent;
+    }
+  }
+
+  .group-enabled\:group-focus\:opacity-100:is(:where(.group):enabled *):is(
+      :where(.group):focus *
+    ) {
+    opacity: 100%;
+  }
+
+  .group-enabled\:group-focus\:\[--axo-select-trigger-mask-start\:transparent\]:is(
+      :where(.group):enabled *
+    ):is(:where(.group):focus *) {
+    --axo-select-trigger-mask-start: transparent;
+  }
+
+  .group-enabled\:group-active\:bg-color-fill-primary-pressed:is(
+      :where(.group):enabled *
+    ):is(:where(.group):active *) {
+    background-color: var(--color-color-fill-primary-pressed);
+  }
+
+  .group-enabled\:group-active\:opacity-100:is(:where(.group):enabled *):is(
+      :where(.group):active *
+    ) {
+    opacity: 100%;
+  }
+
+  @media (hover: hover) {
+    .group-enabled\/clear\:group-hover\/clear\:bg-background-secondary:is(
+        :where(.group\/clear):enabled *
+      ):is(:where(.group\/clear):hover *) {
+      background-color: var(--color-background-secondary);
+    }
+  }
+
+  @media (hover: hover) {
+    .group-enabled\/clear\:group-hover\/clear\:text-label-primary:is(
+        :where(.group\/clear):enabled *
+      ):is(:where(.group\/clear):hover *) {
+      color: var(--color-label-primary);
+    }
+  }
+
+  .group-has-\[input\:placeholder-shown\]\:hidden:is(
+    :where(.group):has(*:is(input:placeholder-shown)) *
+  ) {
+    display: none;
+  }
+
+  .group-data-disabled\:w-7\.5:is(:where(.group)[data-disabled] *) {
+    width: calc(var(--spacing) * 7.5);
+  }
+
+  .group-data-disabled\:rounded-full:is(:where(.group)[data-disabled] *) {
+    border-radius: calc(infinity * 1px);
+  }
+
+  .group-data-focused\:opacity-100:is(:where(.group)[data-focused] *) {
+    opacity: 100%;
+  }
+
+  .group-data-hovered\:underline:is(:where(.group)[data-hovered] *) {
+    text-decoration-line: underline;
+  }
+
+  .group-data-\[state\=active\]\:bg-label-primary:is(
+    :where(.group)[data-state='active'] *
+  ) {
+    background-color: var(--color-label-primary);
+  }
+
+  .group-data-\[state\=checked\]\:translate-x-0:is(
+    :where(.group)[data-state='checked'] *
+  ) {
+    --tw-translate-x: calc(var(--spacing) * 0);
+    translate: var(--tw-translate-x) var(--tw-translate-y);
+  }
+
+  .group-data-\[state\=checked\]\:opacity-100:is(
+    :where(.group)[data-state='checked'] *
+  ) {
+    opacity: 100%;
+  }
+
+  .group-data-\[state\=open\]\:opacity-100:is(
+    :where(.group)[data-state='open'] *
+  ) {
+    opacity: 100%;
+  }
+
+  .group-data-\[state\=open\]\:\[--axo-select-trigger-mask-start\:transparent\]:is(
+    :where(.group)[data-state='open'] *
+  ) {
+    --axo-select-trigger-mask-start: transparent;
+  }
+
+  .peer-has-\[input\]\:overflow-hidden:is(:where(.peer):has(*:is(input)) ~ *) {
+    overflow: hidden;
+  }
+
+  .placeholder\:text-label-placeholder::placeholder {
+    color: var(--color-label-placeholder);
+  }
+
+  .first\:mt-0:first-child {
+    margin-top: calc(var(--spacing) * 0);
+  }
+
+  .first\:ps-1:first-child {
+    padding-inline-start: calc(var(--spacing) * 1);
+  }
+
+  .first\:ps-1\.5:first-child {
+    padding-inline-start: calc(var(--spacing) * 1.5);
+  }
+
+  .first\:ps-2\.5:first-child {
+    padding-inline-start: calc(var(--spacing) * 2.5);
+  }
+
+  .last\:pe-1:last-child {
+    padding-inline-end: calc(var(--spacing) * 1);
+  }
+
+  .last\:pe-1\.5:last-child {
+    padding-inline-end: calc(var(--spacing) * 1.5);
+  }
+
+  .last\:pe-2\.5:last-child {
+    padding-inline-end: calc(var(--spacing) * 2.5);
+  }
+
+  .focus-within\:border-border-focused:focus-within {
+    border-color: var(--color-border-focused);
+  }
+
+  @media (hover: hover) {
+    .hover\:bg-\[\#000\]\/40:hover {
+      background-color: rgba(0, 0, 0, 0.4);
+    }
+  }
+
+  @media (hover: hover) {
+    .hover\:bg-fill-secondary:hover {
+      background-color: var(--color-fill-secondary);
+    }
+  }
+
+  @media (hover: hover) {
+    .hover\:underline:hover {
+      text-decoration-line: underline;
+    }
+  }
+
+  @media (hover: hover) {
+    .not-aria-disabled\:hover\:bg-fill-secondary:not(
+        *[aria-disabled='true']
+      ):hover {
+      background-color: var(--color-fill-secondary);
+    }
+  }
+
+  @media (hover: hover) {
+    .not-aria-disabled\:hover\:not-aria-pressed\:bg-fill-secondary:not(
+        *[aria-disabled='true']
+      ):hover:not(*[aria-pressed='true']) {
+      background-color: var(--color-fill-secondary);
+    }
+  }
+
+  .focus\:border-border-focused:focus {
+    border-color: var(--color-border-focused);
+  }
+
+  .focus\:bg-fill-secondary:focus {
+    background-color: var(--color-fill-secondary);
+  }
+
+  .focus\:bg-fill-selected:focus {
+    background-color: var(--color-fill-selected);
+  }
+
+  @media not (forced-colors: active) {
+    .not-forced-colors\:focus\:outline-focus-ring:focus {
+      outline-style: solid;
+      outline-color: var(
+        --axo-outline-focus-ring-color,
+        var(--color-border-focused)
+      );
+      outline-width: 2.5px;
+    }
+  }
+
+  .focus-visible\:border-color-label-light:focus-visible {
+    border-color: var(--color-color-label-light);
+  }
+
+  .focus-visible\:bg-fill-selected:focus-visible {
+    background-color: var(--color-fill-selected);
+  }
+
+  .not-aria-disabled\:active\:bg-color-fill-affirmative-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-color-fill-affirmative-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-color-fill-destructive-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-color-fill-destructive-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-color-fill-primary-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-color-fill-primary-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-fill-floating-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-fill-floating-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-fill-secondary-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-fill-secondary-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-message-fill-incoming-secondary-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-message-fill-incoming-secondary-pressed);
+  }
+
+  .not-aria-disabled\:active\:bg-message-fill-outgoing-secondary-pressed:not(
+      *[aria-disabled='true']
+    ):active {
+    background-color: var(--color-message-fill-outgoing-secondary-pressed);
+  }
+
+  @media (hover: hover) {
+    .enabled\:hover\:bg-fill-secondary:enabled:hover {
+      background-color: var(--color-fill-secondary);
+    }
+  }
+
+  .enabled\:active\:bg-color-fill-primary-pressed:enabled:active {
+    background-color: var(--color-color-fill-primary-pressed);
+  }
+
+  .enabled\:active\:bg-fill-floating-pressed:enabled:active {
+    background-color: var(--color-fill-floating-pressed);
+  }
+
+  .enabled\:active\:bg-fill-secondary-pressed:enabled:active {
+    background-color: var(--color-fill-secondary-pressed);
+  }
+
+  .disabled\:text-label-disabled:disabled {
+    color: var(--color-label-disabled);
+  }
+}

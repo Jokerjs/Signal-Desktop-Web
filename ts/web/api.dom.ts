@@ -1180,6 +1180,29 @@ export async function updateConversationPin({
   return parseJsonResponse(response);
 }
 
+export async function updateConversationMarkedUnread({
+  conversationId,
+  markedUnread,
+  runtimeSessionId = currentMessageRuntimeSessionId,
+}: Readonly<{
+  conversationId: string;
+  markedUnread: boolean;
+  runtimeSessionId?: string;
+}>): Promise<{ ok: true; version: number }> {
+  const response = await fetch(apiUrl('/conversations/marked-unread'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      conversationId,
+      markedUnread,
+      sessionId: runtimeSessionId,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function requestAttachmentBackfill({
   conversationId,
   conversationType,
