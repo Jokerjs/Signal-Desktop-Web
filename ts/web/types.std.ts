@@ -23,6 +23,7 @@ import type {
   CustomColorType,
 } from '../types/Colors.std.ts';
 import type { DurationInSeconds } from '../util/durations/index.std.ts';
+import type { AvatarDataType } from '../types/Avatar.std.ts';
 
 export type WebAccount = Readonly<{
   aci?: string;
@@ -386,6 +387,7 @@ export type WebConversation = Readonly<{
   username?: string;
   avatarUrl?: string;
   avatarUrlPath?: string;
+  avatars?: ReadonlyArray<AvatarDataType>;
   remoteAvatarUrl?: string;
   color?: string;
   conversationColor?: ConversationColorType;

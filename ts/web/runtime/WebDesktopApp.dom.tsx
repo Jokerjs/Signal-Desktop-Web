@@ -3130,6 +3130,33 @@ export function WebDesktopApp({
         return;
       }
       setShell(current => {
+        if (attributes.__signalWebDeleteConversation === true) {
+          if (!current.conversationLookup[conversationId]) {
+            return current;
+          }
+          const nextConversationLookup = { ...current.conversationLookup };
+          delete nextConversationLookup[conversationId];
+          const updated = normalizeChatShellForLinkedSession(
+            {
+              ...current,
+              conversationLookup: nextConversationLookup,
+              messages: current.messages.filter(
+                message => message.conversationId !== conversationId
+              ),
+              selectedConversationId:
+                current.selectedConversationId === conversationId
+                  ? undefined
+                  : current.selectedConversationId,
+            },
+            linkedSession
+          );
+          persistShell(updated);
+          window.reduxActions?.conversations?.conversationRemoved?.(
+            conversationId
+          );
+          return updated;
+        }
+
         const existing = current.conversationLookup[conversationId];
         if (!existing) {
           if (typeof attributes.id !== 'string') {

@@ -28,6 +28,7 @@ import { getMessagePropStatus } from '../../state/selectors/message.preload.ts';
 import type { AciString } from '../../types/ServiceId.std.ts';
 import { isAciString } from '../../util/isAciString.std.ts';
 import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
+import { getDefaultAvatars } from '../../types/Avatar.std.ts';
 
 const log = createLogger('WebStateAdapter');
 const { isEqual } = lodash;
@@ -1138,6 +1139,10 @@ export function toDesktopConversation(
     aboutEmoji: conversation.aboutEmoji,
     activeAt: conversation.activeAt,
     announcementsOnly: conversation.announcementsOnly,
+    avatars:
+      conversation.avatars && conversation.avatars.length
+        ? conversation.avatars
+        : getDefaultAvatars(isGroup),
     avatarUrl: conversation.avatarUrl,
     avatarUrlPath: conversation.avatarUrlPath,
     badges: [],
@@ -1282,6 +1287,10 @@ function ensureNoteToSelf(
         'avatarUrlPath' in account
           ? account.avatarUrlPath
           : existing.avatarUrlPath,
+      avatars:
+        existing.avatars && existing.avatars.length
+          ? existing.avatars
+          : getDefaultAvatars(false),
       capabilities: {
         ...existing.capabilities,
         attachmentBackfill: true,
@@ -1344,6 +1353,7 @@ function ensureNoteToSelf(
         username: account.username,
         avatarUrl: account.avatarUrl,
         avatarUrlPath: account.avatarUrlPath,
+        avatars: getDefaultAvatars(false),
         capabilities: {
           attachmentBackfill: true,
         },

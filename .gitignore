@@ -8,8 +8,8 @@ build/*.policy
 build/emoji-data.json
 stylesheets/*.css.map
 /dist
-/web-dist
 /server-dist
+/web-dist
 .DS_Store
 config/local.json
 config/local-*

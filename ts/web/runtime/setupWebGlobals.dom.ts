@@ -16,6 +16,9 @@ import {
   sendDirectTextMessage,
   sendGroupTextMessage,
   sendMessageRequestResponseSync,
+  updateConversationArchive,
+  updateConversationMute,
+  updateConversationPin,
 } from '../api.dom.ts';
 import {
   getDesktopMessageMetrics,
@@ -44,6 +47,7 @@ import { INITIAL_EXPIRE_TIMER_VERSION } from '../../util/expirationTimer.std.ts'
 import countryDisplayNames from '../../../build/country-display-names.json';
 import packageJson from '../../../package.json';
 import { loadWebSettings, updateWebSettings } from './webSettings.dom.ts';
+import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import type {
   ConversationAttributesType,
   MessageAttributesType,
@@ -78,6 +82,17 @@ type MessageRecord = MessageAttributesType & Record<string, unknown> & {
 type DebouncedUpdateLastMessage = (() => void) & {
   flush: () => void;
 };
+type WebConvoMatch =
+  | {
+      key: 'serviceId' | 'pni';
+      value: string | undefined;
+      match: WebConversationModel | undefined;
+    }
+  | {
+      key: 'e164';
+      value: string | undefined;
+      match: WebConversationModel | undefined;
+    };
 
 const { hasOwnProperty } = Object.prototype;
 
@@ -1727,25 +1742,85 @@ class WebConversationModel {
   }
 
   public setArchived(isArchived: boolean): void {
-    this.set({
-      isArchived,
-      isPinned: isArchived ? false : this.attributes.isPinned,
-    });
+    const previous = Boolean(this.attributes.isArchived);
+    this.set({ isArchived });
+    if (isArchived) {
+      this.unpin();
+    }
+    if (previous !== Boolean(isArchived)) {
+      void updateConversationArchive({
+        conversationId: this.id,
+        isArchived,
+      }).catch(error => {
+        console.error(
+          'setArchived: failed to sync archive state to storage service',
+          error
+        );
+      });
+    }
   }
 
   public setMuteExpiration(muteExpiresAt: number): void {
+    const previous = this.attributes.muteExpiresAt;
     this.set('muteExpiresAt', muteExpiresAt || undefined);
+    if ((previous ?? 0) !== (muteExpiresAt || 0)) {
+      void updateConversationMute({
+        conversationId: this.id,
+        muteExpiresAt,
+      }).catch(error => {
+        console.error(
+          'setMuteExpiration: failed to sync mute state to storage service',
+          error
+        );
+      });
+    }
   }
 
   public pin(): void {
-    this.set({
-      isArchived: false,
+    if (this.attributes.isPinned) {
+      return;
+    }
+
+    const pinnedConversationIds = new Set(
+      itemStorage.get('pinnedConversationIds', new Array<string>())
+    );
+    pinnedConversationIds.add(this.id);
+    this.writePinnedConversations([...pinnedConversationIds]);
+
+    this.set({ isPinned: true });
+    if (this.attributes.isArchived) {
+      this.set({ isArchived: false });
+    }
+    void updateConversationPin({
+      conversationId: this.id,
       isPinned: true,
+    }).catch(error => {
+      console.error('pin: failed to sync pinned state to storage service', error);
     });
   }
 
   public unpin(): void {
+    if (!this.attributes.isPinned) {
+      return;
+    }
+
+    const pinnedConversationIds = new Set(
+      itemStorage.get('pinnedConversationIds', new Array<string>())
+    );
+    pinnedConversationIds.delete(this.id);
+    this.writePinnedConversations([...pinnedConversationIds]);
+
     this.set('isPinned', false);
+    void updateConversationPin({
+      conversationId: this.id,
+      isPinned: false,
+    }).catch(error => {
+      console.error('unpin: failed to sync pinned state to storage service', error);
+    });
+  }
+
+  public writePinnedConversations(pinnedConversationIds: Array<string>): void {
+    void itemStorage.put('pinnedConversationIds', pinnedConversationIds);
   }
 
   public async removeContact(): Promise<void> {
@@ -2396,6 +2471,24 @@ function applyContactIdentityChange(
   conversation.set(change);
 }
 
+function removeConversationModelFromRuntime(conversation: WebConversationModel): void {
+  window.reduxActions?.conversations?.conversationRemoved?.(conversation.id);
+  onConversationAttributesChanged?.(conversation.id, {
+    __signalWebDeleteConversation: true,
+  });
+}
+
+function getContactIdentityValue(
+  conversation: WebConversationModel,
+  key: 'serviceId' | 'e164' | 'pni'
+): unknown {
+  if (key === 'serviceId') {
+    return conversation.getServiceId();
+  }
+
+  return conversation.get(key);
+}
+
 function installConversationController(
   linkedSession: LinkedSessionRecord | undefined
 ): void {
@@ -2482,49 +2575,244 @@ function installConversationController(
       const conversation = getConversationModel(id);
       return conversation?.attributes.serviceId === SIGNAL_ACI || id === SIGNAL_ACI;
     },
-    lookupOrCreate({ serviceId }: { serviceId?: string }) {
-      if (!serviceId) {
+    lookupOrCreate({
+      e164,
+      serviceId,
+      reason,
+    }: {
+      e164?: string | null;
+      serviceId?: string | null;
+      reason: string;
+    }) {
+      const normalizedServiceId =
+        typeof serviceId === 'string' &&
+        (isAciString(serviceId) || isPniString(serviceId))
+          ? serviceId
+          : undefined;
+      const identifier = normalizedServiceId || e164;
+
+      if ((!e164 && !serviceId) || !identifier) {
+        console.warn(
+          `lookupOrCreate: Called with neither e164 nor serviceId! reason: ${reason}`
+        );
         return undefined;
       }
-      return this.getOrCreate(serviceId, 'private');
+
+      const convoE164 =
+        typeof e164 === 'string'
+          ? findConversationModelByIdentifier(e164)
+          : undefined;
+      const convoServiceId = normalizedServiceId
+        ? findConversationModelByIdentifier(normalizedServiceId)
+        : undefined;
+
+      if (!convoE164 && !convoServiceId) {
+        console.info('lookupOrCreate: Creating new contact, no matches found');
+        const conversation = this.getOrCreate(identifier, 'private');
+        if (conversation && normalizedServiceId && e164) {
+          applyContactIdentityChange(conversation, { e164 });
+        }
+        return conversation;
+      }
+
+      if (!convoE164 && convoServiceId) {
+        return convoServiceId;
+      }
+
+      if (convoE164 && !convoServiceId) {
+        return convoE164;
+      }
+
+      if (!convoE164 || !convoServiceId) {
+        throw new Error(
+          `lookupOrCreate: convoE164 or convoServiceId are falsey but should both be true! reason: ${reason}`
+        );
+      }
+
+      if (convoE164.id === convoServiceId.id) {
+        return convoServiceId;
+      }
+
+      console.warn(
+        `lookupOrCreate: Found a split contact - service id ${normalizedServiceId} and E164 ${e164}. Returning service id match. reason: ${reason}`
+      );
+      return convoServiceId;
     },
     maybeMergeContacts({
       aci,
       e164,
       pni,
-      reason: _reason,
+      reason,
     }: {
       aci?: string;
       e164?: string;
       pni?: string;
       reason: string;
     }) {
-      const existing =
-        findConversationModelByIdentifier(aci) ??
-        findConversationModelByIdentifier(e164) ??
-        findConversationModelByIdentifier(pni);
-      const identifier = aci ?? pni ?? e164;
-      if (!identifier) {
+      const provided = new Array<string>();
+      if (aci) {
+        provided.push(`aci=${aci}`);
+        if (e164) {
+          provided.push('e164');
+        }
+        if (pni) {
+          provided.push('pni');
+        }
+      } else {
+        if (e164) {
+          provided.push(`e164=${e164}`);
+        }
+        if (pni) {
+          provided.push(`pni=${pni}`);
+        }
+      }
+      const logId = `maybeMergeContacts/${reason}/${provided.join(',')}`;
+
+      if (!aci && !e164 && !pni) {
         throw new Error(
-          'maybeMergeContacts: Need to provide at least one of: aci, e164, pni'
+          `${logId}: Need to provide at least one of: aci, e164, pni`
         );
       }
 
-      const conversation =
-        existing ??
-        createConversationModelForIdentifier(identifier, 'private', {
-          e164,
-          pni,
-          serviceId: aci ?? pni,
+      const matches: Array<WebConvoMatch> = [
+        {
+          key: 'serviceId',
+          value: aci,
+          match: findConversationModelByIdentifier(aci),
+        },
+        {
+          key: 'e164',
+          value: e164,
+          match: findConversationModelByIdentifier(e164),
+        },
+        {
+          key: 'pni',
+          value: pni,
+          match: findConversationModelByIdentifier(pni),
+        },
+      ];
+      let unusedMatches = new Array<WebConvoMatch>();
+      let targetConversation: WebConversationModel | undefined;
+      let matchCount = 0;
+
+      matches.forEach(item => {
+        const { key, value, match } = item;
+        if (!value) {
+          return;
+        }
+
+        if (!match) {
+          if (targetConversation) {
+            applyContactIdentityChange(targetConversation, {
+              [key]: value,
+            });
+          } else {
+            unusedMatches.push(item);
+          }
+          return;
+        }
+
+        matchCount += 1;
+        unusedMatches.forEach(unused => {
+          if (!unused.value) {
+            return;
+          }
+
+          if (!targetConversation && !getContactIdentityValue(match, unused.key)) {
+            targetConversation = match;
+          }
+
+          if (
+            !targetConversation &&
+            unused.key === 'serviceId' &&
+            getContactIdentityValue(match, unused.key) === pni
+          ) {
+            targetConversation = match;
+          }
+
+          if (
+            !targetConversation &&
+            unused.key === 'serviceId' &&
+            getContactIdentityValue(match, unused.key) === match.getPni()
+          ) {
+            targetConversation = match;
+          }
+
+          if (!targetConversation) {
+            targetConversation = this.getOrCreate(unused.value, 'private');
+          }
+
+          if (!targetConversation) {
+            throw new Error(`${logId}: did not get target conversation`);
+          }
+
+          applyContactIdentityChange(targetConversation, {
+            [unused.key]: unused.value,
+          });
         });
-      if (!conversation) {
-        throw new Error('maybeMergeContacts: did not get conversation');
-      }
-      applyContactIdentityChange(conversation, {
-        ...(aci ? { serviceId: aci } : {}),
-        ...(e164 ? { e164, phoneNumber: e164 } : {}),
-        ...(pni ? { pni } : {}),
+
+        unusedMatches = [];
+
+        if (targetConversation && targetConversation !== match) {
+          const change: Partial<{
+            serviceId: string;
+            e164: string;
+            pni: string;
+          }> = {
+            [key]: undefined,
+          };
+          if (
+            (key === 'pni' || key === 'e164') &&
+            match.getServiceId() === pni
+          ) {
+            change.serviceId = undefined;
+          }
+
+          applyContactIdentityChange(match, change);
+          const willMerge =
+            !match.getServiceId() && !match.get('e164') && !match.getPni();
+
+          applyContactIdentityChange(targetConversation, {
+            [key]: value,
+          });
+
+          if (willMerge) {
+            removeConversationModelFromRuntime(match);
+          }
+        } else if (
+          targetConversation &&
+          !getContactIdentityValue(targetConversation, key)
+        ) {
+          applyContactIdentityChange(targetConversation, {
+            [key]: value,
+          });
+        }
+
+        if (!targetConversation) {
+          targetConversation = match;
+        }
       });
+
+      if (targetConversation) {
+        return { conversation: targetConversation, mergePromises: [] };
+      }
+
+      if (matchCount !== 0) {
+        throw new Error(`${logId}: should be no matches if no targetConversation`);
+      }
+
+      const identifier = aci ?? pni ?? e164;
+      if (!identifier) {
+        throw new Error(`${logId}: identifier must be truthy`);
+      }
+
+      const conversation = this.getOrCreate(identifier, 'private', {
+        e164,
+        pni,
+      });
+      if (!conversation) {
+        throw new Error(`${logId}: did not get created conversation`);
+      }
 
       return { conversation, mergePromises: [] };
     },

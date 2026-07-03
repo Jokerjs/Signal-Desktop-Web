@@ -175,6 +175,12 @@ async function buildInitialState(): Promise<{
   const shell = storedSession
     ? applyContactsBootstrap(storedShell ?? EMPTY_SHELL, contacts, storedSession)
     : EMPTY_SHELL;
+  const pinnedConversationIds =
+    contacts?.pinned.map(conversation => conversation.id) ??
+    Object.values(shell.conversationLookup)
+      .filter(conversation => conversation.isPinned)
+      .map(conversation => conversation.id);
+  await itemStorage.put('pinnedConversationIds', pinnedConversationIds);
   if (storedSession) {
     await markRegistrationDone();
   } else {
@@ -212,6 +218,7 @@ async function buildInitialState(): Promise<{
       items: {
         ...baseState.items,
         backupTier: storedSession ? BackupLevel.Paid : baseState.items.backupTier,
+        pinnedConversationIds,
         linkPreviews: webSettings.linkPreviews,
         'notification-setting': webSettings.notificationContent,
         hasStoriesDisabled: true,

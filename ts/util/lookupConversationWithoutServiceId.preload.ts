@@ -173,8 +173,13 @@ export async function lookupConversationWithoutServiceId(
 async function checkForUsernameInWeb(
   username: string
 ): Promise<FoundUsernameType | undefined> {
+  let fixedUsername = username;
+  if (fixedUsername.startsWith('@')) {
+    fixedUsername = fixedUsername.slice(1);
+  }
+
   const { lookupUsername } = await import('../web/api.dom.ts');
-  const account = await lookupUsername({ username });
+  const account = await lookupUsername({ username: fixedUsername });
   if (!account.aci) {
     log.error("checkForUsernameInWeb: Returned account didn't include a uuid");
     return;

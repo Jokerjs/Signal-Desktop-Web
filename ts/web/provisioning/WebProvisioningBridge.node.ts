@@ -82,7 +82,12 @@ import {
   type FetchFunctionType,
 } from '../../util/uploads/tusProtocol.node.ts';
 import { importEphemeralBackup } from './WebBackupImportBridge.node.ts';
-import { syncStorageContacts } from './WebStorageContactsSync.node.ts';
+import {
+  syncStorageContacts,
+  updateStorageConversationArchive,
+  updateStorageConversationMute,
+  updateStoragePinnedConversations,
+} from './WebStorageContactsSync.node.ts';
 import {
   decryptIncomingSignalEnvelope,
   exportProtocolState,
@@ -96,6 +101,7 @@ import {
   sendGroupUpdateMessage,
   sendDirectReaction,
   sendFetchLocalProfileSync,
+  sendFetchStorageManifestSync,
   sendMessageRequestResponseSync,
 } from './WebSignalSendBridge.node.ts';
 import {
@@ -5476,6 +5482,117 @@ async function handleContactsSync(
   }
 }
 
+async function handleConversationArchive(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const conversationId =
+    typeof body.conversationId === 'string' ? body.conversationId : undefined;
+  const isArchived =
+    typeof body.isArchived === 'boolean' ? body.isArchived : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!conversationId || isArchived == null) {
+    sendText(req, res, 400, 'Missing conversationId or isArchived');
+    return;
+  }
+
+  const result = await updateStorageConversationArchive({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    chat: streamSession.connection,
+    conversationId,
+    isArchived,
+    linkedPayload: streamSession.linkedPayload,
+    storageUrl: productionConfig.storageUrl,
+  });
+  await sendFetchStorageManifestSync({
+    chat: streamSession.connection,
+    linkedPayload: streamSession.linkedPayload,
+    timestamp: now(),
+  });
+  sendJson(req, res, 200, result);
+}
+
+async function handleConversationMute(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const conversationId =
+    typeof body.conversationId === 'string' ? body.conversationId : undefined;
+  const muteExpiresAt =
+    typeof body.muteExpiresAt === 'number' ? body.muteExpiresAt : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!conversationId || muteExpiresAt == null) {
+    sendText(req, res, 400, 'Missing conversationId or muteExpiresAt');
+    return;
+  }
+
+  const result = await updateStorageConversationMute({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    chat: streamSession.connection,
+    conversationId,
+    linkedPayload: streamSession.linkedPayload,
+    muteExpiresAt,
+    storageUrl: productionConfig.storageUrl,
+  });
+  await sendFetchStorageManifestSync({
+    chat: streamSession.connection,
+    linkedPayload: streamSession.linkedPayload,
+    timestamp: now(),
+  });
+  sendJson(req, res, 200, result);
+}
+
+async function handleConversationPin(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const conversationId =
+    typeof body.conversationId === 'string' ? body.conversationId : undefined;
+  const isPinned =
+    typeof body.isPinned === 'boolean' ? body.isPinned : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!streamSession?.connection || !streamSession.linkedPayload) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+  if (!conversationId || isPinned == null) {
+    sendText(req, res, 400, 'Missing conversationId or isPinned');
+    return;
+  }
+
+  const result = await updateStoragePinnedConversations({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    chat: streamSession.connection,
+    conversationId,
+    isPinned,
+    linkedPayload: streamSession.linkedPayload,
+    storageUrl: productionConfig.storageUrl,
+  });
+  await sendFetchStorageManifestSync({
+    chat: streamSession.connection,
+    linkedPayload: streamSession.linkedPayload,
+    timestamp: now(),
+  });
+  sendJson(req, res, 200, result);
+}
+
 async function handleAttachment(
   req: IncomingMessage,
   res: ServerResponse,
@@ -5942,6 +6059,21 @@ async function handleRequest(
 
   if (req.method === 'POST' && url.pathname === '/contacts/sync') {
     await handleContactsSync(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/conversations/archive') {
+    await handleConversationArchive(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/conversations/mute') {
+    await handleConversationMute(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/conversations/pin') {
+    await handleConversationPin(req, res);
     return;
   }
 

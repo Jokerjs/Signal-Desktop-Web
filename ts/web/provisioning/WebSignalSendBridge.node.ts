@@ -1290,6 +1290,26 @@ function createFetchLocalProfileSyncContent(): Uint8Array<ArrayBuffer> {
   }));
 }
 
+function createFetchStorageManifestSyncContent(): Uint8Array<ArrayBuffer> {
+  return padMessage(Proto.Content.encode({
+    content: {
+      syncMessage: {
+        content: {
+          fetchLatest: {
+            type: Proto.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST,
+          },
+        },
+        padding: null,
+        read: [],
+        stickerPackOperation: [],
+        viewed: [],
+      },
+    },
+    pniSignatureMessage: null,
+    senderKeyDistributionMessage: null,
+  }));
+}
+
 function createAttachmentBackfillRequestSyncContent({
   conversationId,
   conversationType,
@@ -4378,6 +4398,65 @@ export async function sendFetchLocalProfileSync({
 
     throw new Error(
       `sendFetchLocalProfileSync failed: ${JSON.stringify(sendSummary)}`,
+      { cause: error }
+    );
+  }
+
+  return { ok: true, timestamp };
+}
+
+export async function sendFetchStorageManifestSync({
+  chat,
+  linkedPayload,
+  timestamp,
+}: FetchLocalProfileSyncOptions): Promise<{ ok: true; timestamp: number }> {
+  const ourAci = getLinkedAci(linkedPayload);
+  let messages = await encryptForDestination({
+    chat,
+    destinationServiceId: ourAci,
+    linkedPayload,
+    plaintext: createFetchStorageManifestSyncContent(),
+  });
+
+  try {
+    await chat.sendSyncMessage({
+      contents: messages,
+      timestamp,
+      urgent: false,
+    });
+  } catch (error) {
+    const sendSummary = {
+      devices: messages.map(message => ({
+        deviceId: message.deviceId,
+        registrationId: message.registrationId,
+        type: message.contents.type(),
+        contentLength: message.contents.serialize().byteLength,
+      })),
+      cause: getErrorSummary(error),
+    };
+    const mismatchedEntries = getMismatchedDevicesEntries(error, ourAci);
+    if (mismatchedEntries) {
+      await handleWebMismatchedDevices({
+        chat,
+        entries: mismatchedEntries,
+        linkedPayload,
+      });
+      messages = await encryptForDestination({
+        chat,
+        destinationServiceId: ourAci,
+        linkedPayload,
+        plaintext: createFetchStorageManifestSyncContent(),
+      });
+      await chat.sendSyncMessage({
+        contents: messages,
+        timestamp,
+        urgent: false,
+      });
+      return { ok: true, timestamp };
+    }
+
+    throw new Error(
+      `sendFetchStorageManifestSync failed: ${JSON.stringify(sendSummary)}`,
       { cause: error }
     );
   }

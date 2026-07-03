@@ -10,6 +10,8 @@ import {
   decryptProfile,
   deriveStorageItemKey,
   deriveStorageManifestKey,
+  encryptProfile,
+  getRandomBytes,
 } from '../../Crypto.node.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import type { ServiceIdString } from '../../types/ServiceId.std.ts';
@@ -42,6 +44,49 @@ type SyncStorageContactsOptions = Readonly<{
   cdnUrl: string;
   linkedPayload: LinkedPayload;
   storageUrl: string;
+}>;
+
+type UpdateStorageConversationArchiveOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  conversationId: string;
+  isArchived: boolean;
+  linkedPayload: LinkedPayload;
+  storageUrl: string;
+}>;
+
+type UpdateStorageConversationMuteOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  conversationId: string;
+  linkedPayload: LinkedPayload;
+  muteExpiresAt: number;
+  storageUrl: string;
+}>;
+
+type UpdateStoragePinnedConversationsOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  conversationId: string;
+  isPinned: boolean;
+  linkedPayload: LinkedPayload;
+  storageUrl: string;
+}>;
+
+type LoadedStorageState = Readonly<{
+  credentials: StorageCredentials;
+  currentVersion: number;
+  manifest: Proto.ManifestRecord;
+  recordIkm: Uint8Array<ArrayBuffer> | undefined;
+  records: ReadonlyArray<Proto.StorageItem>;
+  recordsByKey: ReadonlyMap<string, Proto.StorageRecord>;
+  storageServiceKey: Uint8Array<ArrayBuffer>;
+}>;
+
+type TargetStorageRecord = Readonly<{
+  item: Proto.StorageItem;
+  record: Proto.StorageRecord;
+  type: Proto.ManifestRecord.Identifier.Type;
 }>;
 
 const MAX_READ_KEYS = 100;
@@ -663,6 +708,500 @@ async function fetchStorageRecords({
     items.push(...Proto.StorageItems.decode(response).items);
   }
   return items;
+}
+
+function encryptStorageRecord({
+  key,
+  recordIkm,
+  storageRecord,
+  storageServiceKey,
+}: Readonly<{
+  key: Uint8Array<ArrayBuffer>;
+  recordIkm: Uint8Array<ArrayBuffer> | undefined;
+  storageRecord: Proto.StorageRecord.Params;
+  storageServiceKey: Uint8Array<ArrayBuffer>;
+}>): Proto.StorageItem.Params {
+  const itemKey = deriveStorageItemKey({
+    storageServiceKey,
+    recordIkm,
+    key,
+  });
+
+  return {
+    key,
+    value: encryptProfile(Proto.StorageRecord.encode(storageRecord), itemKey),
+  };
+}
+
+async function loadStorageState({
+  allowInsecureTls,
+  chat,
+  linkedPayload,
+  storageUrl,
+}: Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  linkedPayload: LinkedPayload;
+  storageUrl: string;
+}>): Promise<LoadedStorageState> {
+  const storageServiceKeyBase64 = linkedPayload.storageServiceKey;
+  if (!storageServiceKeyBase64) {
+    throw new Error('loadStorageState: missing storageServiceKey');
+  }
+
+  const storageServiceKey = Bytes.fromBase64(storageServiceKeyBase64);
+  const credentials = await getStorageCredentials(chat);
+  const manifestBytes = await fetchStorageBytes({
+    allowInsecureTls,
+    credentials,
+    method: 'GET',
+    path: '/v1/storage/manifest',
+    storageUrl,
+  });
+  const encryptedManifest = Proto.StorageManifest.decode(manifestBytes);
+  const manifestKey = deriveStorageManifestKey(
+    storageServiceKey,
+    encryptedManifest.version
+  );
+  const manifest = Proto.ManifestRecord.decode(
+    decryptProfile(encryptedManifest.value, manifestKey)
+  );
+  const currentVersion = toNumber(manifest.version);
+  if (currentVersion == null) {
+    throw new Error('loadStorageState: missing manifest version');
+  }
+  const recordIkm = manifest.recordIkm?.byteLength
+    ? manifest.recordIkm
+    : undefined;
+  const records = await fetchStorageRecords({
+    allowInsecureTls,
+    credentials,
+    identifiers: manifest.identifiers,
+    storageUrl,
+  });
+
+  const recordsByKey = new Map<string, Proto.StorageRecord>();
+  for (const item of records) {
+    const itemKey = deriveStorageItemKey({
+      storageServiceKey,
+      recordIkm,
+      key: item.key,
+    });
+    const storageRecord = Proto.StorageRecord.decode(
+      decryptProfile(item.value, itemKey)
+    );
+    recordsByKey.set(Bytes.toBase64(item.key), storageRecord);
+  }
+
+  return {
+    credentials,
+    currentVersion,
+    manifest,
+    recordIkm,
+    records,
+    recordsByKey,
+    storageServiceKey,
+  };
+}
+
+function findStorageConversationRecord({
+  conversationId,
+  linkedPayload,
+  records,
+  recordsByKey,
+}: Readonly<{
+  conversationId: string;
+  linkedPayload: LinkedPayload;
+  records: ReadonlyArray<Proto.StorageItem>;
+  recordsByKey: ReadonlyMap<string, Proto.StorageRecord>;
+}>): TargetStorageRecord | undefined {
+  for (const item of records) {
+    const storageRecord = recordsByKey.get(Bytes.toBase64(item.key));
+    if (!storageRecord) {
+      continue;
+    }
+
+    const contactConversation = storageRecord.record?.contact
+      ? getContactConversation(storageRecord.record.contact)
+      : undefined;
+    if (contactConversation?.id === conversationId) {
+      return {
+        item,
+        record: storageRecord,
+        type: Proto.ManifestRecord.Identifier.Type.CONTACT,
+      };
+    }
+
+    const groupConversation = storageRecord.record?.groupV2
+      ? getGroupConversation(storageRecord.record.groupV2)
+      : undefined;
+    if (groupConversation?.id === conversationId) {
+      return {
+        item,
+        record: storageRecord,
+        type: Proto.ManifestRecord.Identifier.Type.GROUPV2,
+      };
+    }
+  }
+
+  const ownConversationId =
+    linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  if (ownConversationId === conversationId) {
+    for (const item of records) {
+      const storageRecord = recordsByKey.get(Bytes.toBase64(item.key));
+      if (storageRecord?.record?.account) {
+        return {
+          item,
+          record: storageRecord,
+          type: Proto.ManifestRecord.Identifier.Type.ACCOUNT,
+        };
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function writeStorageRecordUpdate({
+  allowInsecureTls,
+  credentials,
+  currentVersion,
+  manifest,
+  oldKey,
+  recordIkm,
+  sourceDevice,
+  storageRecord,
+  storageServiceKey,
+  storageUrl,
+  targetType,
+}: Readonly<{
+  allowInsecureTls?: boolean;
+  credentials: StorageCredentials;
+  currentVersion: number;
+  manifest: Proto.ManifestRecord;
+  oldKey: Uint8Array<ArrayBuffer>;
+  recordIkm: Uint8Array<ArrayBuffer> | undefined;
+  sourceDevice: number;
+  storageRecord: Proto.StorageRecord;
+  storageServiceKey: Uint8Array<ArrayBuffer>;
+  storageUrl: string;
+  targetType: Proto.ManifestRecord.Identifier.Type;
+}>): Promise<{ ok: true; version: number }> {
+  const nextVersion = currentVersion + 1;
+  const newKey = getRandomBytes(16);
+  const newItem = encryptStorageRecord({
+    key: newKey,
+    recordIkm,
+    storageRecord,
+    storageServiceKey,
+  });
+  const oldKeyBase64 = Bytes.toBase64(oldKey);
+  const nextIdentifiers = manifest.identifiers
+    .filter(identifier => Bytes.toBase64(identifier.raw) !== oldKeyBase64)
+    .concat(
+      Proto.ManifestRecord.Identifier.decode(
+        Proto.ManifestRecord.Identifier.encode({
+          raw: newKey,
+          type: targetType,
+        })
+      )
+    );
+  const nextManifestRecord: Proto.ManifestRecord.Params = {
+    identifiers: nextIdentifiers,
+    recordIkm: recordIkm ?? null,
+    sourceDevice,
+    version: BigInt(nextVersion),
+  };
+  const nextManifestKey = deriveStorageManifestKey(
+    storageServiceKey,
+    BigInt(nextVersion)
+  );
+  const writeOperation = Proto.WriteOperation.encode({
+    clearAll: false,
+    deleteKey: [oldKey],
+    insertItem: [newItem],
+    manifest: {
+      value: encryptProfile(
+        Proto.ManifestRecord.encode(nextManifestRecord),
+        nextManifestKey
+      ),
+      version: BigInt(nextVersion),
+    },
+  });
+
+  await fetchStorageBytes({
+    allowInsecureTls,
+    body: writeOperation,
+    credentials,
+    method: 'PUT',
+    path: '/v1/storage/',
+    storageUrl,
+  });
+
+  return { ok: true, version: nextVersion };
+}
+
+function cloneStorageRecord(record: Proto.StorageRecord): Proto.StorageRecord {
+  return Proto.StorageRecord.decode(Proto.StorageRecord.encode(record));
+}
+
+function getStorageAccountRecord(
+  state: LoadedStorageState
+): TargetStorageRecord | undefined {
+  for (const item of state.records) {
+    const storageRecord = state.recordsByKey.get(Bytes.toBase64(item.key));
+    if (storageRecord?.record?.account) {
+      return {
+        item,
+        record: storageRecord,
+        type: Proto.ManifestRecord.Identifier.Type.ACCOUNT,
+      };
+    }
+  }
+  return undefined;
+}
+
+function getPinnedConversationForTarget({
+  linkedPayload,
+  target,
+}: Readonly<{
+  linkedPayload: LinkedPayload;
+  target: TargetStorageRecord;
+}>): Proto.AccountRecord.PinnedConversation.Params {
+  const contact = target.record.record?.contact;
+  if (contact) {
+    return {
+      identifier: {
+        contact: {
+          serviceIdBinary: contact.aciBinary?.byteLength
+            ? contact.aciBinary
+            : null,
+          serviceId: contact.aci || null,
+          e164: contact.e164 || null,
+        },
+      },
+    };
+  }
+
+  const group = target.record.record?.groupV2;
+  if (group?.masterKey?.byteLength) {
+    return {
+      identifier: {
+        groupMasterKey: group.masterKey,
+      },
+    };
+  }
+
+  if (target.record.record?.account) {
+    const serviceId = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+    if (!serviceId) {
+      throw new Error('getPinnedConversationForTarget: missing account aci');
+    }
+    return {
+      identifier: {
+        contact: {
+          serviceId,
+          serviceIdBinary: null,
+          e164:
+            linkedPayload.credentials?.number ??
+            linkedPayload.account.number ??
+            linkedPayload.account.phoneNumber ??
+            null,
+        },
+      },
+    };
+  }
+
+  throw new Error('getPinnedConversationForTarget: unsupported storage record');
+}
+
+export async function updateStorageConversationArchive({
+  allowInsecureTls,
+  chat,
+  conversationId,
+  isArchived,
+  linkedPayload,
+  storageUrl,
+}: UpdateStorageConversationArchiveOptions): Promise<{ ok: true; version: number }> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const target = findStorageConversationRecord({
+    conversationId,
+    linkedPayload,
+    records: state.records,
+    recordsByKey: state.recordsByKey,
+  });
+  if (!target) {
+    throw new Error(
+      `updateStorageConversationArchive: storage record not found for ${conversationId}`
+    );
+  }
+
+  const updatedRecord = cloneStorageRecord(target.record);
+  if (updatedRecord.record?.contact) {
+    updatedRecord.record.contact.archived = isArchived;
+  } else if (updatedRecord.record?.groupV2) {
+    updatedRecord.record.groupV2.archived = isArchived;
+  } else if (updatedRecord.record?.account) {
+    updatedRecord.record.account.noteToSelfArchived = isArchived;
+  } else {
+    throw new Error(
+      `updateStorageConversationArchive: unsupported storage record for ${conversationId}`
+    );
+  }
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: target.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: target.type,
+  });
+}
+
+export async function updateStorageConversationMute({
+  allowInsecureTls,
+  chat,
+  conversationId,
+  linkedPayload,
+  muteExpiresAt,
+  storageUrl,
+}: UpdateStorageConversationMuteOptions): Promise<{ ok: true; version: number }> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const target = findStorageConversationRecord({
+    conversationId,
+    linkedPayload,
+    records: state.records,
+    recordsByKey: state.recordsByKey,
+  });
+  if (!target) {
+    throw new Error(
+      `updateStorageConversationMute: storage record not found for ${conversationId}`
+    );
+  }
+
+  const mutedUntilTimestamp =
+    muteExpiresAt > 0
+      ? BigInt(Math.min(muteExpiresAt, Number.MAX_SAFE_INTEGER))
+      : 0n;
+  const updatedRecord = cloneStorageRecord(target.record);
+  if (updatedRecord.record?.contact) {
+    updatedRecord.record.contact.mutedUntilTimestamp = mutedUntilTimestamp;
+  } else if (updatedRecord.record?.groupV2) {
+    updatedRecord.record.groupV2.mutedUntilTimestamp = mutedUntilTimestamp;
+  } else {
+    throw new Error(
+      `updateStorageConversationMute: unsupported storage record for ${conversationId}`
+    );
+  }
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: target.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: target.type,
+  });
+}
+
+export async function updateStoragePinnedConversations({
+  allowInsecureTls,
+  chat,
+  conversationId,
+  isPinned,
+  linkedPayload,
+  storageUrl,
+}: UpdateStoragePinnedConversationsOptions): Promise<{ ok: true; version: number }> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const accountTarget = getStorageAccountRecord(state);
+  if (!accountTarget?.record.record?.account) {
+    throw new Error('updateStoragePinnedConversations: account record not found');
+  }
+  const target = findStorageConversationRecord({
+    conversationId,
+    linkedPayload,
+    records: state.records,
+    recordsByKey: state.recordsByKey,
+  });
+  if (!target) {
+    throw new Error(
+      `updateStoragePinnedConversations: storage record not found for ${conversationId}`
+    );
+  }
+
+  const pinnedConversation = getPinnedConversationForTarget({
+    linkedPayload,
+    target,
+  });
+  const existingPinned = accountTarget.record.record.account.pinnedConversations ?? [];
+  const withoutTarget = existingPinned.filter(
+    pinned => getPinnedConversationId(pinned) !== conversationId
+  );
+  const nextPinned = isPinned
+    ? [
+        ...withoutTarget,
+        Proto.AccountRecord.PinnedConversation.decode(
+          Proto.AccountRecord.PinnedConversation.encode(pinnedConversation)
+        ),
+      ]
+    : withoutTarget;
+
+  if (
+    existingPinned.length === nextPinned.length &&
+    existingPinned.every(
+      (pinned, index) =>
+        getPinnedConversationId(pinned) ===
+        getPinnedConversationId(nextPinned[index] as Proto.AccountRecord.PinnedConversation)
+    )
+  ) {
+    return { ok: true, version: state.currentVersion };
+  }
+
+  const updatedRecord = cloneStorageRecord(accountTarget.record);
+  if (!updatedRecord.record?.account) {
+    throw new Error('updateStoragePinnedConversations: missing account record');
+  }
+  updatedRecord.record.account.pinnedConversations = nextPinned;
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: accountTarget.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: accountTarget.type,
+  });
 }
 
 export async function syncStorageContacts({

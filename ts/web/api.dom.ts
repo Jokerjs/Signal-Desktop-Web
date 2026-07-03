@@ -1111,6 +1111,75 @@ export async function syncContacts({
   return parseJsonResponse(response);
 }
 
+export async function updateConversationArchive({
+  conversationId,
+  isArchived,
+  runtimeSessionId = currentMessageRuntimeSessionId,
+}: Readonly<{
+  conversationId: string;
+  isArchived: boolean;
+  runtimeSessionId?: string;
+}>): Promise<{ ok: true; version: number }> {
+  const response = await fetch(apiUrl('/conversations/archive'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      conversationId,
+      isArchived,
+      sessionId: runtimeSessionId,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function updateConversationMute({
+  conversationId,
+  muteExpiresAt,
+  runtimeSessionId = currentMessageRuntimeSessionId,
+}: Readonly<{
+  conversationId: string;
+  muteExpiresAt: number;
+  runtimeSessionId?: string;
+}>): Promise<{ ok: true; version: number }> {
+  const response = await fetch(apiUrl('/conversations/mute'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      conversationId,
+      muteExpiresAt,
+      sessionId: runtimeSessionId,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function updateConversationPin({
+  conversationId,
+  isPinned,
+  runtimeSessionId = currentMessageRuntimeSessionId,
+}: Readonly<{
+  conversationId: string;
+  isPinned: boolean;
+  runtimeSessionId?: string;
+}>): Promise<{ ok: true; version: number }> {
+  const response = await fetch(apiUrl('/conversations/pin'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      conversationId,
+      isPinned,
+      sessionId: runtimeSessionId,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function requestAttachmentBackfill({
   conversationId,
   conversationType,
