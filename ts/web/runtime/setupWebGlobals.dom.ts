@@ -1,7 +1,10 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { getRenderApiBaseUrl, getRenderCdnBaseUrl } from '../renderConfig.dom.ts';
+import {
+  getRenderApiBaseUrl,
+  getRenderCdnBaseUrl,
+} from '../renderConfig.dom.ts';
 import type {
   ChatShellState,
   LinkedSessionRecord,
@@ -55,6 +58,21 @@ import type {
   PinMessageData,
 } from '../../model-types.d.ts';
 import type { GroupV2ChangeDetailType } from '../../types/groups.std.ts';
+import type { AttachmentType } from '../../types/Attachment.std.ts';
+import {
+  isAudio,
+  isFile,
+  isVisualMedia,
+  isVoiceMessage,
+} from '../../util/Attachment.std.ts';
+import type {
+  ContactMediaItemDBType,
+  GetSortedDocumentsOptionsType,
+  GetSortedMediaOptionsType,
+  GetSortedNonAttachmentMediaOptionsType,
+  MediaItemDBType,
+  NonAttachmentMediaItemDBType,
+} from '../../sql/Interface.std.ts';
 import type {
   PinnedMessage,
   PinnedMessageId,
@@ -73,13 +91,14 @@ type PinnedMessagesChanged = (
 ) => void;
 
 type ConversationRecord = Record<string, unknown> & { id: string };
-type MessageRecord = MessageAttributesType & Record<string, unknown> & {
-  id: string;
-  conversationId: string;
-  received_at: number;
-  sent_at: number;
-  timestamp: number;
-};
+type MessageRecord = MessageAttributesType &
+  Record<string, unknown> & {
+    id: string;
+    conversationId: string;
+    received_at: number;
+    sent_at: number;
+    timestamp: number;
+  };
 type DebouncedUpdateLastMessage = (() => void) & {
   flush: () => void;
 };
@@ -127,29 +146,29 @@ function getDerivedGroupPermissionAttributes(
   const ourAci = getOurAci();
   const areWeAdmin = Boolean(
     ourAci &&
-      membersV2.some(member => {
+    membersV2.some(member => {
+      return (
+        member &&
+        typeof member === 'object' &&
+        'aci' in member &&
+        member.aci === ourAci &&
+        'role' in member &&
+        member.role === Proto.Member.Role.ADMINISTRATOR
+      );
+    })
+  );
+  const left = Boolean(
+    attributes.left ||
+    (ourAci &&
+      hasMembersV2 &&
+      !membersV2.some(member => {
         return (
           member &&
           typeof member === 'object' &&
           'aci' in member &&
-          member.aci === ourAci &&
-          'role' in member &&
-          member.role === Proto.Member.Role.ADMINISTRATOR
+          member.aci === ourAci
         );
-      })
-  );
-  const left = Boolean(
-    attributes.left ||
-      (ourAci &&
-        hasMembersV2 &&
-        !membersV2.some(member => {
-          return (
-            member &&
-            typeof member === 'object' &&
-            'aci' in member &&
-            member.aci === ourAci
-          );
-        }))
+      }))
   );
   const terminated = Boolean(attributes.terminated);
 
@@ -169,8 +188,7 @@ function getDerivedGroupPermissionAttributes(
       !left &&
       !terminated &&
       (areWeAdmin ||
-        accessControl.attributes ===
-          Proto.AccessControl.AccessRequired.MEMBER),
+        accessControl.attributes === Proto.AccessControl.AccessRequired.MEMBER),
   };
 }
 
@@ -227,8 +245,9 @@ function getDerivedTitleAttributes(
     nicknameGivenName: attributes.nicknameGivenName as string | undefined,
     profileFamilyName: (attributes.profileFamilyName ??
       attributes.familyName) as string | undefined,
-    profileName: (attributes.profileName ??
-      attributes.firstName) as string | undefined,
+    profileName: (attributes.profileName ?? attributes.firstName) as
+      | string
+      | undefined,
     systemFamilyName: attributes.systemFamilyName as string | undefined,
     systemGivenName: attributes.systemGivenName as string | undefined,
     systemNickname:
@@ -244,7 +263,9 @@ function getDerivedTitleAttributes(
       attributes.profileFamilyName ??
       attributes.familyName,
     firstName:
-      attributes.nicknameGivenName ?? attributes.profileName ?? attributes.firstName,
+      attributes.nicknameGivenName ??
+      attributes.profileName ??
+      attributes.firstName,
     searchableTitle: title,
     title,
     titleNoDefault: getTitleNoDefault(titleAttributes),
@@ -296,8 +317,7 @@ type WebEnqueuedMessage = Readonly<{
 type WebEnqueueMessageOptions = Readonly<{
   timestamp?: number;
 }>;
-export const WEB_MESSAGES_REMOVED_EVENT =
-  'signal-web-runtime-messages-removed';
+export const WEB_MESSAGES_REMOVED_EVENT = 'signal-web-runtime-messages-removed';
 export const WEB_MESSAGES_ADDED_EVENT = 'signal-web-runtime-messages-added';
 let currentLinkedSession: LinkedSessionRecord | undefined;
 let webRuntimeMessagesLookup: Record<string, MessageRecord> = {};
@@ -312,14 +332,20 @@ function getBootstrapConversationLookup(): Record<string, ConversationRecord> {
   return (
     (
       window as unknown as {
-        SignalWebBootstrapConversationLookup?: Record<string, ConversationRecord>;
+        SignalWebBootstrapConversationLookup?: Record<
+          string,
+          ConversationRecord
+        >;
       }
     ).SignalWebBootstrapConversationLookup ?? {}
   );
 }
 
 function isRenderableMessageRecord(message: MessageRecord): boolean {
-  return message.type !== 'pinned-message-notification' || Boolean(message.pinMessage);
+  return (
+    message.type !== 'pinned-message-notification' ||
+    Boolean(message.pinMessage)
+  );
 }
 
 function getTimestamp(message: MessageRecord): number {
@@ -327,13 +353,16 @@ function getTimestamp(message: MessageRecord): number {
 }
 
 function compareMessages(left: MessageRecord, right: MessageRecord): number {
-  return getTimestamp(left) - getTimestamp(right) || left.sent_at - right.sent_at || left.id.localeCompare(right.id);
+  return (
+    getTimestamp(left) - getTimestamp(right) ||
+    left.sent_at - right.sent_at ||
+    left.id.localeCompare(right.id)
+  );
 }
 
 function getMessagesLookup(): Record<string, MessageRecord> {
-  const reduxMessagesLookup = (
-    window.reduxStore?.getState?.().conversations?.messagesLookup ?? {}
-  ) as Record<string, MessageRecord>;
+  const reduxMessagesLookup = (window.reduxStore?.getState?.().conversations
+    ?.messagesLookup ?? {}) as Record<string, MessageRecord>;
   const lookup = {
     ...webRuntimeMessagesLookup,
     ...reduxMessagesLookup,
@@ -349,7 +378,9 @@ function getMessagesLookup(): Record<string, MessageRecord> {
   return lookup;
 }
 
-function getConversationMessages(conversationId: string | undefined): Array<MessageRecord> {
+function getConversationMessages(
+  conversationId: string | undefined
+): Array<MessageRecord> {
   if (!conversationId) {
     return [];
   }
@@ -363,7 +394,11 @@ function normalizeSearchText(value: string): string {
 }
 
 function getWebSearchableMessageText(message: MessageRecord): string {
-  if (message.poll && typeof message.poll === 'object' && 'question' in message.poll) {
+  if (
+    message.poll &&
+    typeof message.poll === 'object' &&
+    'question' in message.poll
+  ) {
     const question = message.poll.question;
     return typeof question === 'string' ? question : '';
   }
@@ -446,11 +481,16 @@ function searchWebMessages(options: {
       : options.conversationId
         ? 100
         : 500;
-  const mentionServiceIds = new Set(options.contactServiceIdsMatchingQuery ?? []);
+  const mentionServiceIds = new Set(
+    options.contactServiceIdsMatchingQuery ?? []
+  );
 
   return Object.values(getMessagesLookup())
     .map(message => {
-      if (options.conversationId && message.conversationId !== options.conversationId) {
+      if (
+        options.conversationId &&
+        message.conversationId !== options.conversationId
+      ) {
         return undefined;
       }
       if (message.isViewOnce || message.storyId) {
@@ -460,7 +500,10 @@ function searchWebMessages(options: {
       const text = getWebSearchableMessageText(message);
       const searchableText = normalizeSearchText(text);
       const matchesBody = terms.every(term => searchableText.includes(term));
-      const mention = findBodyRangeMentionForServiceIds(message, mentionServiceIds);
+      const mention = findBodyRangeMentionForServiceIds(
+        message,
+        mentionServiceIds
+      );
       if (!matchesBody && !mention) {
         return undefined;
       }
@@ -502,11 +545,7 @@ function getConversationMessagesPage(options: unknown): Array<MessageRecord> {
   if (!options || typeof options !== 'object') {
     return [];
   }
-  const {
-    conversationId,
-    limit,
-    receivedAt,
-  } = options as {
+  const { conversationId, limit, receivedAt } = options as {
     conversationId?: string;
     limit?: number;
     receivedAt?: number;
@@ -519,6 +558,240 @@ function getConversationMessagesPage(options: unknown): Array<MessageRecord> {
       : messages;
 
   return filtered.slice(Math.max(0, filtered.length - pageLimit));
+}
+
+function isGalleryMessage(message: MessageRecord): boolean {
+  return (
+    !message.isViewOnce &&
+    (message.type === 'incoming' || message.type === 'outgoing')
+  );
+}
+
+function getMediaItemMessage(message: MessageRecord) {
+  return {
+    id: message.id,
+    type: message.type,
+    conversationId: message.conversationId,
+    receivedAt: message.received_at,
+    receivedAtMs: message.received_at_ms,
+    sentAt: message.sent_at,
+    source: message.source,
+    sourceServiceId: message.sourceServiceId,
+    isErased: Boolean(message.isErased),
+    sendStateByConversationId: message.sendStateByConversationId,
+    readStatus: message.readStatus,
+    errors: message.errors ?? undefined,
+  };
+}
+
+function compareGalleryMessageTime(
+  left: { receivedAt: number; sentAt: number },
+  right: { receivedAt: number; sentAt: number }
+): number {
+  return left.receivedAt - right.receivedAt || left.sentAt - right.sentAt;
+}
+
+function isAfterGalleryCursor(
+  item: { receivedAt: number; sentAt: number },
+  cursor: { receivedAt: number; sentAt: number }
+): boolean {
+  return (
+    item.receivedAt > cursor.receivedAt ||
+    (item.receivedAt === cursor.receivedAt && item.sentAt > cursor.sentAt)
+  );
+}
+
+function isBeforeGalleryCursor(
+  item: { receivedAt: number; sentAt: number },
+  cursor: { receivedAt: number; sentAt: number }
+): boolean {
+  return (
+    item.receivedAt < cursor.receivedAt ||
+    (item.receivedAt === cursor.receivedAt && item.sentAt < cursor.sentAt)
+  );
+}
+
+function getGalleryCursor(options: {
+  receivedAt?: number;
+  sentAt?: number;
+}): { receivedAt: number; sentAt: number } | undefined {
+  if (typeof options.receivedAt !== 'number') {
+    return undefined;
+  }
+  return {
+    receivedAt: options.receivedAt,
+    sentAt:
+      typeof options.sentAt === 'number' ? options.sentAt : Number.MAX_VALUE,
+  };
+}
+
+function getSortedMediaItems(
+  options: GetSortedMediaOptionsType
+): Array<MediaItemDBType> {
+  const cursor = getGalleryCursor(options);
+  const items = getConversationMessages(options.conversationId)
+    .filter(isGalleryMessage)
+    .flatMap(message => {
+      const attachments = Array.isArray(message.attachments)
+        ? message.attachments
+        : [];
+      return attachments.flatMap((attachment, index) => {
+        const typedAttachment = attachment as AttachmentType;
+        let includeAttachment: boolean;
+        if (options.type === 'media') {
+          includeAttachment = isVisualMedia(typedAttachment);
+        } else if (options.type === 'audio') {
+          includeAttachment =
+            isVoiceMessage(typedAttachment) || isAudio([typedAttachment]);
+        } else if (options.type === 'documents') {
+          includeAttachment = isFile(typedAttachment);
+        } else {
+          includeAttachment = false;
+        }
+        if (!includeAttachment) {
+          return [];
+        }
+        return [
+          {
+            type: 'mediaItem' as const,
+            attachment: typedAttachment,
+            index,
+            message: getMediaItemMessage(message),
+          },
+        ];
+      });
+    })
+    .filter(item => item.message.id !== options.messageId);
+
+  const maxSize = options.size;
+  const filtered = items.filter(item => {
+    if (options.order === 'newer') {
+      return cursor ? isAfterGalleryCursor(item.message, cursor) : true;
+    }
+    if (options.order === 'older') {
+      return cursor ? isBeforeGalleryCursor(item.message, cursor) : true;
+    }
+    if (options.order === 'bigger') {
+      if (typeof maxSize !== 'number') {
+        return true;
+      }
+      if (item.attachment.size < maxSize) {
+        return true;
+      }
+      if (item.attachment.size !== maxSize) {
+        return false;
+      }
+      return cursor ? isBeforeGalleryCursor(item.message, cursor) : true;
+    }
+    return false;
+  });
+
+  const sorted = [...filtered].sort((left, right) => {
+    if (options.order === 'newer') {
+      return compareGalleryMessageTime(left.message, right.message);
+    }
+    if (options.order === 'bigger') {
+      const sizeDelta = right.attachment.size - left.attachment.size;
+      if (sizeDelta !== 0) {
+        return sizeDelta;
+      }
+      return compareGalleryMessageTime(right.message, left.message);
+    }
+    return compareGalleryMessageTime(right.message, left.message);
+  });
+
+  return sorted.slice(0, options.limit);
+}
+
+function getSortedNonAttachmentMediaItems(
+  options: GetSortedNonAttachmentMediaOptionsType
+): Array<NonAttachmentMediaItemDBType> {
+  const cursor = getGalleryCursor(options);
+  return getConversationMessages(options.conversationId)
+    .filter(isGalleryMessage)
+    .filter(message => message.id !== options.messageId)
+    .filter(message =>
+      cursor
+        ? isBeforeGalleryCursor(getMediaItemMessage(message), cursor)
+        : true
+    )
+    .sort((left, right) => compareMessages(right, left))
+    .flatMap((message): Array<NonAttachmentMediaItemDBType> => {
+      if (options.type === 'links') {
+        const preview = Array.isArray(message.preview)
+          ? message.preview[0]
+          : undefined;
+        return preview
+          ? [
+              {
+                type: 'link' as const,
+                preview,
+                message: getMediaItemMessage(message),
+              },
+            ]
+          : [];
+      }
+
+      if (options.type === 'contacts') {
+        const contact = Array.isArray(message.contact)
+          ? message.contact[0]
+          : undefined;
+        return contact
+          ? [
+              {
+                type: 'contact' as const,
+                contact,
+                message: getMediaItemMessage(message),
+              },
+            ]
+          : [];
+      }
+
+      return [];
+    })
+    .slice(0, options.limit);
+}
+
+function getSortedDocumentItems(
+  options: GetSortedDocumentsOptionsType
+): Array<MediaItemDBType | ContactMediaItemDBType> {
+  const documents = getSortedMediaItems({
+    ...options,
+    order: 'older',
+    type: 'documents',
+  });
+  const contacts = getSortedNonAttachmentMediaItems({
+    ...options,
+    type: 'contacts',
+  }).filter((item): item is ContactMediaItemDBType => item.type === 'contact');
+
+  return [...documents, ...contacts]
+    .sort((left, right) =>
+      compareGalleryMessageTime(right.message, left.message)
+    )
+    .slice(0, options.limit);
+}
+
+function hasGalleryMedia(conversationId: string): boolean {
+  return getConversationMessages(conversationId)
+    .filter(isGalleryMessage)
+    .some(message => {
+      const attachments = Array.isArray(message.attachments)
+        ? message.attachments
+        : [];
+      const hasAttachment = attachments.some(attachment => {
+        const typedAttachment = attachment as AttachmentType;
+        return (
+          Boolean(typedAttachment.contentType) &&
+          typedAttachment.contentType !== 'text/x-signal-plain'
+        );
+      });
+      const hasPreview =
+        Array.isArray(message.preview) && message.preview.length > 0;
+      const hasContact =
+        Array.isArray(message.contact) && message.contact.length > 0;
+      return hasAttachment || hasPreview || hasContact;
+    });
 }
 
 function getMessageMetrics(conversationId: string | undefined) {
@@ -579,7 +852,9 @@ function appendWebPinnedMessage(
   }
 
   const sortedForConversation = nextPinnedMessages
-    .filter(pinnedMessage => pinnedMessage.conversationId === params.conversationId)
+    .filter(
+      pinnedMessage => pinnedMessage.conversationId === params.conversationId
+    )
     .sort((left, right) => right.pinnedAt - left.pinnedAt);
   const keptIds = new Set(
     sortedForConversation.slice(0, limit).map(pinnedMessage => pinnedMessage.id)
@@ -601,7 +876,9 @@ function appendWebPinnedMessage(
   };
 }
 
-function deleteWebPinnedMessageByMessageId(messageId: string): PinnedMessageId | null {
+function deleteWebPinnedMessageByMessageId(
+  messageId: string
+): PinnedMessageId | null {
   const existing = webRuntimePinnedMessages.find(
     pinnedMessage => pinnedMessage.messageId === messageId
   );
@@ -636,13 +913,13 @@ export function getWebPinnedMessagesPreloadDataForConversation(
         message,
       };
     })
-    .filter(
-      (item): item is PinnedMessagePreloadData => item != null
-    );
+    .filter((item): item is PinnedMessagePreloadData => item != null);
 }
 
 function getOurAci(): string | undefined {
-  return currentLinkedSession?.credentials?.aci ?? currentLinkedSession?.account.aci;
+  return (
+    currentLinkedSession?.credentials?.aci ?? currentLinkedSession?.account.aci
+  );
 }
 
 function getMessageAuthorAci(message: MessageRecord): string | undefined {
@@ -708,9 +985,8 @@ export async function applyRemotePinnedMessage(
         senderAci: params.senderAci,
         sentAtTimestamp: params.timestamp,
         receivedAtTimestamp: params.receivedAt,
-        expireTimer: (targetConversation.get('expireTimer') ?? null) as
-          | DurationInSeconds
-          | null,
+        expireTimer: (targetConversation.get('expireTimer') ??
+          null) as DurationInSeconds | null,
         expirationStartTimestamp: params.receivedAt,
       });
     }
@@ -865,7 +1141,10 @@ export function setWebRuntimeChatShell(shell: ChatShellState): void {
   if (linkedSession) {
     (
       window as unknown as {
-        SignalWebBootstrapConversationLookup?: Record<string, ConversationRecord>;
+        SignalWebBootstrapConversationLookup?: Record<
+          string,
+          ConversationRecord
+        >;
       }
     ).SignalWebBootstrapConversationLookup = Object.fromEntries(
       Object.values(shell.conversationLookup).map(conversation => [
@@ -964,8 +1243,7 @@ class WebConversationModel {
   }
 
   public set(key: string | Record<string, unknown>, value?: unknown): void {
-    const changes =
-      typeof key === 'string' ? { [key]: value } : key;
+    const changes = typeof key === 'string' ? { [key]: value } : key;
     const nextAttributes = { ...this.attributes, ...changes };
     const derivedContactIdentityAttributes =
       getDerivedContactIdentityAttributes(nextAttributes);
@@ -1015,8 +1293,9 @@ class WebConversationModel {
       conversationId: this.id,
       messages,
       metrics: getDesktopMessageMetrics(messages as never),
-      pinnedMessagesPreloadData:
-        getWebPinnedMessagesPreloadDataForConversation(this.id),
+      pinnedMessagesPreloadData: getWebPinnedMessagesPreloadDataForConversation(
+        this.id
+      ),
       unboundedFetch: true,
     });
   }
@@ -1050,8 +1329,9 @@ class WebConversationModel {
       newest.type === 'outgoing'
         ? window.SignalContext.i18n('icu:you')
         : newest.type === 'incoming'
-          ? (window.ConversationController.get(newest.sourceServiceId)
-              ?.getTitle() ?? null)
+          ? (window.ConversationController.get(
+              newest.sourceServiceId
+            )?.getTitle() ?? null)
           : null;
     const lastMessage =
       newest.deletedForEveryone || newest.isErased
@@ -1095,7 +1375,9 @@ class WebConversationModel {
 
   public async throttledFetchSMSOnlyUUID(): Promise<void> {}
 
-  public async throttledGetProfiles(): Promise<void> {}
+  public async throttledGetProfiles(): Promise<void> {
+    await this.getProfiles();
+  }
 
   public async getProfiles(): Promise<void> {}
 
@@ -1405,7 +1687,9 @@ class WebConversationModel {
     value: boolean | number | string;
   }>): Promise<void> {
     if (!currentMessageRuntimeSessionId) {
-      throw new Error('modifyWebGroupSettings: missing message runtime session');
+      throw new Error(
+        'modifyWebGroupSettings: missing message runtime session'
+      );
     }
     const result = await modifyGroupSettings({
       action,
@@ -1493,7 +1777,9 @@ class WebConversationModel {
     });
   }
 
-  public async updateAccessControlAddFromInviteLink(value: boolean): Promise<void> {
+  public async updateAccessControlAddFromInviteLink(
+    value: boolean
+  ): Promise<void> {
     const accessControl = getGroupAccessControlForRecord(this.attributes);
     const nextValue = value
       ? Proto.AccessControl.AccessRequired.MEMBER
@@ -1528,10 +1814,12 @@ class WebConversationModel {
     });
   }
 
-  public async updateGroupAttributes(attributes: Readonly<{
-    description?: string;
-    title?: string;
-  }>): Promise<void> {
+  public async updateGroupAttributes(
+    attributes: Readonly<{
+      description?: string;
+      title?: string;
+    }>
+  ): Promise<void> {
     if (typeof attributes.title === 'string') {
       await this.modifyWebGroupSettings({
         action: 'title',
@@ -1566,7 +1854,9 @@ class WebConversationModel {
     }
   }
 
-  public async addMembersToGroup(contactIds: ReadonlyArray<string>): Promise<void> {
+  public async addMembersToGroup(
+    contactIds: ReadonlyArray<string>
+  ): Promise<void> {
     if (!currentMessageRuntimeSessionId) {
       throw new Error('addMembersToGroup: missing message runtime session');
     }
@@ -1574,8 +1864,7 @@ class WebConversationModel {
     for (const contactId of contactIds) {
       const contact = window.ConversationController.get(contactId);
       const serviceId =
-        contact?.getAci?.() ??
-        (isAciString(contactId) ? contactId : undefined);
+        contact?.getAci?.() ?? (isAciString(contactId) ? contactId : undefined);
       if (!serviceId || !contact) {
         throw new Error('addMembersToGroup: missing member ACI');
       }
@@ -1698,7 +1987,8 @@ class WebConversationModel {
     params: AddPinnedMessageNotificationParams
   ): Promise<void> {
     const ourAci =
-      currentLinkedSession?.credentials?.aci ?? currentLinkedSession?.account.aci;
+      currentLinkedSession?.credentials?.aci ??
+      currentLinkedSession?.account.aci;
     const senderIsMe = params.senderAci === ourAci;
     const message: MessageRecord = {
       id: `web-pinned-notification:${this.id}:${params.sentAtTimestamp}:${params.pinMessage.targetSentTimestamp}`,
@@ -1809,7 +2099,10 @@ class WebConversationModel {
       conversationId: this.id,
       isPinned: true,
     }).catch(error => {
-      console.error('pin: failed to sync pinned state to storage service', error);
+      console.error(
+        'pin: failed to sync pinned state to storage service',
+        error
+      );
     });
   }
 
@@ -1829,7 +2122,10 @@ class WebConversationModel {
       conversationId: this.id,
       isPinned: false,
     }).catch(error => {
-      console.error('unpin: failed to sync pinned state to storage service', error);
+      console.error(
+        'unpin: failed to sync pinned state to storage service',
+        error
+      );
     });
   }
 
@@ -1847,7 +2143,9 @@ class WebConversationModel {
   }
 
   public async destroyMessages(): Promise<void> {
-    const messageIds = getConversationMessages(this.id).map(message => message.id);
+    const messageIds = getConversationMessages(this.id).map(
+      message => message.id
+    );
     removeMessagesFromRuntime(messageIds);
     this.set({
       activeAt: undefined,
@@ -1945,28 +2243,26 @@ class WebConversationModel {
     const pendingMembersV2 = Array.isArray(this.attributes.pendingMembersV2)
       ? this.attributes.pendingMembersV2
       : [];
-    const members =
-      explicitMembers ??
-      [
-        ...membersV2
-          .map(member =>
-            member && typeof member === 'object'
-              ? (member as { aci?: unknown }).aci
-              : undefined
-          )
-          .filter((aci): aci is string => typeof aci === 'string'),
-        ...(options.includePendingMembers
-          ? pendingMembersV2
-              .map(member =>
-                member && typeof member === 'object'
-                  ? (member as { serviceId?: unknown }).serviceId
-                  : undefined
-              )
-              .filter(
-                (serviceId): serviceId is string => typeof serviceId === 'string'
-              )
-          : []),
-      ];
+    const members = explicitMembers ?? [
+      ...membersV2
+        .map(member =>
+          member && typeof member === 'object'
+            ? (member as { aci?: unknown }).aci
+            : undefined
+        )
+        .filter((aci): aci is string => typeof aci === 'string'),
+      ...(options.includePendingMembers
+        ? pendingMembersV2
+            .map(member =>
+              member && typeof member === 'object'
+                ? (member as { serviceId?: unknown }).serviceId
+                : undefined
+            )
+            .filter(
+              (serviceId): serviceId is string => typeof serviceId === 'string'
+            )
+        : []),
+    ];
 
     return {
       groupChange: options.groupChange,
@@ -1981,7 +2277,7 @@ class WebConversationModel {
       messageOrModel &&
       typeof messageOrModel === 'object' &&
       'attributes' in messageOrModel
-        ? ((messageOrModel as { attributes: MessageRecord }).attributes)
+        ? (messageOrModel as { attributes: MessageRecord }).attributes
         : (messageOrModel as MessageRecord);
     if (!message?.id) {
       return;
@@ -2232,7 +2528,9 @@ class WebConversationModel {
           | undefined)
       : undefined;
     const localMessageId = `sent:${
-      isGroupConversation ? String(this.attributes.groupId ?? this.id) : String(this.attributes.serviceId ?? this.id)
+      isGroupConversation
+        ? String(this.attributes.groupId ?? this.id)
+        : String(this.attributes.serviceId ?? this.id)
     }:${timestamp}`;
     const optimisticMessage = toDesktopMessage({
       id: localMessageId,
@@ -2323,11 +2621,14 @@ class WebConversationModel {
 function getConversationLookup(): Record<string, ConversationRecord> {
   return {
     ...getBootstrapConversationLookup(),
-    ...(window.reduxStore?.getState?.().conversations?.conversationLookup ?? {}),
+    ...(window.reduxStore?.getState?.().conversations?.conversationLookup ??
+      {}),
   };
 }
 
-function getConversationModel(id: string | undefined): WebConversationModel | undefined {
+function getConversationModel(
+  id: string | undefined
+): WebConversationModel | undefined {
   if (!id) {
     return undefined;
   }
@@ -2485,7 +2786,9 @@ function applyContactIdentityChange(
   conversation.set(change);
 }
 
-function removeConversationModelFromRuntime(conversation: WebConversationModel): void {
+function removeConversationModelFromRuntime(
+  conversation: WebConversationModel
+): void {
   window.reduxActions?.conversations?.conversationRemoved?.(conversation.id);
   onConversationAttributesChanged?.(conversation.id, {
     __signalWebDeleteConversation: true,
@@ -2587,7 +2890,9 @@ function installConversationController(
     },
     isSignalConversationId(id: string | undefined) {
       const conversation = getConversationModel(id);
-      return conversation?.attributes.serviceId === SIGNAL_ACI || id === SIGNAL_ACI;
+      return (
+        conversation?.attributes.serviceId === SIGNAL_ACI || id === SIGNAL_ACI
+      );
     },
     lookupOrCreate({
       e164,
@@ -2732,7 +3037,10 @@ function installConversationController(
             return;
           }
 
-          if (!targetConversation && !getContactIdentityValue(match, unused.key)) {
+          if (
+            !targetConversation &&
+            !getContactIdentityValue(match, unused.key)
+          ) {
             targetConversation = match;
           }
 
@@ -2812,7 +3120,9 @@ function installConversationController(
       }
 
       if (matchCount !== 0) {
-        throw new Error(`${logId}: should be no matches if no targetConversation`);
+        throw new Error(
+          `${logId}: should be no matches if no targetConversation`
+        );
       }
 
       const identifier = aci ?? pni ?? e164;
@@ -2832,12 +3142,17 @@ function installConversationController(
     },
     onConvoMessageMount() {},
   };
-  window.ConversationController = controller as unknown as typeof window.ConversationController;
+  window.ConversationController =
+    controller as unknown as typeof window.ConversationController;
 }
 
 function installKeyboardLayoutFallback(): void {
   const nav = window.navigator as unknown as {
-    keyboard?: { getLayoutMap?: () => Promise<{ get: (code: string) => string | undefined }> };
+    keyboard?: {
+      getLayoutMap?: () => Promise<{
+        get: (code: string) => string | undefined;
+      }>;
+    };
   };
   if (nav.keyboard?.getLayoutMap) {
     return;
@@ -2867,7 +3182,11 @@ export function setupWebGlobals({
   installKeyboardLayoutFallback();
   installConversationController(linkedSession);
 
-  window.platform = OS.isMacOS() ? 'darwin' : OS.isWindows() ? 'win32' : 'linux';
+  window.platform = OS.isMacOS()
+    ? 'darwin'
+    : OS.isWindows()
+      ? 'win32'
+      : 'linux';
   window.getVersion = () => packageJson.version;
 
   window.Whisper = {
@@ -2952,6 +3271,22 @@ export function setupWebGlobals({
       if (name === 'getConversationById') {
         return undefined;
       }
+      if (name === 'hasMedia') {
+        return typeof args?.[0] === 'string' ? hasGalleryMedia(args[0]) : false;
+      }
+      if (name === 'getSortedMedia') {
+        return getSortedMediaItems(args?.[0] as GetSortedMediaOptionsType);
+      }
+      if (name === 'getSortedNonAttachmentMedia') {
+        return getSortedNonAttachmentMediaItems(
+          args?.[0] as GetSortedNonAttachmentMediaOptionsType
+        );
+      }
+      if (name === 'getSortedDocuments') {
+        return getSortedDocumentItems(
+          args?.[0] as GetSortedDocumentsOptionsType
+        );
+      }
       if (name === 'getOlderMessagesByConversation') {
         return getConversationMessagesPage(args?.[0]);
       }
@@ -2976,7 +3311,9 @@ export function setupWebGlobals({
           | { conversationId?: string; limit?: number; messageId?: string }
           | undefined;
         const messages = getConversationMessages(options?.conversationId);
-        const index = messages.findIndex(message => message.id === options?.messageId);
+        const index = messages.findIndex(
+          message => message.id === options?.messageId
+        );
         if (index < 0) {
           return {
             older: [],
@@ -3118,10 +3455,7 @@ export function setupWebGlobals({
         const limit = args?.[0];
         const params = args?.[1];
         if (typeof limit === 'number' && params && typeof params === 'object') {
-          return appendWebPinnedMessage(
-            limit,
-            params as PinnedMessageParams
-          );
+          return appendWebPinnedMessage(limit, params as PinnedMessageParams);
         }
         return {
           change: null,
@@ -3134,7 +3468,12 @@ export function setupWebGlobals({
           ? deleteWebPinnedMessageByMessageId(messageId)
           : null;
       }
-      if (name.startsWith('create') || name.startsWith('update') || name.startsWith('save') || name.startsWith('remove')) {
+      if (
+        name.startsWith('create') ||
+        name.startsWith('update') ||
+        name.startsWith('save') ||
+        name.startsWith('remove')
+      ) {
         return undefined;
       }
       return undefined;
@@ -3208,7 +3547,8 @@ export function setupWebGlobals({
       waitForChange: async () => undefined,
     },
   };
-  window.SignalContext = signalContext as unknown as typeof window.SignalContext;
+  window.SignalContext =
+    signalContext as unknown as typeof window.SignalContext;
 
   const signal = {
     ...(window.Signal ?? {}),

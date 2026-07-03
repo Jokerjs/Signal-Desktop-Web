@@ -36,6 +36,101 @@
   }
 }
 
+@supports not selector(:dir(ltr)) {
+  .module-left-pane__header__contents__back-button {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+    -webkit-mask-size: 100%;
+    background-color: #5e5e5e;
+  }
+
+  [dir='rtl'] .module-left-pane__header__contents__back-button {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-right.svg') no-repeat
+      center;
+  }
+
+  .keyboard-mode .module-left-pane__header__contents__back-button:focus {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+    -webkit-mask-size: 100%;
+    background-color: #2c6bed;
+  }
+
+  [dir='rtl']
+    .keyboard-mode
+    .module-left-pane__header__contents__back-button:focus,
+  [dir='rtl'].keyboard-mode
+    .module-left-pane__header__contents__back-button:focus {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-right.svg') no-repeat
+      center;
+  }
+
+  .dark-theme .module-left-pane__header__contents__back-button {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+    -webkit-mask-size: 100%;
+    background-color: #b9b9b9;
+  }
+
+  [dir='rtl'] .dark-theme .module-left-pane__header__contents__back-button,
+  [dir='rtl'].dark-theme .module-left-pane__header__contents__back-button {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-right.svg') no-repeat
+      center;
+  }
+
+  .dark-theme.keyboard-mode
+    .module-left-pane__header__contents__back-button:hover {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+    -webkit-mask-size: 100%;
+    background-color: #6191f3;
+  }
+
+  [dir='rtl']
+    .dark-theme.keyboard-mode
+    .module-left-pane__header__contents__back-button:hover,
+  [dir='rtl'].dark-theme.keyboard-mode
+    .module-left-pane__header__contents__back-button:hover {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-right.svg') no-repeat
+      center;
+  }
+
+  [dir='rtl'] .ConversationPanel__header__back-button,
+  [dir='rtl'] .module-Modal__back-button::before,
+  [dir='rtl'] .NavSidebar__BackButton::before,
+  [dir='rtl'] .Preferences__back-icon {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+  }
+
+  [dir='rtl'] .BadgeDialog__nav--previous::before,
+  [dir='rtl'] .BadgeDialog__nav--next::before,
+  [dir='rtl'] .ContactModal__name__chevron,
+  [dir='rtl']
+    .ConversationDetails-membership-list__member-label-button__chevron-icon,
+  [dir='rtl'] .ConversationDetailsHeader__about-icon,
+  [dir='rtl'] .PreferencesDonations__list-item__chevron::before,
+  [dir='rtl'] .Stories__hidden-stories--collapsed::after,
+  [dir='rtl'] .StoryListItem__chevron::after,
+  [dir='rtl'] .StoryViewer__reply__chevron::after,
+  [dir='rtl'] .TextAttachment__preview__tooltip__arrow {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+  }
+
+  [dir='rtl'] .module-ongoing-call__next-page--arrow,
+  [dir='rtl'] .module-ongoing-call__group-call--pagination-tile--next-arrow {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-left.svg') no-repeat
+      center;
+  }
+
+  [dir='rtl'] .module-ongoing-call__prev-page--arrow,
+  [dir='rtl'] .module-ongoing-call__group-call--pagination-tile--prev-arrow {
+    -webkit-mask: url('./images/icons/v3/chevron/chevron-right.svg') no-repeat
+      center;
+  }
+}
+
 @supports not (word-break: auto-phrase) {
   .module-message__link-preview__description,
   .module-message__text,

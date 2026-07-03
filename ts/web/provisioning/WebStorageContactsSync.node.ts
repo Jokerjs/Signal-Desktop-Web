@@ -46,6 +46,14 @@ type SyncStorageContactsOptions = Readonly<{
   storageUrl: string;
 }>;
 
+export type StorageContactsSyncResult = Readonly<{
+  contactsBootstrap: ContactsBootstrap & {
+    source: 'storage';
+    storageVersion?: number;
+  };
+  profileSyncConversations: ReadonlyArray<WebConversation>;
+}>;
+
 type UpdateStorageConversationArchiveOptions = Readonly<{
   allowInsecureTls?: boolean;
   chat: AuthenticatedChatConnection;
@@ -82,6 +90,18 @@ type UpdateStoragePinnedConversationsOptions = Readonly<{
   storageUrl: string;
 }>;
 
+type UpdateStorageAccountProfileOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  avatarUrlPath?: string;
+  chat: AuthenticatedChatConnection;
+  familyName?: string;
+  firstName: string;
+  linkedPayload: LinkedPayload;
+  phoneNumberSharing: boolean;
+  removeAvatar?: boolean;
+  storageUrl: string;
+}>;
+
 type LoadedStorageState = Readonly<{
   credentials: StorageCredentials;
   currentVersion: number;
@@ -99,7 +119,6 @@ type TargetStorageRecord = Readonly<{
 }>;
 
 const MAX_READ_KEYS = 100;
-const MAX_PROFILE_AVATAR_FETCHES_PER_BATCH = 8;
 const PROFILE_AVATAR_CACHE_MS = 5 * 60 * 1000;
 
 type ProfileAvatarCacheValue = Readonly<{
@@ -157,7 +176,9 @@ function setCachedProfileAvatarUrl(
   });
 }
 
-function toNumber(value: bigint | number | null | undefined): number | undefined {
+function toNumber(
+  value: bigint | number | null | undefined
+): number | undefined {
   if (typeof value === 'number') {
     return value;
   }
@@ -168,11 +189,13 @@ function toNumber(value: bigint | number | null | undefined): number | undefined
 }
 
 function fromAvatarColor(
-  color: (
-    | Proto.ContactRecord
-    | Proto.GroupV2Record
-    | Proto.AccountRecord
-  )['avatarColor'] | undefined
+  color:
+    | (
+        | Proto.ContactRecord
+        | Proto.GroupV2Record
+        | Proto.AccountRecord
+      )['avatarColor']
+    | undefined
 ): string | undefined {
   switch (color) {
     case Proto.AvatarColor.A100:
@@ -207,7 +230,10 @@ function fromAvatarColor(
   }
 }
 
-function getContactTitle(contact: Proto.ContactRecord, fallback: string): string {
+function getContactTitle(
+  contact: Proto.ContactRecord,
+  fallback: string
+): string {
   const nickname = [contact.nickname?.given, contact.nickname?.family]
     .filter(Boolean)
     .join(' ')
@@ -228,7 +254,9 @@ function getContactTitle(contact: Proto.ContactRecord, fallback: string): string
   return nickname || systemName || profileName || contact.username || fallback;
 }
 
-function getContactConversation(contact: Proto.ContactRecord): WebConversation | undefined {
+function getContactConversation(
+  contact: Proto.ContactRecord
+): WebConversation | undefined {
   const aci = fromAciUuidBytesOrString(
     contact.aciBinary,
     contact.aci,
@@ -324,29 +352,25 @@ function fetchProfileAvatarBytesAllowingInsecureTls({
   url: URL;
 }>): Promise<Uint8Array<ArrayBuffer>> {
   return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      { rejectUnauthorized: false },
-      response => {
-        const chunks = new Array<Buffer>();
-        response.on('data', chunk => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        });
-        response.on('end', () => {
-          const bytes = Buffer.concat(chunks);
-          const statusCode = response.statusCode ?? 0;
-          if (statusCode < 200 || statusCode >= 300) {
-            reject(
-              new Error(
-                `profile avatar ${avatarPath} failed with status ${statusCode}: ${bytes.toString('utf8')}`
-              )
-            );
-            return;
-          }
-          resolve(new Uint8Array(bytes) as Uint8Array<ArrayBuffer>);
-        });
-      }
-    );
+    const request = https.get(url, { rejectUnauthorized: false }, response => {
+      const chunks = new Array<Buffer>();
+      response.on('data', chunk => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      response.on('end', () => {
+        const bytes = Buffer.concat(chunks);
+        const statusCode = response.statusCode ?? 0;
+        if (statusCode < 200 || statusCode >= 300) {
+          reject(
+            new Error(
+              `profile avatar ${avatarPath} failed with status ${statusCode}: ${bytes.toString('utf8')}`
+            )
+          );
+          return;
+        }
+        resolve(new Uint8Array(bytes) as Uint8Array<ArrayBuffer>);
+      });
+    });
     request.on('error', reject);
     request.end();
   });
@@ -364,7 +388,9 @@ async function fetchProfileAvatarBytes({
   const url = new URL(`${cdnUrl.replace(/\/$/, '')}/${avatarPath}`);
   try {
     const response = await fetch(url);
-    const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
     if (!response.ok) {
       throw new Error(
         `profile avatar ${avatarPath} failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`
@@ -429,9 +455,36 @@ async function fetchContactProfileAvatarUrl({
     return undefined;
   }
 
-  const encryptedAvatar = await fetchProfileAvatarBytes({
+  return fetchProfileAvatarUrl({
     allowInsecureTls,
     avatarPath: profile.avatar,
+    cacheKey,
+    cdnUrl,
+    profileKey,
+  });
+}
+
+async function fetchProfileAvatarUrl({
+  allowInsecureTls,
+  avatarPath,
+  cacheKey,
+  cdnUrl,
+  profileKey,
+}: Readonly<{
+  allowInsecureTls?: boolean;
+  avatarPath: string;
+  cacheKey: string | undefined;
+  cdnUrl: string;
+  profileKey: string;
+}>): Promise<string | undefined> {
+  const cachedAvatarUrl = getCachedProfileAvatarUrl(cacheKey);
+  if (cachedAvatarUrl != null) {
+    return cachedAvatarUrl;
+  }
+
+  const encryptedAvatar = await fetchProfileAvatarBytes({
+    allowInsecureTls,
+    avatarPath,
     cdnUrl,
   });
   const decryptedAvatar = decryptProfile(
@@ -444,67 +497,43 @@ async function fetchContactProfileAvatarUrl({
     return undefined;
   }
 
-  const avatarUrl = `data:${contentType};base64,${Buffer.from(decryptedAvatar).toString(
-    'base64'
-  )}`;
+  const avatarUrl = `data:${contentType};base64,${Buffer.from(
+    decryptedAvatar
+  ).toString('base64')}`;
   setCachedProfileAvatarUrl(cacheKey, avatarUrl);
 
   return avatarUrl;
 }
 
-async function addProfileAvatars({
+export async function syncContactProfile({
   allowInsecureTls,
   cdnUrl,
   chat,
-  conversations,
+  conversation,
 }: Readonly<{
   allowInsecureTls?: boolean;
   cdnUrl: string;
   chat: AuthenticatedChatConnection;
-  conversations: ReadonlyArray<WebConversation>;
-}>): Promise<Array<WebConversation>> {
-  const result = [...conversations];
-  for (
-    let index = 0;
-    index < result.length;
-    index += MAX_PROFILE_AVATAR_FETCHES_PER_BATCH
-  ) {
-    const batch = result.slice(index, index + MAX_PROFILE_AVATAR_FETCHES_PER_BATCH);
-    // eslint-disable-next-line no-await-in-loop
-    const avatars = await Promise.all(
-      batch.map(async conversation => {
-        try {
-          return await fetchContactProfileAvatarUrl({
-            allowInsecureTls,
-            cdnUrl,
-            chat,
-            conversation,
-          });
-        } catch {
-          return undefined;
-        }
-      })
-    );
-    avatars.forEach((avatarUrl, batchIndex) => {
-      if (!avatarUrl) {
-        return;
-      }
-      const conversation = batch[batchIndex];
-      if (!conversation) {
-        return;
-      }
-      const resultIndex = index + batchIndex;
-      result[resultIndex] = {
-        ...conversation,
+  conversation: WebConversation;
+}>): Promise<Partial<WebConversation>> {
+  const avatarUrl = await fetchContactProfileAvatarUrl({
+    allowInsecureTls,
+    cdnUrl,
+    chat,
+    conversation,
+  });
+
+  return avatarUrl
+    ? {
         avatarUrl,
         hasAvatar: true,
-      };
-    });
-  }
-  return result;
+      }
+    : {};
 }
 
-function getGroupConversation(group: Proto.GroupV2Record): WebConversation | undefined {
+function getGroupConversation(
+  group: Proto.GroupV2Record
+): WebConversation | undefined {
   if (!group.masterKey || group.masterKey.byteLength === 0) {
     return undefined;
   }
@@ -621,7 +650,9 @@ async function fetchStorageBytes({
       url,
     });
   }
-  const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+  const bytes = new Uint8Array(
+    await response.arrayBuffer()
+  ) as Uint8Array<ArrayBuffer>;
   if (!response.ok) {
     const responseBody = Buffer.from(bytes).toString('utf8');
     throw new Error(
@@ -1002,7 +1033,8 @@ function getPinnedConversationForTarget({
   }
 
   if (target.record.record?.account) {
-    const serviceId = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+    const serviceId =
+      linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
     if (!serviceId) {
       throw new Error('getPinnedConversationForTarget: missing account aci');
     }
@@ -1031,7 +1063,10 @@ export async function updateStorageConversationArchive({
   isArchived,
   linkedPayload,
   storageUrl,
-}: UpdateStorageConversationArchiveOptions): Promise<{ ok: true; version: number }> {
+}: UpdateStorageConversationArchiveOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
   const state = await loadStorageState({
     allowInsecureTls,
     chat,
@@ -1085,7 +1120,10 @@ export async function updateStorageConversationMute({
   linkedPayload,
   muteExpiresAt,
   storageUrl,
-}: UpdateStorageConversationMuteOptions): Promise<{ ok: true; version: number }> {
+}: UpdateStorageConversationMuteOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
   const state = await loadStorageState({
     allowInsecureTls,
     chat,
@@ -1198,7 +1236,10 @@ export async function updateStoragePinnedConversations({
   isPinned,
   linkedPayload,
   storageUrl,
-}: UpdateStoragePinnedConversationsOptions): Promise<{ ok: true; version: number }> {
+}: UpdateStoragePinnedConversationsOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
   const state = await loadStorageState({
     allowInsecureTls,
     chat,
@@ -1207,7 +1248,9 @@ export async function updateStoragePinnedConversations({
   });
   const accountTarget = getStorageAccountRecord(state);
   if (!accountTarget?.record.record?.account) {
-    throw new Error('updateStoragePinnedConversations: account record not found');
+    throw new Error(
+      'updateStoragePinnedConversations: account record not found'
+    );
   }
   const target = findStorageConversationRecord({
     conversationId,
@@ -1225,7 +1268,8 @@ export async function updateStoragePinnedConversations({
     linkedPayload,
     target,
   });
-  const existingPinned = accountTarget.record.record.account.pinnedConversations ?? [];
+  const existingPinned =
+    accountTarget.record.record.account.pinnedConversations ?? [];
   const withoutTarget = existingPinned.filter(
     pinned => getPinnedConversationId(pinned) !== conversationId
   );
@@ -1243,7 +1287,9 @@ export async function updateStoragePinnedConversations({
     existingPinned.every(
       (pinned, index) =>
         getPinnedConversationId(pinned) ===
-        getPinnedConversationId(nextPinned[index] as Proto.AccountRecord.PinnedConversation)
+        getPinnedConversationId(
+          nextPinned[index] as Proto.AccountRecord.PinnedConversation
+        )
     )
   ) {
     return { ok: true, version: state.currentVersion };
@@ -1270,16 +1316,73 @@ export async function updateStoragePinnedConversations({
   });
 }
 
+export async function updateStorageAccountProfile({
+  allowInsecureTls,
+  avatarUrlPath,
+  chat,
+  familyName,
+  firstName,
+  linkedPayload,
+  phoneNumberSharing,
+  removeAvatar,
+  storageUrl,
+}: UpdateStorageAccountProfileOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const accountTarget = getStorageAccountRecord(state);
+  if (!accountTarget?.record.record?.account) {
+    throw new Error('updateStorageAccountProfile: account record not found');
+  }
+
+  const updatedRecord = cloneStorageRecord(accountTarget.record);
+  if (!updatedRecord.record?.account) {
+    throw new Error('updateStorageAccountProfile: missing account record');
+  }
+
+  const account = updatedRecord.record.account;
+  account.givenName = firstName;
+  account.familyName = familyName || '';
+  if (removeAvatar === true) {
+    account.avatarUrlPath = '';
+  } else if (avatarUrlPath) {
+    account.avatarUrlPath = avatarUrlPath;
+  }
+  if (linkedPayload.profileKeyBase64) {
+    account.profileKey = Bytes.fromBase64(linkedPayload.profileKeyBase64);
+  }
+  account.phoneNumberSharingMode = phoneNumberSharing
+    ? Proto.AccountRecord.PhoneNumberSharingMode.EVERYBODY
+    : Proto.AccountRecord.PhoneNumberSharingMode.NOBODY;
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: accountTarget.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: accountTarget.type,
+  });
+}
+
 export async function syncStorageContacts({
   allowInsecureTls,
   chat,
   cdnUrl,
   linkedPayload,
   storageUrl,
-}: SyncStorageContactsOptions): Promise<ContactsBootstrap & {
-  source: 'storage';
-  storageVersion?: number;
-}> {
+}: SyncStorageContactsOptions): Promise<StorageContactsSyncResult> {
   const storageServiceKeyBase64 = linkedPayload.storageServiceKey;
   if (!storageServiceKeyBase64) {
     throw new Error('syncStorageContacts: missing storageServiceKey');
@@ -1345,13 +1448,36 @@ export async function syncStorageContacts({
       .map(getPinnedConversationId)
       .filter(id => id != null)
   );
-  const accountTitle = [
-    accountRecord?.givenName,
-    accountRecord?.familyName,
-  ].filter(Boolean).join(' ').trim();
+  const accountTitle = [accountRecord?.givenName, accountRecord?.familyName]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  const accountAvatarUrlPath =
+    accountRecord?.avatarUrlPath || linkedPayload.account.avatarUrlPath;
+  const accountProfileKey = accountRecord?.profileKey?.byteLength
+    ? Bytes.toBase64(accountRecord.profileKey)
+    : linkedPayload.profileKeyBase64;
+  let accountAvatarUrl = linkedPayload.account.avatarUrl;
+  if (accountAvatarUrlPath && accountProfileKey) {
+    try {
+      accountAvatarUrl = await fetchProfileAvatarUrl({
+        allowInsecureTls,
+        avatarPath: accountAvatarUrlPath,
+        cacheKey: `account:${accountProfileKey}:${accountAvatarUrlPath}`,
+        cdnUrl,
+        profileKey: accountProfileKey,
+      });
+    } catch (error) {
+      console.warn(
+        'syncStorageContacts: failed to fetch account avatar',
+        error
+      );
+    }
+  }
   const account = {
     ...linkedPayload.account,
-    avatarUrlPath: accountRecord?.avatarUrlPath || undefined,
+    avatarUrl: accountAvatarUrl,
+    avatarUrlPath: accountAvatarUrlPath || undefined,
     color: fromAvatarColor(accountRecord?.avatarColor),
     noteToSelfArchived: accountRecord?.noteToSelfArchived,
     noteToSelfMarkedUnread: accountRecord?.noteToSelfMarkedUnread,
@@ -1364,42 +1490,47 @@ export async function syncStorageContacts({
   const generatedAt = Date.now();
   const enrichedConversations = await enrichGroupConversations({
     allowInsecureTls,
+    cdnUrl,
     chat,
     conversations: [...conversationsById.values()],
     linkedPayload,
     storageUrl,
   });
-  const conversations = await addProfileAvatars({
-    allowInsecureTls,
-    cdnUrl,
-    chat,
-    conversations: enrichedConversations.map(conversation => ({
-      ...conversation,
-      isPinned: pinnedIds.has(conversation.id),
-    })),
-  });
+  const conversations = enrichedConversations.map(conversation => ({
+    ...conversation,
+    isPinned: pinnedIds.has(conversation.id),
+  }));
+  const profileSyncConversations = conversations.filter(
+    conversation =>
+      conversation.conversationType === 'direct' &&
+      Boolean(conversation.profileKey) &&
+      Boolean(conversation.serviceId)
+  );
   const active = conversations
     .filter(conversation => !conversation.isArchived && conversation.activeAt)
     .sort((left, right) => (right.activeAt ?? 0) - (left.activeAt ?? 0));
 
   return {
-    source: 'storage',
-    version: 1,
-    storageVersion,
-    generatedAt,
-    account,
-    selectedConversationId: active[0]?.id,
-    storyDistributionLists: [
-      {
-        id: MY_STORY_ID,
-        name: '我的动态',
-        allowsReplies: true,
-        isBlockList: true,
-        memberServiceIds: [],
-      },
-    ],
-    pinned: active.filter(conversation => conversation.isPinned),
-    conversations: active.filter(conversation => !conversation.isPinned),
-    archived: conversations.filter(conversation => conversation.isArchived),
+    contactsBootstrap: {
+      source: 'storage',
+      version: 1,
+      storageVersion,
+      generatedAt,
+      account,
+      selectedConversationId: active[0]?.id,
+      storyDistributionLists: [
+        {
+          id: MY_STORY_ID,
+          name: '我的动态',
+          allowsReplies: true,
+          isBlockList: true,
+          memberServiceIds: [],
+        },
+      ],
+      pinned: active.filter(conversation => conversation.isPinned),
+      conversations: active.filter(conversation => !conversation.isPinned),
+      archived: conversations.filter(conversation => conversation.isArchived),
+    },
+    profileSyncConversations,
   };
 }

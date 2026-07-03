@@ -83,7 +83,10 @@ import {
 } from '../../util/uploads/tusProtocol.node.ts';
 import { importEphemeralBackup } from './WebBackupImportBridge.node.ts';
 import {
+  type StorageContactsSyncResult,
+  syncContactProfile,
   syncStorageContacts,
+  updateStorageAccountProfile,
   updateStorageConversationArchive,
   updateStorageConversationMarkedUnread,
   updateStorageConversationMute,
@@ -107,6 +110,7 @@ import {
 } from './WebSignalSendBridge.node.ts';
 import {
   createGroupConversation,
+  enrichGroupConversations,
   fetchLatestGroupStateConversation,
   modifyGroupMember,
   modifyGroupSettings,
@@ -114,6 +118,8 @@ import {
   type WebGroupSettingsModifyAction,
 } from './WebGroupStateSync.node.ts';
 import type {
+  ChatShellState,
+  ContactsBootstrap,
   MessageStreamEvent,
   ProtocolState,
   WebAttachment,
@@ -183,6 +189,7 @@ const WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS = Number(
 );
 const MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT = 500;
 const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
+const PROFILE_FETCH_CONCURRENCY = 30;
 const emojiToSheet = new Map<string, string>();
 const emojiSheetCache = new Map<string, Map<string, Uint8Array<ArrayBuffer>>>();
 
@@ -524,6 +531,136 @@ function acknowledgePersistedStreamEvent(
     return;
   }
   persistedStreamEventsByAccount.set(accountKey, nextItems);
+}
+
+async function kickOffProfileFetches({
+  streamSession,
+  syncResult,
+  writeEvent,
+}: Readonly<{
+  streamSession: MessageStreamSession;
+  syncResult: StorageContactsSyncResult;
+  writeEvent: (event: MessageStreamEvent) => void;
+}>): Promise<void> {
+  if (
+    !streamSession.connection ||
+    syncResult.profileSyncConversations.length === 0
+  ) {
+    return;
+  }
+  const { connection } = streamSession;
+
+  for (
+    let index = 0;
+    index < syncResult.profileSyncConversations.length;
+    index += PROFILE_FETCH_CONCURRENCY
+  ) {
+    const batch = syncResult.profileSyncConversations.slice(
+      index,
+      index + PROFILE_FETCH_CONCURRENCY
+    );
+    // eslint-disable-next-line no-await-in-loop
+    await Promise.all(
+      batch.map(async conversation => {
+        try {
+          const profile = await syncContactProfile({
+            allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+            chat: connection,
+            cdnUrl: getDefaultCdnUrl(),
+            conversation,
+          });
+          if (Object.keys(profile).length === 0) {
+            return;
+          }
+          streamSession.updatedAt = now();
+          writeEvent({
+            type: 'conversation',
+            conversation: {
+              ...conversation,
+              ...profile,
+            },
+          });
+        } catch (error) {
+          console.warn('kickOffProfileFetches: failed to fetch profile', {
+            conversationId: conversation.id,
+            error: errorToLogString(error),
+          });
+        }
+      })
+    );
+  }
+}
+
+async function enrichBackupImportGroups({
+  chat,
+  chatShell,
+  contactsBootstrap,
+  linkedPayload,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  chatShell: ChatShellState;
+  contactsBootstrap: ContactsBootstrap;
+  linkedPayload: LinkedPayload;
+}>): Promise<
+  Readonly<{
+    chatShell: ChatShellState;
+    contactsBootstrap: ContactsBootstrap;
+  }>
+> {
+  const conversations = Object.values(chatShell.conversationLookup);
+  if (
+    !conversations.some(
+      conversation =>
+        conversation.type === 'group' ||
+        conversation.conversationType === 'group'
+    )
+  ) {
+    return { chatShell, contactsBootstrap };
+  }
+
+  try {
+    const enrichedConversations = await enrichGroupConversations({
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      cdnUrl: getDefaultCdnUrl(),
+      chat,
+      conversations,
+      linkedPayload,
+      storageUrl: productionConfig.storageUrl,
+    });
+    const enrichedById = new Map(
+      enrichedConversations.map(conversation => [conversation.id, conversation])
+    );
+    const mergeConversation = (conversation: WebConversation) => {
+      const enriched = enrichedById.get(conversation.id);
+      return enriched ? { ...conversation, ...enriched } : conversation;
+    };
+
+    return {
+      chatShell: {
+        ...chatShell,
+        conversationLookup: Object.fromEntries(
+          Object.entries(chatShell.conversationLookup).map(
+            ([conversationId, conversation]) => [
+              conversationId,
+              mergeConversation(conversation),
+            ]
+          )
+        ),
+      },
+      contactsBootstrap: {
+        ...contactsBootstrap,
+        pinned: contactsBootstrap.pinned.map(mergeConversation),
+        conversations: contactsBootstrap.conversations.map(mergeConversation),
+        archived: contactsBootstrap.archived.map(mergeConversation),
+      },
+    };
+  } catch (error) {
+    console.warn(
+      'enrichBackupImportGroups: failed to hydrate group conversations',
+      error
+    );
+    return { chatShell, contactsBootstrap };
+  }
 }
 
 function emitProtocolState(streamSession: MessageStreamSession): void {
@@ -2682,8 +2819,18 @@ async function importBackupForMessageStream({
     streamSession.backupImportStatus = 'done';
     streamSession.backupImportStats = result.stats;
     streamSession.updatedAt = now();
-    writeEvent({ type: 'contacts-bootstrap', data: result.contactsBootstrap });
-    writeEvent({ type: 'chat-shell', state: result.chatShell });
+    let chatShell = result.chatShell;
+    let contactsBootstrap = result.contactsBootstrap;
+    if (streamSession.connection) {
+      ({ chatShell, contactsBootstrap } = await enrichBackupImportGroups({
+        chat: streamSession.connection,
+        chatShell,
+        contactsBootstrap,
+        linkedPayload,
+      }));
+    }
+    writeEvent({ type: 'contacts-bootstrap', data: contactsBootstrap });
+    writeEvent({ type: 'chat-shell', state: chatShell });
     writeEvent({
       type: 'backup-import-status',
       status: 'done',
@@ -2745,6 +2892,7 @@ async function enrichConversationForGroupMessage({
 
   return fetchLatestGroupStateConversation({
     allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    cdnUrl: getDefaultCdnUrl(),
     chat: connection,
     conversation,
     linkedPayload,
@@ -3079,11 +3227,16 @@ async function handleMessageStream(
                     linkedPayload,
                     storageUrl: productionConfig.storageUrl,
                   })
-                    .then(contacts => {
+                    .then(syncResult => {
                       streamSession.updatedAt = now();
                       writePersistedEvent({
                         type: 'contacts-bootstrap',
-                        data: contacts,
+                        data: syncResult.contactsBootstrap,
+                      });
+                      void kickOffProfileFetches({
+                        streamSession,
+                        syncResult,
+                        writeEvent: writePersistedEvent,
                       });
                     })
                     .catch(error => {
@@ -4811,6 +4964,30 @@ async function handleWriteProfile(
     );
   }
 
+  try {
+    await updateStorageAccountProfile({
+      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+      avatarUrlPath,
+      chat: streamSession.connection,
+      familyName,
+      firstName,
+      linkedPayload: streamSession.linkedPayload,
+      phoneNumberSharing: body.phoneNumberSharing,
+      removeAvatar: body.removeAvatar,
+      storageUrl: productionConfig.storageUrl,
+    });
+    await sendFetchStorageManifestSync({
+      chat: streamSession.connection,
+      linkedPayload: streamSession.linkedPayload,
+      timestamp,
+    });
+  } catch (error) {
+    console.warn(
+      'handleWriteProfile: profile updated, but storage service sync failed',
+      error
+    );
+  }
+
   if (body.hasOtherDevices === true) {
     await sendFetchLocalProfileSync({
       chat: streamSession.connection,
@@ -5397,14 +5574,21 @@ async function handleContactsSync(
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (streamSession?.connection && streamSession.linkedPayload) {
-    const contacts = await syncStorageContacts({
+    const syncResult = await syncStorageContacts({
       allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
       chat: streamSession.connection,
       cdnUrl: getDefaultCdnUrl(),
       linkedPayload: streamSession.linkedPayload,
       storageUrl: productionConfig.storageUrl,
     });
-    sendJson(req, res, 200, contacts);
+    sendJson(req, res, 200, syncResult.contactsBootstrap);
+    if (streamSession.writeEvent) {
+      void kickOffProfileFetches({
+        streamSession,
+        syncResult,
+        writeEvent: streamSession.writeEvent,
+      });
+    }
     return;
   }
 
@@ -5453,7 +5637,7 @@ async function handleContactsSync(
         languages: ['zh-CN', 'en-US'],
       }
     );
-    const contacts = await syncStorageContacts({
+    const syncResult = await syncStorageContacts({
       allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
       chat: connection,
       cdnUrl: getDefaultCdnUrl(),
@@ -5477,7 +5661,7 @@ async function handleContactsSync(
       },
       storageUrl: productionConfig.storageUrl,
     });
-    sendJson(req, res, 200, contacts);
+    sendJson(req, res, 200, syncResult.contactsBootstrap);
   } finally {
     await connection?.disconnect();
   }

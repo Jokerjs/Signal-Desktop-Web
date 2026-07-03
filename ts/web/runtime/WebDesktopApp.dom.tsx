@@ -410,16 +410,16 @@ function isDeviceDelinkedError(error: string | undefined): boolean {
   const normalizedError = error?.toLowerCase();
   return Boolean(
     normalizedError != null &&
-      (normalizedError.includes(DEVICE_DELINKED_ERROR.toLowerCase()) ||
-        normalizedError.includes('devicedelinked') ||
-        normalizedError.includes('device delinked') ||
-        normalizedError.includes('deregistered') ||
-        normalizedError.includes('no longer authorized') ||
-        normalizedError.includes('unauthorized') ||
-        normalizedError === 'failed to open message stream: 401' ||
-        normalizedError === 'failed to open message stream: 403' ||
-        normalizedError.includes('request failed with status 401') ||
-        normalizedError.includes('request failed with status 403'))
+    (normalizedError.includes(DEVICE_DELINKED_ERROR.toLowerCase()) ||
+      normalizedError.includes('devicedelinked') ||
+      normalizedError.includes('device delinked') ||
+      normalizedError.includes('deregistered') ||
+      normalizedError.includes('no longer authorized') ||
+      normalizedError.includes('unauthorized') ||
+      normalizedError === 'failed to open message stream: 401' ||
+      normalizedError === 'failed to open message stream: 403' ||
+      normalizedError.includes('request failed with status 401') ||
+      normalizedError.includes('request failed with status 403'))
   );
 }
 
@@ -571,8 +571,7 @@ function updateNoteToSelfProfile(
     about: 'about' in account ? account.about : existing.about,
     aboutEmoji:
       'aboutEmoji' in account ? account.aboutEmoji : existing.aboutEmoji,
-    avatarUrl:
-      'avatarUrl' in account ? account.avatarUrl : existing.avatarUrl,
+    avatarUrl: 'avatarUrl' in account ? account.avatarUrl : existing.avatarUrl,
     avatarUrlPath:
       'avatarUrlPath' in account
         ? account.avatarUrlPath
@@ -3411,6 +3410,7 @@ export function WebDesktopApp({
           throw new Error(event.error ?? `Message stream ${event.status}`);
         }
         if (event.status === 'open' && runtimeSessionId) {
+          const activeRuntimeSessionId = runtimeSessionId;
           const nowMs = Date.now();
           const hasRecentContactsSync =
             storageContactsRef.current != null &&
@@ -3421,48 +3421,55 @@ export function WebDesktopApp({
 
           if (!hasRecentContactsSync && !hasContactsSyncInFlight) {
             lastContactsSyncOnOpenAtRef.current = nowMs;
-            const contactsSyncPromise = syncContacts({ runtimeSessionId })
-            .then(data => {
-              const latestLinkedSession = getCurrentLinkedSession();
-              const profileAwareData = mergeContactsBootstrapWithLinkedProfile(
-                data,
-                latestLinkedSession
-              );
-              if (profileAwareData.source === 'storage') {
-                storageContactsRef.current = profileAwareData;
-              }
-              const syncedLinkedSession = mergeLinkedSessionAccount(
-                latestLinkedSession,
-                profileAwareData.account
-              );
-              if (syncedLinkedSession !== latestLinkedSession) {
-                setLinkedSession(syncedLinkedSession);
-                persistLinkedSessionToStorage(syncedLinkedSession);
-                void persistLinkedSessionRecordToIndexedDb(syncedLinkedSession);
-              }
-              void persistContactsBootstrapForSession(
-                syncedLinkedSession.credentials?.aci,
-                profileAwareData
-              );
-              setShell(current => {
-                const next = applyContactsBootstrap(
-                  current,
-                  profileAwareData,
-                  syncedLinkedSession
+            const contactsSyncPromise = syncContacts({
+              runtimeSessionId: activeRuntimeSessionId,
+            })
+              .then(data => {
+                const latestLinkedSession = getCurrentLinkedSession();
+                const profileAwareData =
+                  mergeContactsBootstrapWithLinkedProfile(
+                    data,
+                    latestLinkedSession
+                  );
+                if (profileAwareData.source === 'storage') {
+                  storageContactsRef.current = profileAwareData;
+                }
+                const syncedLinkedSession = mergeLinkedSessionAccount(
+                  latestLinkedSession,
+                  profileAwareData.account
                 );
-                persistShell(next);
-                dispatchShell(syncedLinkedSession, next);
-                return next;
+                if (syncedLinkedSession !== latestLinkedSession) {
+                  setLinkedSession(syncedLinkedSession);
+                  persistLinkedSessionToStorage(syncedLinkedSession);
+                  void persistLinkedSessionRecordToIndexedDb(
+                    syncedLinkedSession
+                  );
+                }
+                void persistContactsBootstrapForSession(
+                  syncedLinkedSession.credentials?.aci,
+                  profileAwareData
+                );
+                setShell(current => {
+                  const next = applyContactsBootstrap(
+                    current,
+                    profileAwareData,
+                    syncedLinkedSession
+                  );
+                  persistShell(next);
+                  dispatchShell(syncedLinkedSession, next);
+                  return next;
+                });
+              })
+              .catch(error => {
+                console.error('Contacts sync failed', error);
+              })
+              .finally(() => {
+                if (
+                  contactsSyncOnOpenPromiseRef.current === contactsSyncPromise
+                ) {
+                  contactsSyncOnOpenPromiseRef.current = undefined;
+                }
               });
-            })
-            .catch(error => {
-              console.error('Contacts sync failed', error);
-            })
-            .finally(() => {
-              if (contactsSyncOnOpenPromiseRef.current === contactsSyncPromise) {
-                contactsSyncOnOpenPromiseRef.current = undefined;
-              }
-            });
             contactsSyncOnOpenPromiseRef.current = contactsSyncPromise;
           } else if (hasContactsSyncInFlight) {
             console.info('Contacts sync skipped: already in flight');
@@ -3539,7 +3546,10 @@ export function WebDesktopApp({
               ...current,
               conversationLookup: {
                 ...current.conversationLookup,
-                [event.conversation.id]: event.conversation,
+                [event.conversation.id]: {
+                  ...current.conversationLookup[event.conversation.id],
+                  ...event.conversation,
+                },
               },
             },
             currentLinkedSession

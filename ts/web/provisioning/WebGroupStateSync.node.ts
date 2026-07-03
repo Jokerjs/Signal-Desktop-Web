@@ -231,9 +231,13 @@ function getCredentialForToday(
   credentials: ReadonlyArray<GroupCredentialType>
 ): GroupCredentialType {
   const today = toDayMillis(Date.now());
-  const credential = credentials.find(item => item.redemptionTime * 1000 === today);
+  const credential = credentials.find(
+    item => item.redemptionTime * 1000 === today
+  );
   if (!credential) {
-    throw new Error('getCredentialForToday: group credentials do not include today');
+    throw new Error(
+      'getCredentialForToday: group credentials do not include today'
+    );
   }
   return credential;
 }
@@ -267,7 +271,9 @@ function getGroupCredentialsFromResponse({
       toAciObject(aci as AciString),
       toPniObject(toTaggedPni(response.pni as UntaggedPniString)),
       rawCredential.redemptionTime,
-      new AuthCredentialWithPniResponse(Bytes.fromBase64(rawCredential.credential))
+      new AuthCredentialWithPniResponse(
+        Bytes.fromBase64(rawCredential.credential)
+      )
     );
   const credential = Bytes.toBase64(authCredential.serialize());
   const presentation = getAuthCredentialPresentation(
@@ -320,7 +326,9 @@ async function fetchGroupBytes({
       headers,
       method: 'GET',
     });
-    const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
     if (!response.ok) {
       throw new GroupHttpStatusError(
         `/v2/groups failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`,
@@ -367,6 +375,127 @@ async function fetchGroupBytes({
   }
 }
 
+function getImageContentType(
+  data: Uint8Array<ArrayBuffer>
+): string | undefined {
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47
+  ) {
+    return 'image/png';
+  }
+  if (
+    data[0] === 0x47 &&
+    data[1] === 0x49 &&
+    data[2] === 0x46 &&
+    data[3] === 0x38
+  ) {
+    return 'image/gif';
+  }
+  if (
+    data[0] === 0x52 &&
+    data[1] === 0x49 &&
+    data[2] === 0x46 &&
+    data[3] === 0x46 &&
+    data[8] === 0x57 &&
+    data[9] === 0x45 &&
+    data[10] === 0x42 &&
+    data[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
+async function fetchGroupAvatarBytes({
+  allowInsecureTls,
+  avatarKey,
+  cdnUrl,
+}: Readonly<{
+  allowInsecureTls?: boolean;
+  avatarKey: string;
+  cdnUrl: string;
+}>): Promise<Uint8Array<ArrayBuffer>> {
+  const url = new URL(
+    `${cdnUrl.replace(/\/$/, '')}/${encodeURIComponent(avatarKey)}`
+  );
+  try {
+    const response = await fetch(url);
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
+    if (!response.ok) {
+      throw new Error(
+        `group avatar ${avatarKey} failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`
+      );
+    }
+    return bytes;
+  } catch (error) {
+    if (!allowInsecureTls) {
+      throw error;
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { rejectUnauthorized: false }, response => {
+      const chunks = new Array<Buffer>();
+      response.on('data', chunk => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      response.on('end', () => {
+        const bytes = Buffer.concat(chunks);
+        const statusCode = response.statusCode ?? 0;
+        if (statusCode < 200 || statusCode >= 300) {
+          reject(
+            new Error(
+              `group avatar ${avatarKey} failed with status ${statusCode}: ${bytes.toString('utf8')}`
+            )
+          );
+          return;
+        }
+        resolve(new Uint8Array(bytes) as Uint8Array<ArrayBuffer>);
+      });
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function fetchGroupAvatarDataUrl({
+  allowInsecureTls,
+  avatarKey,
+  cdnUrl,
+  secretParams,
+}: Readonly<{
+  allowInsecureTls?: boolean;
+  avatarKey: string;
+  cdnUrl: string;
+  secretParams: string;
+}>): Promise<string | undefined> {
+  const ciphertext = await fetchGroupAvatarBytes({
+    allowInsecureTls,
+    avatarKey,
+    cdnUrl,
+  });
+  const clientZkGroupCipher = getClientZkGroupCipher(secretParams);
+  const plaintext = decryptGroupBlob(clientZkGroupCipher, ciphertext);
+  const blob = Proto.GroupAttributeBlob.decode(plaintext);
+  const avatar = blob.content?.avatar;
+  if (!avatar) {
+    return undefined;
+  }
+  const contentType = getImageContentType(avatar as Uint8Array<ArrayBuffer>);
+  if (!contentType) {
+    return undefined;
+  }
+  return `data:${contentType};base64,${Buffer.from(avatar).toString('base64')}`;
+}
+
 async function putGroupBytes({
   allowInsecureTls,
   credentials,
@@ -391,7 +520,9 @@ async function putGroupBytes({
       headers,
       method: 'PUT',
     });
-    const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
     if (!response.ok) {
       throw new GroupHttpStatusError(
         `/v2/groups PUT failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`,
@@ -459,7 +590,9 @@ async function fetchGroupAvatarUploadAttributes({
       headers,
       method: 'GET',
     });
-    const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
     if (!response.ok) {
       throw new Error(
         `/v2/groups/avatar/form failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`
@@ -662,7 +795,9 @@ async function fetchProfileKeyCredential({
 }>): Promise<string> {
   const { profileKey, serviceId } = targetConversation;
   if (!profileKey || !serviceId) {
-    throw new Error('fetchProfileKeyCredential: target conversation is missing profileKey or serviceId');
+    throw new Error(
+      'fetchProfileKeyCredential: target conversation is missing profileKey or serviceId'
+    );
   }
 
   const clientZkProfileCipher = getClientZkProfileOperations(
@@ -697,7 +832,9 @@ async function fetchProfileKeyCredential({
   }
   const profile = JSON.parse(responseBody) as ProfileCredentialResponse;
   if (!profile.credential) {
-    throw new Error('fetchProfileKeyCredential: profile response is missing credential');
+    throw new Error(
+      'fetchProfileKeyCredential: profile response is missing credential'
+    );
   }
   return handleProfileKeyCredential(
     clientZkProfileCipher,
@@ -732,7 +869,9 @@ function buildModifyMemberActions({
 
   if (action === 'add') {
     if (!profileKeyCredentialBase64 || !targetConversation?.profileKey) {
-      throw new Error('buildModifyMemberActions: add action is missing target profile credential');
+      throw new Error(
+        'buildModifyMemberActions: add action is missing target profile credential'
+      );
     }
     const clientZkProfileCipher = getClientZkProfileOperations(
       productionConfig.serverPublicParams
@@ -916,7 +1055,9 @@ function buildCreateGroupProto({
   expireTimer?: number;
   membersV2: ReadonlyArray<NonNullable<WebConversation['membersV2']>[number]>;
   name: string;
-  pendingMembersV2: ReadonlyArray<NonNullable<WebConversation['pendingMembersV2']>[number]>;
+  pendingMembersV2: ReadonlyArray<
+    NonNullable<WebConversation['pendingMembersV2']>[number]
+  >;
   profileKeyCredentialByAci: ReadonlyMap<string, string>;
   publicParams: string;
   secretParams: string;
@@ -954,9 +1095,13 @@ function buildCreateGroupProto({
     disappearingMessagesTimer,
     accessControl,
     members: membersV2.map(member => {
-      const profileKeyCredentialBase64 = profileKeyCredentialByAci.get(member.aci);
+      const profileKeyCredentialBase64 = profileKeyCredentialByAci.get(
+        member.aci
+      );
       if (!profileKeyCredentialBase64) {
-        throw new Error('buildCreateGroupProto: missing member profile credential');
+        throw new Error(
+          'buildCreateGroupProto: missing member profile credential'
+        );
       }
       return {
         role: member.role,
@@ -1027,7 +1172,9 @@ export async function createGroupConversation({
     throw new Error('createGroupConversation: missing linked profile key');
   }
 
-  const masterKeyBytes = new Uint8Array(randomBytes(32)) as Uint8Array<ArrayBuffer>;
+  const masterKeyBytes = new Uint8Array(
+    randomBytes(32)
+  ) as Uint8Array<ArrayBuffer>;
   const secretParamsBytes = deriveGroupSecretParams(masterKeyBytes);
   const publicParamsBytes = deriveGroupPublicParams(secretParamsBytes);
   const groupIdBytes = deriveGroupID(secretParamsBytes);
@@ -1041,15 +1188,20 @@ export async function createGroupConversation({
     addFromInviteLink: Proto.AccessControl.AccessRequired.UNSATISFIABLE,
     memberLabel: Proto.AccessControl.AccessRequired.MEMBER,
   };
-  const conversationAccessControl: NonNullable<WebConversation['accessControl']> = {
+  const conversationAccessControl: NonNullable<
+    WebConversation['accessControl']
+  > = {
     attributes: Proto.AccessControl.AccessRequired.MEMBER,
     members: Proto.AccessControl.AccessRequired.MEMBER,
     addFromInviteLink: Proto.AccessControl.AccessRequired.UNSATISFIABLE,
     memberLabel: Proto.AccessControl.AccessRequired.MEMBER,
   };
-  const membersV2 = new Array<NonNullable<WebConversation['membersV2']>[number]>();
-  const pendingMembersV2 =
-    new Array<NonNullable<WebConversation['pendingMembersV2']>[number]>();
+  const membersV2 = new Array<
+    NonNullable<WebConversation['membersV2']>[number]
+  >();
+  const pendingMembersV2 = new Array<
+    NonNullable<WebConversation['pendingMembersV2']>[number]
+  >();
   const profileKeyCredentialByAci = new Map<string, string>();
 
   membersV2.push({
@@ -1081,7 +1233,10 @@ export async function createGroupConversation({
         chat,
         targetConversation: conversation,
       });
-      profileKeyCredentialByAci.set(conversation.serviceId, profileKeyCredentialBase64);
+      profileKeyCredentialByAci.set(
+        conversation.serviceId,
+        profileKeyCredentialBase64
+      );
       membersV2.push({
         aci: conversation.serviceId as AciString,
         role: Proto.Member.Role.DEFAULT,
@@ -1141,7 +1296,9 @@ export async function createGroupConversation({
   });
   const response = Proto.GroupResponse.decode(bytes);
   if (!response.groupSendEndorsementsResponse) {
-    throw new Error('createGroupConversation: missing groupSendEndorsementsResponse');
+    throw new Error(
+      'createGroupConversation: missing groupSendEndorsementsResponse'
+    );
   }
 
   const timestamp = Date.now();
@@ -1189,7 +1346,10 @@ function buildGroupDescriptionBuffer(
       descriptionText: description,
     },
   });
-  const result = encryptGroupBlob(clientZkGroupCipher, descriptionBlobPlaintext);
+  const result = encryptGroupBlob(
+    clientZkGroupCipher,
+    descriptionBlobPlaintext
+  );
   if (result.byteLength > GROUP_DESC_MAX_ENCRYPTED_BYTES) {
     throw new Error(
       'buildGroupDescriptionBuffer: encrypted group title is too long'
@@ -1244,7 +1404,9 @@ function buildModifyGroupSettingsActions({
   }
 
   if (!secretParams) {
-    throw new Error('buildModifyGroupSettingsActions: group was missing secretParams');
+    throw new Error(
+      'buildModifyGroupSettingsActions: group was missing secretParams'
+    );
   }
 
   if (action === 'access-control-member-label') {
@@ -1292,12 +1454,17 @@ function buildModifyGroupSettingsActions({
     return toGroupActionsParams({
       version: revision,
       modifyDescription: {
-        description: buildGroupDescriptionBuffer(clientZkGroupCipher, String(value)),
+        description: buildGroupDescriptionBuffer(
+          clientZkGroupCipher,
+          String(value)
+        ),
       },
     });
   }
 
-  throw new Error(`buildModifyGroupSettingsActions: unsupported action ${action}`);
+  throw new Error(
+    `buildModifyGroupSettingsActions: unsupported action ${action}`
+  );
 }
 
 async function patchGroupChangeBytes({
@@ -1324,7 +1491,9 @@ async function patchGroupChangeBytes({
       headers,
       method: 'PATCH',
     });
-    const bytes = new Uint8Array(await response.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+    const bytes = new Uint8Array(
+      await response.arrayBuffer()
+    ) as Uint8Array<ArrayBuffer>;
     if (!response.ok) {
       throw new GroupHttpStatusError(
         `/v2/groups PATCH failed with status ${response.status}: ${Buffer.from(bytes).toString('utf8')}`,
@@ -1394,11 +1563,14 @@ export async function modifyGroupMember({
   targetServiceId: ServiceIdString;
 }>): Promise<WebGroupMemberModifyResult> {
   if (
-    (conversation.type !== 'group' && conversation.conversationType !== 'group') ||
+    (conversation.type !== 'group' &&
+      conversation.conversationType !== 'group') ||
     !conversation.publicParams ||
     !conversation.secretParams
   ) {
-    throw new Error('modifyGroupMember: conversation is not a GroupV2 conversation');
+    throw new Error(
+      'modifyGroupMember: conversation is not a GroupV2 conversation'
+    );
   }
   const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
   if (!ourAci) {
@@ -1418,7 +1590,9 @@ export async function modifyGroupMember({
           targetConversation:
             targetConversation ??
             (() => {
-              throw new Error('modifyGroupMember: add action is missing targetConversation');
+              throw new Error(
+                'modifyGroupMember: add action is missing targetConversation'
+              );
             })(),
         })
       : undefined;
@@ -1499,16 +1673,21 @@ async function uploadGroupActionsWithRetry({
   allowInsecureTls?: boolean;
   chat: AuthenticatedChatConnection;
   conversation: WebConversation;
-  createActions: (conversation: WebConversation) => Proto.GroupChange.Actions.Params;
+  createActions: (
+    conversation: WebConversation
+  ) => Proto.GroupChange.Actions.Params;
   linkedPayload: LinkedPayload;
   storageUrl: string;
 }>): Promise<WebGroupSettingsModifyResult> {
   if (
-    (conversation.type !== 'group' && conversation.conversationType !== 'group') ||
+    (conversation.type !== 'group' &&
+      conversation.conversationType !== 'group') ||
     !conversation.publicParams ||
     !conversation.secretParams
   ) {
-    throw new Error('uploadGroupActionsWithRetry: conversation is not a GroupV2 conversation');
+    throw new Error(
+      'uploadGroupActionsWithRetry: conversation is not a GroupV2 conversation'
+    );
   }
 
   const credentials = await getGroupCredentials({
@@ -1643,8 +1822,14 @@ function decryptPendingMembers(
       if (!member.member?.userId || !member.addedByUserId) {
         return undefined;
       }
-      const serviceId = decryptServiceId(clientZkGroupCipher, member.member.userId);
-      const addedByUserId = decryptAci(clientZkGroupCipher, member.addedByUserId);
+      const serviceId = decryptServiceId(
+        clientZkGroupCipher,
+        member.member.userId
+      );
+      const addedByUserId = decryptAci(
+        clientZkGroupCipher,
+        member.addedByUserId
+      );
       return {
         addedByUserId,
         role: member.member.role ?? Proto.Member.Role.DEFAULT,
@@ -1676,6 +1861,7 @@ function decryptBannedMembers(
 
 export async function fetchLatestGroupStateConversation({
   allowInsecureTls,
+  cdnUrl,
   chat,
   conversation,
   groupCredentialResponse,
@@ -1683,6 +1869,7 @@ export async function fetchLatestGroupStateConversation({
   storageUrl = productionConfig.storageUrl,
 }: Readonly<{
   allowInsecureTls?: boolean;
+  cdnUrl?: string;
   chat: AuthenticatedChatConnection;
   conversation: WebConversation;
   groupCredentialResponse?: GroupCredentialsResponse;
@@ -1690,7 +1877,8 @@ export async function fetchLatestGroupStateConversation({
   storageUrl?: string;
 }>): Promise<WebConversation> {
   if (
-    (conversation.type !== 'group' && conversation.conversationType !== 'group') ||
+    (conversation.type !== 'group' &&
+      conversation.conversationType !== 'group') ||
     !conversation.publicParams ||
     !conversation.secretParams
   ) {
@@ -1719,8 +1907,14 @@ export async function fetchLatestGroupStateConversation({
   if (!response.group) {
     return conversation;
   }
-  const title = decryptGroupTitle(response.group.title, conversation.secretParams);
-  const membersV2 = decryptMembers(response.group.members ?? [], conversation.secretParams);
+  const title = decryptGroupTitle(
+    response.group.title,
+    conversation.secretParams
+  );
+  const membersV2 = decryptMembers(
+    response.group.members ?? [],
+    conversation.secretParams
+  );
   const pendingMembersV2 = decryptPendingMembers(
     response.group.membersPendingProfileKey ?? [],
     conversation.secretParams
@@ -1730,17 +1924,38 @@ export async function fetchLatestGroupStateConversation({
     conversation.secretParams
   );
   const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
-  const left = ourAci ? !membersV2.some(member => member.aci === ourAci) : conversation.left;
+  const left = ourAci
+    ? !membersV2.some(member => member.aci === ourAci)
+    : conversation.left;
+  const remoteAvatarUrl =
+    response.group.avatarUrl || conversation.remoteAvatarUrl;
+  let avatarUrl = conversation.avatarUrl;
+  if (response.group.avatarUrl && cdnUrl) {
+    try {
+      avatarUrl =
+        (await fetchGroupAvatarDataUrl({
+          allowInsecureTls,
+          avatarKey: response.group.avatarUrl,
+          cdnUrl,
+          secretParams: conversation.secretParams,
+        })) ?? avatarUrl;
+    } catch (error) {
+      console.warn(
+        'fetchLatestGroupStateConversation: failed to fetch group avatar',
+        error
+      );
+    }
+  }
 
   return {
     ...conversation,
-    avatarUrl: response.group.avatarUrl || conversation.avatarUrl,
+    avatarUrl,
     bannedMembersV2,
-    hasAvatar: Boolean(response.group.avatarUrl) || conversation.hasAvatar,
+    hasAvatar: Boolean(avatarUrl || remoteAvatarUrl) || conversation.hasAvatar,
     left,
     membersV2,
     pendingMembersV2,
-    remoteAvatarUrl: response.group.avatarUrl || conversation.remoteAvatarUrl,
+    remoteAvatarUrl,
     revision: response.group.version ?? conversation.revision,
     searchableTitle: title ?? conversation.searchableTitle,
     title: title ?? conversation.title,
@@ -1750,12 +1965,14 @@ export async function fetchLatestGroupStateConversation({
 
 export async function enrichGroupConversations({
   allowInsecureTls,
+  cdnUrl,
   chat,
   conversations,
   linkedPayload,
   storageUrl,
 }: Readonly<{
   allowInsecureTls?: boolean;
+  cdnUrl?: string;
   chat: AuthenticatedChatConnection;
   conversations: ReadonlyArray<WebConversation>;
   linkedPayload: LinkedPayload;
@@ -1763,7 +1980,10 @@ export async function enrichGroupConversations({
 }>): Promise<Array<WebConversation>> {
   const now = Date.now();
   const groupsToFetch = conversations.filter(conversation => {
-    if (conversation.type !== 'group' && conversation.conversationType !== 'group') {
+    if (
+      conversation.type !== 'group' &&
+      conversation.conversationType !== 'group'
+    ) {
       return false;
     }
     const forbiddenUntil = groupStateForbiddenUntilById.get(
@@ -1773,7 +1993,9 @@ export async function enrichGroupConversations({
   });
 
   const groupCredentialResponse =
-    groupsToFetch.length > 0 ? await fetchGroupCredentialResponse(chat) : undefined;
+    groupsToFetch.length > 0
+      ? await fetchGroupCredentialResponse(chat)
+      : undefined;
 
   let forbiddenCount = 0;
 
@@ -1795,6 +2017,7 @@ export async function enrichGroupConversations({
       try {
         return await fetchLatestGroupStateConversation({
           allowInsecureTls,
+          cdnUrl,
           chat,
           conversation,
           groupCredentialResponse,
@@ -1810,17 +2033,23 @@ export async function enrichGroupConversations({
           );
           return conversation;
         }
-        console.warn('enrichGroupConversations: failed to fetch group state', error);
+        console.warn(
+          'enrichGroupConversations: failed to fetch group state',
+          error
+        );
         return conversation;
       }
     })
   );
 
   if (forbiddenCount > 0) {
-    console.info('enrichGroupConversations: group states unavailable, skipped', {
-      count: forbiddenCount,
-      skipMs: GROUP_STATE_FORBIDDEN_SKIP_MS,
-    });
+    console.info(
+      'enrichGroupConversations: group states unavailable, skipped',
+      {
+        count: forbiddenCount,
+        skipMs: GROUP_STATE_FORBIDDEN_SKIP_MS,
+      }
+    );
   }
 
   return result;
