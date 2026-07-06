@@ -89,10 +89,14 @@ function mergeBootstrapAccountForLinkedSession(
   };
 }
 
-export function compareWebMessages(left: WebMessage, right: WebMessage): number {
+export function compareWebMessages(
+  left: WebMessage,
+  right: WebMessage
+): number {
   return (
     left.timestamp - right.timestamp ||
-    (left.receivedAt ?? left.timestamp) - (right.receivedAt ?? right.timestamp) ||
+    (left.receivedAt ?? left.timestamp) -
+      (right.receivedAt ?? right.timestamp) ||
     left.id.localeCompare(right.id)
   );
 }
@@ -117,18 +121,19 @@ export function getConversationTitle(
     !conversation.e164 &&
     !conversation.phoneNumber &&
     !conversation.username
-      ? conversation.titleNoNickname ??
+      ? (conversation.titleNoNickname ??
         conversation.titleNoDefault ??
-        conversation.title
+        conversation.title)
       : undefined;
   return getTitle({
     e164: conversation.e164 ?? conversation.phoneNumber,
     name: isGroup
-      ? conversation.name ?? conversation.titleNoDefault ?? conversation.title
+      ? (conversation.name ?? conversation.titleNoDefault ?? conversation.title)
       : undefined,
     nicknameFamilyName: conversation.nicknameFamilyName,
     nicknameGivenName: conversation.nicknameGivenName,
-    profileFamilyName: conversation.profileFamilyName ?? conversation.familyName,
+    profileFamilyName:
+      conversation.profileFamilyName ?? conversation.familyName,
     profileName: conversation.profileName ?? conversation.firstName,
     systemFamilyName: conversation.systemFamilyName,
     systemGivenName: conversation.systemGivenName,
@@ -243,15 +248,15 @@ function hasVisibleConversationActivity(
 ): boolean {
   return Boolean(
     conversation?.hasMessages ||
-      conversation?.activeAt ||
-      conversation?.inboxPosition ||
-      conversation?.lastMessage ||
-      conversation?.lastMessageReceivedAt ||
-      conversation?.lastMessageReceivedAtMs ||
-      conversation?.lastUpdated ||
-      conversation?.messageCount ||
-      conversation?.snippet ||
-      conversation?.timestamp
+    conversation?.activeAt ||
+    conversation?.inboxPosition ||
+    conversation?.lastMessage ||
+    conversation?.lastMessageReceivedAt ||
+    conversation?.lastMessageReceivedAtMs ||
+    conversation?.lastUpdated ||
+    conversation?.messageCount ||
+    conversation?.snippet ||
+    conversation?.timestamp
   );
 }
 
@@ -429,8 +434,7 @@ function getAreWeGroupAdmin(
   return Boolean(
     conversation.membersV2?.some(member => {
       return (
-        member.aci === ourAci &&
-        member.role === Proto.Member.Role.ADMINISTRATOR
+        member.aci === ourAci && member.role === Proto.Member.Role.ADMINISTRATOR
       );
     })
   );
@@ -504,7 +508,10 @@ function ensureDirectConversationShellsForGroupMembers(
   );
 
   for (const conversation of Object.values(conversationLookup)) {
-    if (conversation.type !== 'group' && conversation.conversationType !== 'group') {
+    if (
+      conversation.type !== 'group' &&
+      conversation.conversationType !== 'group'
+    ) {
       continue;
     }
 
@@ -571,8 +578,9 @@ export function getWebConversationLastMessage(
     desktopMessage.type === 'outgoing'
       ? window.SignalContext.i18n('icu:you')
       : desktopMessage.type === 'incoming'
-        ? (window.ConversationController.get(message.sourceServiceId)?.getTitle() ??
-          null)
+        ? (window.ConversationController.get(
+            message.sourceServiceId
+          )?.getTitle() ?? null)
         : null;
   return {
     author,
@@ -612,7 +620,10 @@ function deriveConversationPreviews(
 
     const receivedAt = message.receivedAt ?? message.timestamp;
     const previewText = getWebMessagePreviewText(message);
-    const lastMessage = getWebConversationLastMessage(message, ourConversationId);
+    const lastMessage = getWebConversationLastMessage(
+      message,
+      ourConversationId
+    );
     const nextConversation: WebConversation = {
       ...conversation,
       activeAt: Math.max(conversation.activeAt ?? 0, receivedAt),
@@ -650,7 +661,8 @@ export function getWebAttachmentVirtualPath(
   const isVideo = contentType.startsWith('video/');
   const isAudio = isWebAudioAttachment(attachment);
   const isDisplayableMedia = isImage || isVideo || isAudio;
-  const isUnavailable = attachment.backfillError || attachment.status === 'failed';
+  const isUnavailable =
+    attachment.backfillError || attachment.status === 'failed';
   const isPermanentlyUnavailable =
     isUnavailable && !isAudio && !isImage && !isVideo;
   const isBackupOnlyAudio = isWebBackupOnlyAudioAttachment(attachment);
@@ -662,9 +674,9 @@ export function getWebAttachmentVirtualPath(
         : undefined
       : isBackupOnlyVisual
         ? undefined
-      : (attachment.downloadPath ??
-        attachment.localBlobKey ??
-        `web:${getWebAttachmentStablePathKey(attachment, accessUrl)}`)
+        : (attachment.downloadPath ??
+          attachment.localBlobKey ??
+          `web:${getWebAttachmentStablePathKey(attachment, accessUrl)}`)
     : attachment.downloadPath;
 }
 
@@ -736,7 +748,9 @@ function isWebBackupOnlyVisualAttachment(attachment: WebAttachment): boolean {
   );
 }
 
-function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown> {
+function toDesktopAttachment(
+  attachment: WebAttachment
+): Record<string, unknown> {
   const contentType = getWebAttachmentContentTypeFromParts(attachment);
   const flags = attachment.flags;
   const accessUrl = getProjectedAttachmentAccessUrl(attachment);
@@ -744,7 +758,8 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
   const isVideo = contentType.startsWith('video/');
   const isAudio = isWebAudioAttachment(attachment);
   const isVisual = isWebVisualAttachment(attachment);
-  const isUnavailable = attachment.backfillError || attachment.status === 'failed';
+  const isUnavailable =
+    attachment.backfillError || attachment.status === 'failed';
   const shouldProjectAsPermanentlyUnavailable =
     isUnavailable && !isAudio && !isVisual;
   const isPending = attachment.status === 'pending' && !accessUrl;
@@ -758,7 +773,8 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
     : undefined;
   const explicitVisualPreviewUrl =
     attachment.thumbnailUrl ?? attachment.previewUrl ?? thumbnailAccessUrl;
-  const visualPreviewUrl = explicitVisualPreviewUrl ?? (isImage ? accessUrl : undefined);
+  const visualPreviewUrl =
+    explicitVisualPreviewUrl ?? (isImage ? accessUrl : undefined);
   const thumbnailContentType = attachment.thumbnail
     ? getWebAttachmentContentTypeFromParts(attachment.thumbnail)
     : undefined;
@@ -778,7 +794,9 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
   const thumbnail =
     (isImage || isVideo) && thumbnailUrl
       ? {
-          contentType: isImage ? contentType : (thumbnailContentType ?? 'image/jpeg'),
+          contentType: isImage
+            ? contentType
+            : (thumbnailContentType ?? 'image/jpeg'),
           height,
           path: virtualPath,
           size: attachment.size ?? 0,
@@ -797,7 +815,9 @@ function toDesktopAttachment(attachment: WebAttachment): Record<string, unknown>
     blurHash: attachment.blurHash,
     caption: attachment.caption,
     cdnId: shouldProjectAsPermanentlyUnavailable ? undefined : attachment.cdnId,
-    cdnKey: shouldProjectAsPermanentlyUnavailable ? undefined : attachment.cdnKey,
+    cdnKey: shouldProjectAsPermanentlyUnavailable
+      ? undefined
+      : attachment.cdnKey,
     cdnNumber: shouldProjectAsPermanentlyUnavailable
       ? undefined
       : attachment.cdnNumber,
@@ -869,7 +889,9 @@ function toDesktopQuote(quote: WebMessage['quote']): unknown {
 function toDesktopPreview(preview: WebMessage['preview']): unknown {
   return preview?.map(item => ({
     ...item,
-    image: toDesktopAttachmentOrUndefined(item.image as WebAttachment | undefined),
+    image: toDesktopAttachmentOrUndefined(
+      item.image as WebAttachment | undefined
+    ),
   }));
 }
 
@@ -880,7 +902,9 @@ function toDesktopSticker(sticker: WebMessage['sticker']): unknown {
 
   return {
     ...sticker,
-    data: toDesktopAttachmentOrUndefined(sticker.data as WebAttachment | undefined),
+    data: toDesktopAttachmentOrUndefined(
+      sticker.data as WebAttachment | undefined
+    ),
   };
 }
 
@@ -914,9 +938,7 @@ function toDesktopPoll(message: WebMessage): unknown {
   return undefined;
 }
 
-function toDesktopEditHistory(
-  editHistory: WebMessage['editHistory']
-): unknown {
+function toDesktopEditHistory(editHistory: WebMessage['editHistory']): unknown {
   return editHistory?.map(edit => ({
     ...edit,
     attachments: edit.attachments?.map(attachment =>
@@ -946,7 +968,9 @@ function toDesktopSendStatus(status: WebMessage['status']): SendStatus {
   }
 }
 
-function getDesktopMessageType(message: WebMessage): MessageAttributesType['type'] {
+function getDesktopMessageType(
+  message: WebMessage
+): MessageAttributesType['type'] {
   const type =
     message.desktopType ??
     (message.direction === 'outgoing' ? 'outgoing' : 'incoming');
@@ -1006,13 +1030,9 @@ export function toDesktopMessage(message: WebMessage): DesktopMessage {
     quote: toDesktopQuote(message.quote),
     reactions: message.reactions,
     readStatus:
-      type === 'incoming'
-        ? (message.readStatus ?? ReadStatus.Read)
-        : undefined,
+      type === 'incoming' ? (message.readStatus ?? ReadStatus.Read) : undefined,
     seenStatus:
-      type === 'incoming'
-        ? (message.readStatus ?? ReadStatus.Read)
-        : undefined,
+      type === 'incoming' ? (message.readStatus ?? ReadStatus.Read) : undefined,
     source: message.sourceServiceId,
     sourceServiceId: message.sourceServiceId,
     sticker: toDesktopSticker(message.sticker),
@@ -1022,7 +1042,7 @@ export function toDesktopMessage(message: WebMessage): DesktopMessage {
       ? {
           authorAci: message.storyContext.authorAci,
           messageId: String(message.storyContext.sentTimestamp),
-      }
+        }
       : undefined,
     verified: message.verified,
     verifiedChanged: message.verifiedChanged,
@@ -1091,11 +1111,12 @@ export function toDesktopConversation(
 ): DesktopConversation {
   const isGroup =
     conversation.type === 'group' || conversation.conversationType === 'group';
-  const sessionAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  const sessionAci =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci;
   const sortTimestamp = getConversationListSortTimestamp(conversation);
   const left = conversation.left;
   const groupName = isGroup
-    ? conversation.name ?? conversation.titleNoDefault ?? conversation.title
+    ? (conversation.name ?? conversation.titleNoDefault ?? conversation.title)
     : undefined;
   const directTitleFallback =
     !isGroup &&
@@ -1109,16 +1130,17 @@ export function toDesktopConversation(
     !conversation.e164 &&
     !conversation.phoneNumber &&
     !conversation.username
-      ? conversation.titleNoNickname ??
+      ? (conversation.titleNoNickname ??
         conversation.titleNoDefault ??
-        conversation.title
+        conversation.title)
       : undefined;
   const titleAttributes = {
     e164: conversation.e164 ?? conversation.phoneNumber,
     name: groupName,
     nicknameFamilyName: conversation.nicknameFamilyName,
     nicknameGivenName: conversation.nicknameGivenName,
-    profileFamilyName: conversation.profileFamilyName ?? conversation.familyName,
+    profileFamilyName:
+      conversation.profileFamilyName ?? conversation.familyName,
     profileName: conversation.profileName ?? conversation.firstName,
     systemFamilyName: conversation.systemFamilyName,
     systemGivenName: conversation.systemGivenName,
@@ -1254,9 +1276,8 @@ export function toDesktopConversation(
       membersCount: conversation.membersV2?.length ?? 0,
       memberships: getMembershipsFromMembersV2(conversation),
       membersV2: conversation.membersV2,
-      pendingMemberships: getPendingMembershipsFromPendingMembersV2(
-        conversation
-      ),
+      pendingMemberships:
+        getPendingMembershipsFromPendingMembersV2(conversation),
       pendingMembersV2: conversation.pendingMembersV2,
       publicParams: conversation.publicParams,
       revision: conversation.revision ?? 0,
@@ -1272,7 +1293,8 @@ function ensureNoteToSelf(
   shell: ChatShellState,
   linkedSession: LinkedSessionRecord
 ): ChatShellState {
-  const sessionAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  const sessionAci =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci;
   if (!sessionAci) {
     return shell;
   }
@@ -1375,7 +1397,10 @@ function setBootstrapConversationLookup(
 ): void {
   (
     window as unknown as {
-      SignalWebBootstrapConversationLookup?: Record<string, DesktopConversation>;
+      SignalWebBootstrapConversationLookup?: Record<
+        string,
+        DesktopConversation
+      >;
     }
   ).SignalWebBootstrapConversationLookup = Object.fromEntries(
     Object.values(shell.conversationLookup).map(conversation => [
@@ -1451,7 +1476,9 @@ export function applyContactsBootstrap(
       : conversation;
     const merged = mergeConversationForBootstrap({
       existing:
-        isStorageBootstrap && !existing?.hasMessages && !existing?.messagesDeleted
+        isStorageBootstrap &&
+        !existing?.hasMessages &&
+        !existing?.messagesDeleted
           ? undefined
           : existing,
       incoming,
@@ -1464,13 +1491,13 @@ export function applyContactsBootstrap(
       activeAt:
         merged.messagesDeleted === true
           ? undefined
-          : merged.activeAt ??
+          : (merged.activeAt ??
             merged.lastMessageReceivedAtMs ??
             merged.lastUpdated ??
             merged.timestamp ??
             (isStorageOnlyConversation
               ? undefined
-              : nextLookup[conversation.id]?.activeAt),
+              : nextLookup[conversation.id]?.activeAt)),
     };
   }
 
@@ -1479,9 +1506,8 @@ export function applyContactsBootstrap(
       ...shell,
       selectedConversationId:
         shell.selectedConversationId ?? bootstrap.selectedConversationId,
-      conversationLookup: ensureDirectConversationShellsForGroupMembers(
-        nextLookup
-      ),
+      conversationLookup:
+        ensureDirectConversationShellsForGroupMembers(nextLookup),
     },
     effectiveLinkedSession
   );
@@ -1499,31 +1525,6 @@ export function createDesktopConversationState(
       toDesktopConversation(conversation, linkedSession),
     ])
   );
-  const messages = [...shell.messages].sort(compareWebMessages).map(toDesktopMessage);
-  const messagesLookup = Object.fromEntries(
-    messages.map(message => [message.id, message])
-  );
-  const messagesByConversation: Record<string, unknown> = {};
-  const pinnedMessages = shell.pinnedMessages ?? [];
-
-  for (const conversation of Object.values(shell.conversationLookup)) {
-    const conversationMessages = messages
-      .filter(message => message.conversationId === conversation.id)
-      .sort((left, right) => left.received_at - right.received_at);
-    messagesByConversation[conversation.id] = {
-      haveNewest: true,
-      haveOldest: true,
-      isNearBottom: true,
-      messageChangeCounter: 0,
-      messageIds: conversationMessages.map(message => message.id),
-      messageLoadingState: undefined,
-      metrics: getDesktopMessageMetrics(conversationMessages),
-      pinnedMessages: pinnedMessages.filter(
-        pinnedMessage => pinnedMessage.conversationId === conversation.id
-      ),
-      scrollToMessageCounter: 0,
-    };
-  }
 
   return {
     conversationLookup: conversations,
@@ -1547,7 +1548,7 @@ export function createDesktopConversationState(
         .filter(conversation => typeof conversation.username === 'string')
         .map(conversation => [conversation.username, conversation])
     ),
-    messagesByConversation,
-    messagesLookup,
+    messagesByConversation: {},
+    messagesLookup: {},
   };
 }

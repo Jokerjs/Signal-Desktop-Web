@@ -133,6 +133,7 @@ const VIDEO_THUMBNAIL_QUALITY = 0.82;
 const VIDEO_THUMBNAIL_TIMEOUT = 30_000;
 const ATTACHMENT_BACKFILL_REQUEST_TIMEOUT = 4 * SECOND;
 const CONTACTS_SYNC_ON_OPEN_THROTTLE_MS = 60 * SECOND;
+const MESSAGE_LOAD_CHUNK_SIZE = 30;
 const ATTACHMENT_BACKFILL_STATUS_PENDING =
   Proto.SyncMessage.AttachmentBackfillResponse.AttachmentData.Status.PENDING;
 const ATTACHMENT_BACKFILL_STATUS_TERMINAL_ERROR =
@@ -151,6 +152,165 @@ const MESSAGE_STREAM_RECONNECT_INITIAL_DELAY = 1_000;
 const MESSAGE_STREAM_RECONNECT_MAX_DELAY = 15_000;
 const DEVICE_DELINKED_ERROR = 'DeviceDelinked: device was deregistered';
 const pendingAttachmentBackfillTimeouts = new Map<string, number>();
+
+let shellMessageIndexSource: ChatShellState['messages'] | undefined;
+let shellMessageIndexById = new Map<string, number>();
+let shellMessageIdSet = new Set<string>();
+
+function getShellMessageIndexes(
+  messages: ChatShellState['messages']
+): Readonly<{
+  idSet: ReadonlySet<string>;
+  indexById: ReadonlyMap<string, number>;
+}> {
+  if (shellMessageIndexSource !== messages) {
+    shellMessageIndexSource = messages;
+    shellMessageIndexById = new Map<string, number>();
+    shellMessageIdSet = new Set<string>();
+    messages.forEach((message, index) => {
+      shellMessageIndexById.set(message.id, index);
+      shellMessageIdSet.add(message.id);
+    });
+  }
+
+  return {
+    idSet: shellMessageIdSet,
+    indexById: shellMessageIndexById,
+  };
+}
+
+function appendUniqueMessagesSorted(
+  currentMessages: ChatShellState['messages'],
+  incomingMessages: ReadonlyArray<WebMessage>
+): ChatShellState['messages'] {
+  if (!incomingMessages.length) {
+    return currentMessages;
+  }
+
+  const { idSet } = getShellMessageIndexes(currentMessages);
+  const uniqueMessages = new Array<WebMessage>();
+  const incomingIds = new Set<string>();
+  for (const message of incomingMessages) {
+    if (idSet.has(message.id) || incomingIds.has(message.id)) {
+      continue;
+    }
+    incomingIds.add(message.id);
+    uniqueMessages.push(message);
+  }
+
+  if (!uniqueMessages.length) {
+    return currentMessages;
+  }
+
+  const sortedIncoming =
+    uniqueMessages.length === 1
+      ? uniqueMessages
+      : [...uniqueMessages].sort(compareWebMessages);
+
+  const lastCurrent = currentMessages.at(-1);
+  if (
+    !lastCurrent ||
+    compareWebMessages(lastCurrent, sortedIncoming[0] as WebMessage) <= 0
+  ) {
+    return [...currentMessages, ...sortedIncoming];
+  }
+
+  const firstCurrent = currentMessages[0];
+  if (
+    firstCurrent &&
+    compareWebMessages(
+      sortedIncoming[sortedIncoming.length - 1] as WebMessage,
+      firstCurrent
+    ) <= 0
+  ) {
+    return [...sortedIncoming, ...currentMessages];
+  }
+
+  const nextMessages = new Array<WebMessage>(
+    currentMessages.length + sortedIncoming.length
+  );
+  let currentIndex = 0;
+  let incomingIndex = 0;
+  let writeIndex = 0;
+  while (
+    currentIndex < currentMessages.length ||
+    incomingIndex < sortedIncoming.length
+  ) {
+    const current = currentMessages[currentIndex];
+    const incoming = sortedIncoming[incomingIndex];
+    if (
+      incoming == null ||
+      (current != null && compareWebMessages(current, incoming) <= 0)
+    ) {
+      nextMessages[writeIndex] = current as WebMessage;
+      currentIndex += 1;
+    } else {
+      nextMessages[writeIndex] = incoming;
+      incomingIndex += 1;
+    }
+    writeIndex += 1;
+  }
+
+  return nextMessages;
+}
+
+function upsertMessageSorted(
+  currentMessages: ChatShellState['messages'],
+  message: WebMessage
+): ChatShellState['messages'] {
+  const { indexById } = getShellMessageIndexes(currentMessages);
+  const existingIndex = indexById.get(message.id);
+  if (existingIndex == null) {
+    return appendUniqueMessagesSorted(currentMessages, [message]);
+  }
+
+  const existing = currentMessages[existingIndex];
+  if (existing === message) {
+    return currentMessages;
+  }
+
+  const nextMessages = [...currentMessages];
+  nextMessages.splice(existingIndex, 1);
+  return appendUniqueMessagesSorted(nextMessages, [message]);
+}
+
+function replaceMessageById(
+  currentMessages: ChatShellState['messages'],
+  messageId: string,
+  update: (message: WebMessage) => WebMessage
+): Readonly<{
+  messages: ChatShellState['messages'];
+  existing: WebMessage | undefined;
+  updated: WebMessage | undefined;
+}> {
+  const { indexById } = getShellMessageIndexes(currentMessages);
+  const index = indexById.get(messageId);
+  if (index == null) {
+    return {
+      existing: undefined,
+      messages: currentMessages,
+      updated: undefined,
+    };
+  }
+
+  const existing = currentMessages[index] as WebMessage;
+  const updated = update(existing);
+  if (updated === existing) {
+    return {
+      existing,
+      messages: currentMessages,
+      updated,
+    };
+  }
+
+  const nextMessages = [...currentMessages];
+  nextMessages[index] = updated;
+  return {
+    existing,
+    messages: nextMessages,
+    updated,
+  };
+}
 
 function isWebAudioAttachment(attachment: WebAttachment): boolean {
   const contentType = getWebAttachmentContentTypeFromParts(attachment);
@@ -742,24 +902,161 @@ function dispatchConversations(
   }
 }
 
+let conversationMessagesSource: ChatShellState['messages'] | undefined;
+let conversationMessagesSourceVersion = 0;
+const conversationMessagesById = new Map<string, Array<WebMessage>>();
+const desktopMessagesByConversationId = new Map<
+  string,
+  Readonly<{
+    desktopMessages: ReturnType<typeof toDesktopMessage>[];
+    metrics: ReturnType<typeof getDesktopMessageMetrics>;
+    sourceMessages: ReadonlyArray<WebMessage>;
+  }>
+>();
+let pinnedMessagesSource: ChatShellState['pinnedMessages'] | undefined;
+let pinnedMessagesSourceVersion = 0;
+const lastMessagesResetKeyByConversationId = new Map<string, string>();
+
+function getConversationMessagesFromShell(
+  conversationId: string,
+  shell: ChatShellState
+): ReadonlyArray<WebMessage> {
+  if (conversationMessagesSource !== shell.messages) {
+    conversationMessagesSource = shell.messages;
+    conversationMessagesSourceVersion += 1;
+    conversationMessagesById.clear();
+    desktopMessagesByConversationId.clear();
+  }
+
+  const cached = conversationMessagesById.get(conversationId);
+  if (cached) {
+    return cached;
+  }
+
+  const messages = shell.messages
+    .filter(message => message.conversationId === conversationId)
+    .sort(compareWebMessages);
+  conversationMessagesById.set(conversationId, messages);
+  return messages;
+}
+
+function getConversationDesktopMessages(
+  conversationId: string,
+  shell: ChatShellState
+): Readonly<{
+  desktopMessages: ReturnType<typeof toDesktopMessage>[];
+  metrics: ReturnType<typeof getDesktopMessageMetrics>;
+}> {
+  const sourceMessages = getConversationMessagesFromShell(
+    conversationId,
+    shell
+  );
+  const cached = desktopMessagesByConversationId.get(conversationId);
+  if (cached?.sourceMessages === sourceMessages) {
+    return cached;
+  }
+
+  const pageMessages = sourceMessages.slice(
+    Math.max(0, sourceMessages.length - MESSAGE_LOAD_CHUNK_SIZE)
+  );
+  pageMessages.forEach(registerMessageInCache);
+  const desktopMessages = pageMessages.map(toDesktopMessage);
+  const metrics = getDesktopMessageMetricsFromWebMessages(sourceMessages);
+  const next = {
+    desktopMessages,
+    metrics,
+    sourceMessages,
+  };
+  desktopMessagesByConversationId.set(conversationId, next);
+  return next;
+}
+
+function getDesktopMessageMetricsFromWebMessages(
+  messages: ReadonlyArray<WebMessage>
+): ReturnType<typeof getDesktopMessageMetrics> {
+  let oldest: ReturnType<typeof getDesktopMessageMetrics>['oldest'];
+  let newest: ReturnType<typeof getDesktopMessageMetrics>['newest'];
+
+  for (const message of messages) {
+    const pointer = {
+      id: message.id,
+      received_at: message.receivedAt ?? message.timestamp,
+      sent_at: message.timestamp,
+    };
+    if (
+      !oldest ||
+      pointer.received_at < oldest.received_at ||
+      (pointer.received_at === oldest.received_at &&
+        pointer.sent_at < (oldest.sent_at ?? 0))
+    ) {
+      oldest = pointer;
+    }
+    if (
+      !newest ||
+      pointer.received_at > newest.received_at ||
+      (pointer.received_at === newest.received_at &&
+        pointer.sent_at > (newest.sent_at ?? 0))
+    ) {
+      newest = pointer;
+    }
+  }
+
+  return {
+    newest,
+    oldest,
+    totalUnseen: 0,
+  };
+}
+
+function getMessagesResetKey(
+  conversationId: string,
+  shell: ChatShellState
+): string {
+  if (pinnedMessagesSource !== shell.pinnedMessages) {
+    pinnedMessagesSource = shell.pinnedMessages;
+    pinnedMessagesSourceVersion += 1;
+  }
+
+  return [
+    conversationId,
+    conversationMessagesSourceVersion,
+    pinnedMessagesSourceVersion,
+  ].join(':');
+}
+
+function hasLoadedConversationMessages(conversationId: string): boolean {
+  const state = window.reduxStore?.getState?.();
+  const messageIds =
+    state?.conversations?.messagesByConversation?.[conversationId]?.messageIds;
+  return Array.isArray(messageIds) && messageIds.length > 0;
+}
+
 function dispatchConversationMessages(
   conversationId: string,
   shell: ChatShellState
 ): void {
-  const messages = shell.messages
-    .filter(message => message.conversationId === conversationId)
-    .sort(compareWebMessages);
-  messages.forEach(registerMessageInCache);
-  const desktopMessages = messages.map(toDesktopMessage);
+  if (hasLoadedConversationMessages(conversationId)) {
+    return;
+  }
+
+  const { desktopMessages, metrics } = getConversationDesktopMessages(
+    conversationId,
+    shell
+  );
+  const resetKey = getMessagesResetKey(conversationId, shell);
+  if (lastMessagesResetKeyByConversationId.get(conversationId) === resetKey) {
+    return;
+  }
 
   window.reduxActions?.conversations?.messagesReset?.({
     conversationId,
     messages: desktopMessages,
-    metrics: getDesktopMessageMetrics(desktopMessages),
+    metrics,
     pinnedMessagesPreloadData:
       getWebPinnedMessagesPreloadDataForConversation(conversationId),
     unboundedFetch: true,
   });
+  lastMessagesResetKeyByConversationId.set(conversationId, resetKey);
 }
 
 function getActiveConversationId(shell: ChatShellState): string | undefined {
@@ -1377,13 +1674,6 @@ function markConversationRead(
         unreadCount: 0,
       },
     },
-    messages: shell.messages.map(message =>
-      message.conversationId === conversationId &&
-      message.direction === 'incoming' &&
-      message.readStatus === ReadStatus.Unread
-        ? { ...message, readStatus: ReadStatus.Read }
-        : message
-    ),
   };
 }
 
@@ -1729,6 +2019,12 @@ export function WebDesktopApp({
     shellRef.current = shell;
   }, [shell]);
 
+  useEffect(() => {
+    if (initialLinkedSession) {
+      dispatchShell(initialLinkedSession, initialShell);
+    }
+  }, [initialLinkedSession, initialShell]);
+
   const messageStreamSessionKey = useMemo(() => {
     if (!linkedSession?.credentials?.aci) {
       return undefined;
@@ -1747,15 +2043,22 @@ export function WebDesktopApp({
     linkedSession?.linkedAt,
   ]);
 
-  const persistShell = useCallback(
+  const persistShellToStorage = useCallback(
     (next: ChatShellState) => {
-      setWebRuntimeChatShell(next);
       void persistChatShellStateToStorage(
         next,
         linkedSession?.credentials?.aci
       );
     },
     [linkedSession?.credentials?.aci]
+  );
+
+  const persistShell = useCallback(
+    (next: ChatShellState) => {
+      setWebRuntimeChatShell(next);
+      persistShellToStorage(next);
+    },
+    [persistShellToStorage]
   );
 
   useEffect(() => {
@@ -1779,14 +2082,13 @@ export function WebDesktopApp({
           ...current,
           selectedConversationId,
         };
-        persistShell(next);
         return next;
       });
     };
 
     syncSelectedConversationId();
     return store.subscribe(syncSelectedConversationId);
-  }, [persistShell, store]);
+  }, [store]);
 
   useEffect(() => {
     setWebRuntimePinnedMessagesChanged(pinnedMessages => {
@@ -1842,47 +2144,51 @@ export function WebDesktopApp({
             }
 
             setShell(current => {
-              const currentMessage = current.messages.find(
-                item => item.id === message.id
+              const { messages, existing, updated } = replaceMessageById(
+                current.messages,
+                message.id,
+                currentMessage => {
+                  const currentAttachment =
+                    currentMessage.attachments?.[attachmentIndex];
+                  if (
+                    !currentAttachment ||
+                    currentAttachment.thumbnailUrl ||
+                    currentAttachment.thumbnail ||
+                    !currentAttachment.contentType?.startsWith('video/')
+                  ) {
+                    return currentMessage;
+                  }
+
+                  return {
+                    ...currentMessage,
+                    attachments: currentMessage.attachments?.map(
+                      (item, index) =>
+                        index === attachmentIndex
+                          ? {
+                              ...item,
+                              duration: item.duration ?? result.duration,
+                              height: item.height ?? result.height,
+                              thumbnailUrl: result.thumbnailUrl,
+                              width: item.width ?? result.width,
+                            }
+                          : item
+                    ),
+                  };
+                }
               );
-              const currentAttachment =
-                currentMessage?.attachments?.[attachmentIndex];
-              if (
-                !currentMessage ||
-                !currentAttachment ||
-                currentAttachment.thumbnailUrl ||
-                currentAttachment.thumbnail ||
-                !currentAttachment.contentType?.startsWith('video/')
-              ) {
+              if (!existing || !updated || updated === existing) {
                 return current;
               }
-
-              const nextMessage: WebMessage = {
-                ...currentMessage,
-                attachments: currentMessage.attachments?.map((item, index) =>
-                  index === attachmentIndex
-                    ? {
-                        ...item,
-                        duration: item.duration ?? result.duration,
-                        height: item.height ?? result.height,
-                        thumbnailUrl: result.thumbnailUrl,
-                        width: item.width ?? result.width,
-                      }
-                    : item
-                ),
-              };
               const next = {
                 ...current,
-                messages: current.messages.map(item =>
-                  item.id === currentMessage.id ? nextMessage : item
-                ),
+                messages,
               };
               persistShell(next);
-              registerMessageInCache(nextMessage);
+              registerMessageInCache(updated);
               window.reduxActions?.conversations?.messageChanged?.(
-                nextMessage.id,
-                nextMessage.conversationId,
-                toDesktopMessage(nextMessage)
+                updated.id,
+                updated.conversationId,
+                toDesktopMessage(updated)
               );
               return next;
             });
@@ -1921,43 +2227,45 @@ export function WebDesktopApp({
 
     const clearPendingBackfillForMessage = (messageId: string): void => {
       setShell(current => {
-        const target = current.messages.find(
-          message => message.id === messageId
-        );
-        if (!target?.attachments?.length) {
-          return current;
-        }
-
-        let didChange = false;
-        const nextMessage: WebMessage = {
-          ...target,
-          attachments: target.attachments.map(attachment => {
-            if (attachment.status !== 'pending') {
-              return attachment;
+        const { messages, existing, updated } = replaceMessageById(
+          current.messages,
+          messageId,
+          target => {
+            if (!target.attachments?.length) {
+              return target;
             }
 
-            didChange = true;
-            const nextAttachment = { ...attachment };
-            delete nextAttachment.status;
-            return nextAttachment;
-          }),
-        };
-        if (!didChange) {
+            let didChange = false;
+            const nextMessage: WebMessage = {
+              ...target,
+              attachments: target.attachments.map(attachment => {
+                if (attachment.status !== 'pending') {
+                  return attachment;
+                }
+
+                didChange = true;
+                const nextAttachment = { ...attachment };
+                delete nextAttachment.status;
+                return nextAttachment;
+              }),
+            };
+            return didChange ? nextMessage : target;
+          }
+        );
+        if (!existing || !updated || updated === existing) {
           return current;
         }
 
         const next = {
           ...current,
-          messages: current.messages.map(message =>
-            message.id === messageId ? nextMessage : message
-          ),
+          messages,
         };
         persistShell(next);
-        registerMessageInCache(nextMessage);
+        registerMessageInCache(updated);
         window.reduxActions?.conversations?.messageChanged?.(
-          nextMessage.id,
-          nextMessage.conversationId,
-          toDesktopMessage(nextMessage)
+          updated.id,
+          updated.conversationId,
+          toDesktopMessage(updated)
         );
         return next;
       });
@@ -2318,10 +2626,7 @@ export function WebDesktopApp({
           const nextShell = normalizeChatShellForLinkedSession(
             {
               ...current,
-              messages: [
-                ...current.messages.filter(item => item.id !== message.id),
-                message,
-              ].sort(compareWebMessages),
+              messages: upsertMessageSorted(current.messages, message),
               conversationLookup: {
                 ...current.conversationLookup,
                 [conversationId]: nextConversation,
@@ -2392,68 +2697,72 @@ export function WebDesktopApp({
         }
 
         setShell(current => {
-          const target = current.messages.find(
-            message => message.id === messageId
+          const { messages, existing, updated } = replaceMessageById(
+            current.messages,
+            messageId,
+            target => {
+              if (!target.attachments?.length) {
+                return target;
+              }
+
+              return {
+                ...target,
+                attachments: target.attachments.map(attachment => {
+                  if (
+                    isWebBackupOnlyAudioAttachment(attachment) ||
+                    isWebBackupOnlyVisualAttachment(attachment)
+                  ) {
+                    const accessUrl = buildAttachmentAccessUrl(attachment);
+                    return {
+                      ...attachment,
+                      backfillError: undefined,
+                      downloadUrl: isWebBackupOnlyVisualAttachment(attachment)
+                        ? undefined
+                        : accessUrl || attachment.downloadUrl,
+                      error: undefined,
+                      isCorrupted: undefined,
+                      status: isWebBackupOnlyVisualAttachment(attachment)
+                        ? 'pending'
+                        : 'ready',
+                    } satisfies NonNullable<WebMessage['attachments']>[number];
+                  }
+
+                  const accessUrl = buildAttachmentAccessUrl(attachment);
+                  if (!accessUrl) {
+                    return attachment;
+                  }
+
+                  const nextAttachment = {
+                    ...attachment,
+                    backfillError: undefined,
+                    downloadUrl: accessUrl,
+                    error: undefined,
+                    isCorrupted: undefined,
+                    status: 'ready',
+                  } satisfies NonNullable<WebMessage['attachments']>[number];
+
+                  return nextAttachment;
+                }),
+              };
+            }
           );
-          if (!target?.attachments?.length) {
+          if (!existing || !updated || updated === existing) {
             return current;
           }
 
-          const nextMessage: WebMessage = {
-            ...target,
-            attachments: target.attachments.map(attachment => {
-              if (
-                isWebBackupOnlyAudioAttachment(attachment) ||
-                isWebBackupOnlyVisualAttachment(attachment)
-              ) {
-                const accessUrl = buildAttachmentAccessUrl(attachment);
-                return {
-                  ...attachment,
-                  backfillError: undefined,
-                  downloadUrl: isWebBackupOnlyVisualAttachment(attachment)
-                    ? undefined
-                    : accessUrl || attachment.downloadUrl,
-                  error: undefined,
-                  isCorrupted: undefined,
-                  status: isWebBackupOnlyVisualAttachment(attachment)
-                    ? 'pending'
-                    : 'ready',
-                } satisfies NonNullable<WebMessage['attachments']>[number];
-              }
-
-              const accessUrl = buildAttachmentAccessUrl(attachment);
-              if (!accessUrl) {
-                return attachment;
-              }
-
-              const nextAttachment = {
-                ...attachment,
-                backfillError: undefined,
-                downloadUrl: accessUrl,
-                error: undefined,
-                isCorrupted: undefined,
-                status: 'ready',
-              } satisfies NonNullable<WebMessage['attachments']>[number];
-
-              return nextAttachment;
-            }),
-          };
-
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === messageId ? nextMessage : message
-            ),
+            messages,
           };
           void persistChatShellStateToStorage(
             next,
             linkedSession?.credentials?.aci
           );
-          registerMessageInCache(nextMessage);
+          registerMessageInCache(updated);
           window.reduxActions?.conversations?.messageChanged?.(
-            nextMessage.id,
-            nextMessage.conversationId,
-            toDesktopMessage(nextMessage)
+            updated.id,
+            updated.conversationId,
+            toDesktopMessage(updated)
           );
           return next;
         });
@@ -2461,127 +2770,133 @@ export function WebDesktopApp({
       },
       markAttachmentUnavailable(messageId, attachmentPath) {
         setShell(current => {
-          const target = current.messages.find(
-            message => message.id === messageId
-          );
-          if (!target?.attachments?.length) {
-            return current;
-          }
-          const audioAttachmentCount = target.attachments.filter(attachment =>
-            isWebAudioAttachment(attachment)
-          ).length;
-          let didChange = false;
-          const nextMessage: WebMessage = {
-            ...target,
-            attachments: target.attachments.map(attachment => {
-              const isMatchingAttachment =
-                getWebAttachmentVirtualPath(attachment) === attachmentPath ||
-                (isWebAudioAttachment(attachment) &&
-                  audioAttachmentCount === 1 &&
-                  attachmentPath.startsWith('web:'));
-              if (!isMatchingAttachment) {
-                return attachment;
+          const { messages, existing, updated } = replaceMessageById(
+            current.messages,
+            messageId,
+            target => {
+              if (!target.attachments?.length) {
+                return target;
               }
-              didChange = true;
-              if (isWebAudioAttachment(attachment)) {
-                const nextAttachment = { ...attachment };
-                delete nextAttachment.backfillError;
-                delete nextAttachment.downloadPath;
-                delete nextAttachment.downloadUrl;
-                delete nextAttachment.error;
-                delete nextAttachment.isCorrupted;
-                delete nextAttachment.localBlobKey;
-                delete nextAttachment.path;
-                delete nextAttachment.status;
-                delete nextAttachment.url;
-                return nextAttachment;
-              }
-              return {
-                ...attachment,
-                backfillError: true,
-                status: 'failed',
+              const audioAttachmentCount = target.attachments.filter(
+                attachment => isWebAudioAttachment(attachment)
+              ).length;
+              let didChange = false;
+              const nextMessage: WebMessage = {
+                ...target,
+                attachments: target.attachments.map(attachment => {
+                  const isMatchingAttachment =
+                    getWebAttachmentVirtualPath(attachment) ===
+                      attachmentPath ||
+                    (isWebAudioAttachment(attachment) &&
+                      audioAttachmentCount === 1 &&
+                      attachmentPath.startsWith('web:'));
+                  if (!isMatchingAttachment) {
+                    return attachment;
+                  }
+                  didChange = true;
+                  if (isWebAudioAttachment(attachment)) {
+                    const nextAttachment = { ...attachment };
+                    delete nextAttachment.backfillError;
+                    delete nextAttachment.downloadPath;
+                    delete nextAttachment.downloadUrl;
+                    delete nextAttachment.error;
+                    delete nextAttachment.isCorrupted;
+                    delete nextAttachment.localBlobKey;
+                    delete nextAttachment.path;
+                    delete nextAttachment.status;
+                    delete nextAttachment.url;
+                    return nextAttachment;
+                  }
+                  return {
+                    ...attachment,
+                    backfillError: true,
+                    status: 'failed',
+                  };
+                }),
               };
-            }),
-          };
-          if (!didChange) {
+              return didChange ? nextMessage : target;
+            }
+          );
+          if (!existing || !updated || updated === existing) {
             return current;
           }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === messageId ? nextMessage : message
-            ),
+            messages,
           };
           persistShell(next);
-          registerMessageInCache(nextMessage);
+          registerMessageInCache(updated);
           window.reduxActions?.conversations?.messageChanged?.(
-            nextMessage.id,
-            nextMessage.conversationId,
-            toDesktopMessage(nextMessage)
+            updated.id,
+            updated.conversationId,
+            toDesktopMessage(updated)
           );
           if (linkedSession) {
-            dispatchConversationMessages(nextMessage.conversationId, next);
+            dispatchConversationMessages(updated.conversationId, next);
           }
           return next;
         });
       },
       markAttachmentReady(messageId, attachmentPath) {
         setShell(current => {
-          const target = current.messages.find(
-            message => message.id === messageId
+          const { messages, existing, updated } = replaceMessageById(
+            current.messages,
+            messageId,
+            target => {
+              if (!target.attachments?.length) {
+                return target;
+              }
+              const audioAttachmentCount = target.attachments.filter(
+                attachment => isWebAudioAttachment(attachment)
+              ).length;
+              let didChange = false;
+              const nextMessage: WebMessage = {
+                ...target,
+                attachments: target.attachments.map(attachment => {
+                  const isMatchingAttachment =
+                    getWebAttachmentVirtualPath(attachment) ===
+                      attachmentPath ||
+                    attachment.path === attachmentPath ||
+                    (isWebAudioAttachment(attachment) &&
+                      audioAttachmentCount === 1 &&
+                      attachmentPath.startsWith('web:'));
+                  if (!isMatchingAttachment) {
+                    return attachment;
+                  }
+                  const accessUrl = buildAttachmentAccessUrl(attachment);
+                  if (!accessUrl) {
+                    return attachment;
+                  }
+                  didChange = true;
+                  return {
+                    ...attachment,
+                    backfillError: undefined,
+                    downloadUrl: accessUrl,
+                    error: undefined,
+                    isCorrupted: undefined,
+                    status: 'ready',
+                  } satisfies NonNullable<WebMessage['attachments']>[number];
+                }),
+              };
+              return didChange ? nextMessage : target;
+            }
           );
-          if (!target?.attachments?.length) {
-            return current;
-          }
-          const audioAttachmentCount = target.attachments.filter(attachment =>
-            isWebAudioAttachment(attachment)
-          ).length;
-          let didChange = false;
-          const nextMessage: WebMessage = {
-            ...target,
-            attachments: target.attachments.map(attachment => {
-              const isMatchingAttachment =
-                getWebAttachmentVirtualPath(attachment) === attachmentPath ||
-                attachment.path === attachmentPath ||
-                (isWebAudioAttachment(attachment) &&
-                  audioAttachmentCount === 1 &&
-                  attachmentPath.startsWith('web:'));
-              if (!isMatchingAttachment) {
-                return attachment;
-              }
-              const accessUrl = buildAttachmentAccessUrl(attachment);
-              if (!accessUrl) {
-                return attachment;
-              }
-              didChange = true;
-              return {
-                ...attachment,
-                backfillError: undefined,
-                downloadUrl: accessUrl,
-                error: undefined,
-                isCorrupted: undefined,
-                status: 'ready',
-              } satisfies NonNullable<WebMessage['attachments']>[number];
-            }),
-          };
-          if (!didChange) {
+          if (!existing || !updated || updated === existing) {
             return current;
           }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === messageId ? nextMessage : message
-            ),
+            messages,
           };
           persistShell(next);
-          registerMessageInCache(nextMessage);
+          registerMessageInCache(updated);
           window.reduxActions?.conversations?.messageChanged?.(
-            nextMessage.id,
-            nextMessage.conversationId,
-            toDesktopMessage(nextMessage)
+            updated.id,
+            updated.conversationId,
+            toDesktopMessage(updated)
           );
           if (linkedSession) {
-            dispatchConversationMessages(nextMessage.conversationId, next);
+            dispatchConversationMessages(updated.conversationId, next);
           }
           return next;
         });
@@ -2789,8 +3104,9 @@ export function WebDesktopApp({
           }
           nextShell = {
             ...nextShell,
-            messages: [...nextShell.messages, ...outboundMessages].sort(
-              compareWebMessages
+            messages: appendUniqueMessagesSorted(
+              nextShell.messages,
+              outboundMessages
             ),
           };
           persistShell(nextShell);
@@ -2847,16 +3163,15 @@ export function WebDesktopApp({
             timestamp,
           });
           setShell(current => {
-            if (
-              current.messages.some(message => message.id === notification.id)
-            ) {
+            const nextMessages = appendUniqueMessagesSorted(current.messages, [
+              notification,
+            ]);
+            if (nextMessages === current.messages) {
               return current;
             }
             const next = {
               ...current,
-              messages: [...current.messages, notification].sort(
-                compareWebMessages
-              ),
+              messages: nextMessages,
             };
             persistShell(next);
             registerMessageInCache(notification);
@@ -2924,18 +3239,23 @@ export function WebDesktopApp({
         let nextMessage: WebMessage | undefined;
 
         setShell(current => {
-          nextMessage = applyOutgoingReactionToMessage({
-            message: previousMessage,
-            reaction,
-            timestamp,
-            isSent: false,
-            ourConversationId,
+          const result = replaceMessageById(current.messages, id, message => {
+            nextMessage = applyOutgoingReactionToMessage({
+              message,
+              reaction,
+              timestamp,
+              isSent: false,
+              ourConversationId,
+            });
+            return nextMessage;
           });
+          if (!result.existing || !result.updated) {
+            return current;
+          }
+          const updatedMessage = result.updated;
           const nextShell = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === id && nextMessage ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           void persistChatShellStateToStorage(
             nextShell,
@@ -2943,8 +3263,8 @@ export function WebDesktopApp({
           );
           window.reduxActions?.conversations?.messageChanged?.(
             id,
-            nextMessage.conversationId,
-            toDesktopMessage(nextMessage)
+            updatedMessage.conversationId,
+            toDesktopMessage(updatedMessage)
           );
           return nextShell;
         });
@@ -2989,22 +3309,27 @@ export function WebDesktopApp({
               });
             }
             setShell(current => {
-              const message = current.messages.find(item => item.id === id);
-              if (!message) {
+              let sentMessage: WebMessage | undefined;
+              const result = replaceMessageById(
+                current.messages,
+                id,
+                message => {
+                  sentMessage = applyOutgoingReactionToMessage({
+                    message,
+                    reaction,
+                    timestamp,
+                    isSent: true,
+                    ourConversationId,
+                  });
+                  return sentMessage;
+                }
+              );
+              if (!result.existing || !result.updated || !sentMessage) {
                 return current;
               }
-              const sentMessage = applyOutgoingReactionToMessage({
-                message,
-                reaction,
-                timestamp,
-                isSent: true,
-                ourConversationId,
-              });
               const nextShell = {
                 ...current,
-                messages: current.messages.map(item =>
-                  item.id === id ? sentMessage : item
-                ),
+                messages: result.messages,
               };
               void persistChatShellStateToStorage(
                 nextShell,
@@ -3023,11 +3348,17 @@ export function WebDesktopApp({
               if (!previousMessage) {
                 return current;
               }
+              const result = replaceMessageById(
+                current.messages,
+                id,
+                () => previousMessage
+              );
+              if (!result.existing) {
+                return current;
+              }
               const nextShell = {
                 ...current,
-                messages: current.messages.map(message =>
-                  message.id === id ? previousMessage : message
-                ),
+                messages: result.messages,
               };
               void persistChatShellStateToStorage(
                 nextShell,
@@ -3091,14 +3422,11 @@ export function WebDesktopApp({
         return;
       }
       setShell(current => {
-        const existingIds = new Set(
-          current.messages.map(message => message.id)
+        const nextMessages = appendUniqueMessagesSorted(
+          current.messages,
+          messages
         );
-        const nextMessages = [
-          ...current.messages,
-          ...messages.filter(message => !existingIds.has(message.id)),
-        ].sort(compareWebMessages);
-        if (nextMessages.length === current.messages.length) {
+        if (nextMessages === current.messages) {
           return current;
         }
         const nextShell = {
@@ -3580,7 +3908,10 @@ export function WebDesktopApp({
             : event.message;
         let shouldDispatchMessage = false;
         setShell(current => {
-          if (current.messages.some(existing => existing.id === message.id)) {
+          const nextMessages = appendUniqueMessagesSorted(current.messages, [
+            message,
+          ]);
+          if (nextMessages === current.messages) {
             return current;
           }
           shouldDispatchMessage = true;
@@ -3594,9 +3925,7 @@ export function WebDesktopApp({
           );
           const next = {
             ...withConversation,
-            messages: [...withConversation.messages, message].sort(
-              compareWebMessages
-            ),
+            messages: nextMessages,
           };
           persistShell(next);
           dispatchConversation(
@@ -3631,9 +3960,10 @@ export function WebDesktopApp({
           timestamp: event.timestamp,
         });
         setShell(current => {
-          if (
-            current.messages.some(message => message.id === notification.id)
-          ) {
+          const nextMessages = appendUniqueMessagesSorted(current.messages, [
+            notification,
+          ]);
+          if (nextMessages === current.messages) {
             return current;
           }
           const ourConversationId =
@@ -3642,9 +3972,7 @@ export function WebDesktopApp({
           const next = ensureConversationForMessage(
             {
               ...current,
-              messages: [...current.messages, notification].sort(
-                compareWebMessages
-              ),
+              messages: nextMessages,
             },
             notification,
             ourConversationId
@@ -3701,11 +4029,17 @@ export function WebDesktopApp({
             if (!didClearPending) {
               return current;
             }
+            const result = replaceMessageById(
+              current.messages,
+              target.id,
+              () => nextMessage
+            );
+            if (!result.existing) {
+              return current;
+            }
             const next = {
               ...current,
-              messages: current.messages.map(message =>
-                message.id === target.id ? nextMessage : message
-              ),
+              messages: result.messages,
             };
             persistShell(next);
             registerMessageInCache(nextMessage);
@@ -3824,11 +4158,17 @@ export function WebDesktopApp({
           if (!didChange) {
             return current;
           }
+          const result = replaceMessageById(
+            current.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           registerMessageInCache(nextMessage);
@@ -3879,11 +4219,17 @@ export function WebDesktopApp({
           if (nextMessage === target) {
             return current;
           }
+          const result = replaceMessageById(
+            current.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           window.reduxActions?.conversations?.messageChanged?.(
@@ -3925,11 +4271,17 @@ export function WebDesktopApp({
             currentLinkedSession.credentials?.aci ??
               currentLinkedSession.account.aci
           );
+          const result = replaceMessageById(
+            withConversation.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...withConversation,
-            messages: withConversation.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           dispatchConversation(
@@ -3980,11 +4332,17 @@ export function WebDesktopApp({
             currentLinkedSession.credentials?.aci ??
               currentLinkedSession.account.aci
           );
+          const result = replaceMessageById(
+            withConversation.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...withConversation,
-            messages: withConversation.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           dispatchConversation(
@@ -4092,11 +4450,17 @@ export function WebDesktopApp({
           if (!nextMessage || nextMessage === target) {
             return current;
           }
+          const result = replaceMessageById(
+            current.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           window.reduxActions?.conversations?.messageChanged?.(
@@ -4135,11 +4499,17 @@ export function WebDesktopApp({
           if (!nextMessage || nextMessage === target) {
             return current;
           }
+          const result = replaceMessageById(
+            current.messages,
+            target.id,
+            () => nextMessage
+          );
+          if (!result.existing) {
+            return current;
+          }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === target.id ? nextMessage : message
-            ),
+            messages: result.messages,
           };
           persistShell(next);
           window.reduxActions?.conversations?.messageChanged?.(
@@ -4152,21 +4522,20 @@ export function WebDesktopApp({
         });
       } else if (event.type === 'message-status') {
         setShell(current => {
-          const existing = current.messages.find(
-            message => message.id === event.id
+          const { existing, messages } = replaceMessageById(
+            current.messages,
+            event.id,
+            message => ({ ...message, status: event.status })
           );
+          if (!existing) {
+            return current;
+          }
           const next = {
             ...current,
-            messages: current.messages.map(message =>
-              message.id === event.id
-                ? { ...message, status: event.status }
-                : message
-            ),
+            messages,
           };
           persistShell(next);
-          if (existing) {
-            dispatchConversationMessages(existing.conversationId, next);
-          }
+          dispatchConversationMessages(existing.conversationId, next);
           return next;
         });
       } else if (event.type === 'error') {

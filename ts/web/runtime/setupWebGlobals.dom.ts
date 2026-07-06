@@ -25,7 +25,7 @@ import {
   updateConversationPin,
 } from '../api.dom.ts';
 import {
-  getDesktopMessageMetrics,
+  type DesktopMessageMetrics,
   toDesktopConversation,
   toDesktopMessage,
 } from './stateAdapter.dom.ts';
@@ -48,6 +48,8 @@ import { getPinnedMessageExpiresAt } from '../../util/pinnedMessages.std.ts';
 import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
 import { DurationInSeconds } from '../../util/durations/duration-in-seconds.std.ts';
 import { INITIAL_EXPIRE_TIMER_VERSION } from '../../util/expirationTimer.std.ts';
+import { TimelineMessageLoadingState } from '../../util/timelineUtil.std.ts';
+import { isNotNil } from '../../util/isNotNil.std.ts';
 import countryDisplayNames from '../../../build/country-display-names.json';
 import packageJson from '../../../package.json';
 import { loadWebSettings, updateWebSettings } from './webSettings.dom.ts';
@@ -89,6 +91,8 @@ type ConversationAttributesChanged = (
 type PinnedMessagesChanged = (
   pinnedMessages: ReadonlyArray<PinnedMessage>
 ) => void;
+
+const MESSAGE_LOAD_CHUNK_SIZE = 30;
 
 type ConversationRecord = Record<string, unknown> & { id: string };
 type MessageRecord = MessageAttributesType &
@@ -321,12 +325,41 @@ export const WEB_MESSAGES_REMOVED_EVENT = 'signal-web-runtime-messages-removed';
 export const WEB_MESSAGES_ADDED_EVENT = 'signal-web-runtime-messages-added';
 let currentLinkedSession: LinkedSessionRecord | undefined;
 let webRuntimeMessagesLookup: Record<string, MessageRecord> = {};
+let webRuntimeMessagesSource: ChatShellState['messages'] | undefined;
+let webRuntimeShellMessagesById = new Map<string, WebMessage>();
+let webRuntimeShellMessagesByConversation = new Map<
+  string,
+  Array<WebMessage>
+>();
 const webRuntimeDeletedMessageIds = new Set<string>();
 let webRuntimePinnedMessages: ReadonlyArray<PinnedMessage> = [];
 let nextWebRuntimePinnedMessageId = 1;
 let onConversationAttributesChanged: ConversationAttributesChanged | undefined;
 let onPinnedMessagesChanged: PinnedMessagesChanged | undefined;
 let currentMessageRuntimeSessionId: string | undefined;
+let webRuntimeConversationLookupSource:
+  | ChatShellState['conversationLookup']
+  | undefined;
+let webRuntimeConversationLookupLinkedSession: LinkedSessionRecord | undefined;
+let webRuntimeConversationLookup: Record<string, ConversationRecord> = {};
+
+type RuntimeMessageEntry =
+  | Readonly<{
+      kind: 'record';
+      id: string;
+      conversationId: string;
+      receivedAt: number;
+      sentAt: number;
+      message: MessageRecord;
+    }>
+  | Readonly<{
+      kind: 'web';
+      id: string;
+      conversationId: string;
+      receivedAt: number;
+      sentAt: number;
+      message: WebMessage;
+    }>;
 
 function getBootstrapConversationLookup(): Record<string, ConversationRecord> {
   return (
@@ -360,10 +393,319 @@ function compareMessages(left: MessageRecord, right: MessageRecord): number {
   );
 }
 
+function compareRuntimeMessageEntries(
+  left: RuntimeMessageEntry,
+  right: RuntimeMessageEntry
+): number {
+  return (
+    left.receivedAt - right.receivedAt ||
+    left.sentAt - right.sentAt ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+function getWebMessageEntry(message: WebMessage): RuntimeMessageEntry {
+  return {
+    kind: 'web',
+    id: message.id,
+    conversationId: message.conversationId,
+    receivedAt: message.receivedAt ?? message.timestamp,
+    sentAt: message.timestamp,
+    message,
+  };
+}
+
+function getMessageRecordEntry(message: MessageRecord): RuntimeMessageEntry {
+  return {
+    kind: 'record',
+    id: message.id,
+    conversationId: message.conversationId,
+    receivedAt: getTimestamp(message),
+    sentAt: message.sent_at ?? message.timestamp ?? getTimestamp(message),
+    message,
+  };
+}
+
+function runtimeMessageEntryToRecord(
+  entry: RuntimeMessageEntry
+): MessageRecord {
+  return entry.kind === 'record'
+    ? entry.message
+    : (toDesktopMessage(entry.message) as MessageRecord);
+}
+
+function getReduxMessagesLookup(): Record<string, MessageRecord> {
+  return (window.reduxStore?.getState?.().conversations?.messagesLookup ??
+    {}) as Record<string, MessageRecord>;
+}
+
+function getMessageFromLookup(
+  messageId: string,
+  reduxMessagesLookup = getReduxMessagesLookup()
+): MessageRecord | undefined {
+  if (webRuntimeDeletedMessageIds.has(messageId)) {
+    return undefined;
+  }
+
+  const message = webRuntimeMessagesLookup[messageId];
+  if (message) {
+    return isRenderableMessageRecord(message) ? message : undefined;
+  }
+
+  const webMessage = webRuntimeShellMessagesById.get(messageId);
+  if (webMessage) {
+    const desktopMessage = toDesktopMessage(webMessage) as MessageRecord;
+    return isRenderableMessageRecord(desktopMessage)
+      ? desktopMessage
+      : undefined;
+  }
+
+  const reduxMessage = reduxMessagesLookup[messageId];
+  return reduxMessage && isRenderableMessageRecord(reduxMessage)
+    ? reduxMessage
+    : undefined;
+}
+
+function getConversationMessageEntries(
+  conversationId: string | undefined
+): Array<RuntimeMessageEntry> {
+  if (!conversationId) {
+    return [];
+  }
+
+  const overrideMessages = Object.values(webRuntimeMessagesLookup).filter(
+    message =>
+      message.conversationId === conversationId &&
+      !webRuntimeDeletedMessageIds.has(message.id) &&
+      isRenderableMessageRecord(message)
+  );
+  const overrideIds = new Set(overrideMessages.map(message => message.id));
+
+  const entries: Array<RuntimeMessageEntry> = [];
+  for (const message of webRuntimeShellMessagesByConversation.get(
+    conversationId
+  ) ?? []) {
+    if (
+      webRuntimeDeletedMessageIds.has(message.id) ||
+      overrideIds.has(message.id)
+    ) {
+      continue;
+    }
+    entries.push(getWebMessageEntry(message));
+  }
+  for (const message of overrideMessages) {
+    entries.push(getMessageRecordEntry(message));
+  }
+  return entries;
+}
+
+function getConversationMessageEntryById(
+  conversationId: string,
+  messageId: string
+): RuntimeMessageEntry | undefined {
+  const message = webRuntimeMessagesLookup[messageId];
+  if (
+    message &&
+    message.conversationId === conversationId &&
+    !webRuntimeDeletedMessageIds.has(message.id) &&
+    isRenderableMessageRecord(message)
+  ) {
+    return getMessageRecordEntry(message);
+  }
+
+  const webMessage = webRuntimeShellMessagesById.get(messageId);
+  if (
+    webMessage &&
+    webMessage.conversationId === conversationId &&
+    !webRuntimeDeletedMessageIds.has(webMessage.id)
+  ) {
+    return getWebMessageEntry(webMessage);
+  }
+
+  const reduxMessage = getReduxMessagesLookup()[messageId];
+  if (
+    reduxMessage &&
+    reduxMessage.conversationId === conversationId &&
+    isRenderableMessageRecord(reduxMessage)
+  ) {
+    return getMessageRecordEntry(reduxMessage);
+  }
+
+  return undefined;
+}
+
+function insertSortedRuntimeMessageEntry(
+  entries: Array<RuntimeMessageEntry>,
+  entry: RuntimeMessageEntry
+): void {
+  const index = entries.findIndex(
+    existing => compareRuntimeMessageEntries(entry, existing) < 0
+  );
+  if (index < 0) {
+    entries.push(entry);
+  } else {
+    entries.splice(index, 0, entry);
+  }
+}
+
+function getNewestConversationMessageEntries(
+  conversationId: string,
+  limit: number
+): Array<RuntimeMessageEntry> {
+  const result: Array<RuntimeMessageEntry> = [];
+  for (const entry of getConversationMessageEntries(conversationId)) {
+    insertSortedRuntimeMessageEntry(result, entry);
+    if (result.length > limit) {
+      result.shift();
+    }
+  }
+  return result;
+}
+
+function getOlderConversationMessageEntries(
+  conversationId: string,
+  oldestMessageId: string,
+  limit: number
+): Array<RuntimeMessageEntry> {
+  const anchor = getConversationMessageEntryById(
+    conversationId,
+    oldestMessageId
+  );
+  if (!anchor) {
+    return [];
+  }
+
+  const result: Array<RuntimeMessageEntry> = [];
+  for (const entry of getConversationMessageEntries(conversationId)) {
+    if (compareRuntimeMessageEntries(entry, anchor) >= 0) {
+      continue;
+    }
+    insertSortedRuntimeMessageEntry(result, entry);
+    if (result.length > limit) {
+      result.shift();
+    }
+  }
+  return result;
+}
+
+function getNewerConversationMessageEntries(
+  conversationId: string,
+  newestMessageId: string,
+  limit: number
+): Array<RuntimeMessageEntry> {
+  const anchor = getConversationMessageEntryById(
+    conversationId,
+    newestMessageId
+  );
+  if (!anchor) {
+    return [];
+  }
+
+  const result: Array<RuntimeMessageEntry> = [];
+  for (const entry of getConversationMessageEntries(conversationId)) {
+    if (compareRuntimeMessageEntries(entry, anchor) <= 0) {
+      continue;
+    }
+    insertSortedRuntimeMessageEntry(result, entry);
+    if (result.length > limit) {
+      result.pop();
+    }
+  }
+  return result;
+}
+
+function getConversationMessageEntriesAround(
+  conversationId: string,
+  messageId: string,
+  limit: number
+): Array<RuntimeMessageEntry> {
+  const anchor = getConversationMessageEntryById(conversationId, messageId);
+  if (!anchor) {
+    return getNewestConversationMessageEntries(conversationId, limit);
+  }
+
+  const sideLimit = Math.floor(limit / 2);
+  const older: Array<RuntimeMessageEntry> = [];
+  const newer: Array<RuntimeMessageEntry> = [];
+  for (const entry of getConversationMessageEntries(conversationId)) {
+    const delta = compareRuntimeMessageEntries(entry, anchor);
+    if (delta < 0) {
+      insertSortedRuntimeMessageEntry(older, entry);
+      if (older.length > sideLimit) {
+        older.shift();
+      }
+    } else if (delta > 0) {
+      insertSortedRuntimeMessageEntry(newer, entry);
+      if (newer.length > sideLimit) {
+        newer.pop();
+      }
+    }
+  }
+  return [...older, anchor, ...newer];
+}
+
+function runtimeMessageEntriesToRecords(
+  entries: ReadonlyArray<RuntimeMessageEntry>
+): Array<MessageRecord> {
+  return entries
+    .map(runtimeMessageEntryToRecord)
+    .filter(isRenderableMessageRecord);
+}
+
+function getMessageMetricsFromEntries(
+  entries: ReadonlyArray<RuntimeMessageEntry>
+): DesktopMessageMetrics {
+  let oldest: RuntimeMessageEntry | undefined;
+  let newest: RuntimeMessageEntry | undefined;
+  for (const entry of entries) {
+    if (!oldest || compareRuntimeMessageEntries(entry, oldest) < 0) {
+      oldest = entry;
+    }
+    if (!newest || compareRuntimeMessageEntries(entry, newest) > 0) {
+      newest = entry;
+    }
+  }
+
+  return {
+    newest: newest
+      ? {
+          id: newest.id,
+          received_at: newest.receivedAt,
+          sent_at: newest.sentAt,
+        }
+      : undefined,
+    oldest: oldest
+      ? {
+          id: oldest.id,
+          received_at: oldest.receivedAt,
+          sent_at: oldest.sentAt,
+        }
+      : undefined,
+    totalUnseen: 0,
+  };
+}
+
+function getMessageMetricsForConversation(
+  conversationId: string | undefined
+): DesktopMessageMetrics {
+  return getMessageMetricsFromEntries(
+    getConversationMessageEntries(conversationId)
+  );
+}
+
+function getAllShellMessageRecords(): Array<MessageRecord> {
+  return [...webRuntimeShellMessagesById.values()]
+    .filter(message => !webRuntimeDeletedMessageIds.has(message.id))
+    .map(message => toDesktopMessage(message) as MessageRecord)
+    .filter(isRenderableMessageRecord);
+}
+
 function getMessagesLookup(): Record<string, MessageRecord> {
-  const reduxMessagesLookup = (window.reduxStore?.getState?.().conversations
-    ?.messagesLookup ?? {}) as Record<string, MessageRecord>;
+  const reduxMessagesLookup = getReduxMessagesLookup();
   const lookup = {
+    ...Object.fromEntries(
+      getAllShellMessageRecords().map(message => [message.id, message])
+    ),
     ...webRuntimeMessagesLookup,
     ...reduxMessagesLookup,
   };
@@ -378,15 +720,36 @@ function getMessagesLookup(): Record<string, MessageRecord> {
   return lookup;
 }
 
+function getSortedConversationMessageEntries(
+  conversationId: string | undefined
+): Array<RuntimeMessageEntry> {
+  return getConversationMessageEntries(conversationId).sort(
+    compareRuntimeMessageEntries
+  );
+}
+
 function getConversationMessages(
   conversationId: string | undefined
 ): Array<MessageRecord> {
-  if (!conversationId) {
-    return [];
+  return runtimeMessageEntriesToRecords(
+    getSortedConversationMessageEntries(conversationId)
+  );
+}
+
+function getConversationNewestMessageAndCount(
+  conversationId: string
+): Readonly<{ count: number; newest: MessageRecord | undefined }> {
+  const entries = getConversationMessageEntries(conversationId);
+  let newest: RuntimeMessageEntry | undefined;
+  for (const entry of entries) {
+    if (!newest || compareRuntimeMessageEntries(entry, newest) > 0) {
+      newest = entry;
+    }
   }
-  return Object.values(getMessagesLookup())
-    .filter(message => message.conversationId === conversationId)
-    .sort(compareMessages);
+  return {
+    count: entries.length,
+    newest: newest ? runtimeMessageEntryToRecord(newest) : undefined,
+  };
 }
 
 function normalizeSearchText(value: string): string {
@@ -795,26 +1158,34 @@ function hasGalleryMedia(conversationId: string): boolean {
 }
 
 function getMessageMetrics(conversationId: string | undefined) {
-  const messages = getConversationMessages(conversationId);
-  return getDesktopMessageMetrics(messages as never);
+  return getMessageMetricsForConversation(conversationId);
 }
 
 function getConversationMessageStats(conversationId: string | undefined) {
-  const messages = getConversationMessages(conversationId);
-  const newest = messages.at(-1);
+  const entries = getConversationMessageEntries(conversationId);
+  let newest: RuntimeMessageEntry | undefined;
+  let hasUserInitiatedMessages = false;
+  for (const entry of entries) {
+    if (!newest || compareRuntimeMessageEntries(entry, newest) > 0) {
+      newest = entry;
+    }
+    if (hasUserInitiatedMessages) {
+      continue;
+    }
+    const message = runtimeMessageEntryToRecord(entry);
+    const maybeStatsMessage = message as MessageRecord & {
+      isUserInitiatedMessage?: boolean | number;
+    };
+    hasUserInitiatedMessages =
+      maybeStatsMessage.isUserInitiatedMessage === true ||
+      maybeStatsMessage.isUserInitiatedMessage === 1 ||
+      message.type === 'outgoing';
+  }
+  const newestRecord = newest ? runtimeMessageEntryToRecord(newest) : undefined;
   return {
-    activity: newest,
-    preview: newest,
-    hasUserInitiatedMessages: messages.some(message => {
-      const maybeStatsMessage = message as MessageRecord & {
-        isUserInitiatedMessage?: boolean | number;
-      };
-      return (
-        maybeStatsMessage.isUserInitiatedMessage === true ||
-        maybeStatsMessage.isUserInitiatedMessage === 1 ||
-        message.type === 'outgoing'
-      );
-    }),
+    activity: newestRecord,
+    preview: newestRecord,
+    hasUserInitiatedMessages,
   };
 }
 
@@ -1033,15 +1404,79 @@ export function applyRemoteUnpinMessage(
   return true;
 }
 
-function resetConversationMessages(conversationId: string): void {
-  const messages = getConversationMessages(conversationId);
+function getNewestConversationMessagePage(
+  conversationId: string
+): Array<MessageRecord> {
+  return runtimeMessageEntriesToRecords(
+    getNewestConversationMessageEntries(conversationId, MESSAGE_LOAD_CHUNK_SIZE)
+  );
+}
+
+function getConversationMessagePageAround(
+  conversationId: string,
+  messageId: string
+): Array<MessageRecord> {
+  return runtimeMessageEntriesToRecords(
+    getConversationMessageEntriesAround(
+      conversationId,
+      messageId,
+      MESSAGE_LOAD_CHUNK_SIZE
+    )
+  );
+}
+
+function getOlderConversationMessagePage(
+  conversationId: string,
+  oldestMessageId: string
+): Array<MessageRecord> {
+  return runtimeMessageEntriesToRecords(
+    getOlderConversationMessageEntries(
+      conversationId,
+      oldestMessageId,
+      MESSAGE_LOAD_CHUNK_SIZE
+    )
+  );
+}
+
+function getNewerConversationMessagePage(
+  conversationId: string,
+  newestMessageId: string
+): Array<MessageRecord> {
+  return runtimeMessageEntriesToRecords(
+    getNewerConversationMessageEntries(
+      conversationId,
+      newestMessageId,
+      MESSAGE_LOAD_CHUNK_SIZE
+    )
+  );
+}
+
+function resetConversationMessagePage(
+  options: Readonly<{
+    conversationId: string;
+    messages: ReadonlyArray<MessageRecord>;
+    scrollToMessageId?: string;
+    shouldHighlight?: boolean;
+    unboundedFetch?: boolean;
+  }>
+): void {
+  const { conversationId, messages, scrollToMessageId, shouldHighlight } =
+    options;
   window.reduxActions?.conversations?.messagesReset?.({
     conversationId,
     messages,
-    metrics: getDesktopMessageMetrics(messages as never),
+    metrics: getMessageMetrics(conversationId),
     pinnedMessagesPreloadData:
       getWebPinnedMessagesPreloadDataForConversation(conversationId),
-    unboundedFetch: true,
+    scrollToMessageId,
+    shouldHighlight,
+    unboundedFetch: options.unboundedFetch,
+  });
+}
+
+function waitForTimelineLoadingStateRender(): Promise<void> {
+  return new Promise(resolve => {
+    window.requestAnimationFrame(() => resolve());
   });
 }
 
@@ -1070,12 +1505,6 @@ function toWebForwardAttachment(
     url: attachment.url,
     width: attachment.width,
   };
-}
-
-function getConversationNewestMessage(
-  conversationId: string
-): MessageRecord | undefined {
-  return getConversationMessages(conversationId).at(-1);
 }
 
 function createDebouncedUpdateLastMessage(
@@ -1139,6 +1568,22 @@ function removeMessagesFromRuntime(messageIds: ReadonlyArray<string>): void {
 export function setWebRuntimeChatShell(shell: ChatShellState): void {
   const linkedSession = currentLinkedSession;
   if (linkedSession) {
+    if (
+      webRuntimeConversationLookupSource !== shell.conversationLookup ||
+      webRuntimeConversationLookupLinkedSession !== linkedSession
+    ) {
+      webRuntimeConversationLookupSource = shell.conversationLookup;
+      webRuntimeConversationLookupLinkedSession = linkedSession;
+      webRuntimeConversationLookup = Object.fromEntries(
+        Object.values(shell.conversationLookup).map(conversation => [
+          conversation.id,
+          toDesktopConversation(
+            conversation,
+            linkedSession
+          ) as ConversationRecord,
+        ])
+      );
+    }
     (
       window as unknown as {
         SignalWebBootstrapConversationLookup?: Record<
@@ -1146,25 +1591,28 @@ export function setWebRuntimeChatShell(shell: ChatShellState): void {
           ConversationRecord
         >;
       }
-    ).SignalWebBootstrapConversationLookup = Object.fromEntries(
-      Object.values(shell.conversationLookup).map(conversation => [
-        conversation.id,
-        toDesktopConversation(
-          conversation,
-          linkedSession
-        ) as ConversationRecord,
-      ])
-    );
+    ).SignalWebBootstrapConversationLookup = webRuntimeConversationLookup;
   }
 
-  webRuntimeMessagesLookup = Object.fromEntries(
-    shell.messages
-      .filter(message => !webRuntimeDeletedMessageIds.has(message.id))
-      .map(message => {
-        const desktopMessage = toDesktopMessage(message) as MessageRecord;
-        return [desktopMessage.id, desktopMessage];
-      })
-  );
+  if (webRuntimeMessagesSource !== shell.messages) {
+    webRuntimeMessagesSource = shell.messages;
+    const byId = new Map<string, WebMessage>();
+    const byConversation = new Map<string, Array<WebMessage>>();
+    for (const message of shell.messages) {
+      if (webRuntimeDeletedMessageIds.has(message.id)) {
+        continue;
+      }
+      byId.set(message.id, message);
+      const messages = byConversation.get(message.conversationId);
+      if (messages) {
+        messages.push(message);
+      } else {
+        byConversation.set(message.conversationId, [message]);
+      }
+    }
+    webRuntimeShellMessagesById = byId;
+    webRuntimeShellMessagesByConversation = byConversation;
+  }
   webRuntimePinnedMessages = shell.pinnedMessages ?? [];
   nextWebRuntimePinnedMessageId =
     Math.max(
@@ -1288,11 +1736,11 @@ class WebConversationModel {
   public captureChange(): void {}
 
   public async preloadNewestMessages(): Promise<void> {
-    const messages = getConversationMessages(this.id);
+    const messages = getNewestConversationMessagePage(this.id);
     window.reduxActions?.conversations?.addPreloadData?.({
       conversationId: this.id,
       messages,
-      metrics: getDesktopMessageMetrics(messages as never),
+      metrics: getMessageMetrics(this.id),
       pinnedMessagesPreloadData: getWebPinnedMessagesPreloadDataForConversation(
         this.id
       ),
@@ -1300,14 +1748,77 @@ class WebConversationModel {
     });
   }
 
-  public async loadNewestMessages(): Promise<void> {
-    resetConversationMessages(this.id);
+  public async loadNewestMessages(
+    newestMessageId?: string,
+    setFocus?: boolean
+  ): Promise<void> {
+    const messages = newestMessageId
+      ? getConversationMessagePageAround(this.id, newestMessageId)
+      : getNewestConversationMessagePage(this.id);
+    resetConversationMessagePage({
+      conversationId: this.id,
+      messages,
+      scrollToMessageId: setFocus ? messages.at(-1)?.id : undefined,
+      unboundedFetch: !newestMessageId,
+    });
+  }
+
+  public async loadOlderMessages(oldestMessageId: string): Promise<void> {
+    window.reduxActions?.conversations?.setMessageLoadingState?.(
+      this.id,
+      TimelineMessageLoadingState.LoadingOlderMessages
+    );
+    await waitForTimelineLoadingStateRender();
+
+    const messages = getOlderConversationMessagePage(this.id, oldestMessageId);
+    if (messages.length === 0) {
+      window.reduxActions?.conversations?.repairOldestMessage?.(this.id);
+      window.reduxActions?.conversations?.setMessageLoadingState?.(
+        this.id,
+        undefined
+      );
+      return;
+    }
+
+    window.reduxActions?.conversations?.messagesAdded?.({
+      conversationId: this.id,
+      isActive: document.visibilityState === 'visible',
+      isJustSent: false,
+      isNewMessage: false,
+      messages,
+    });
+  }
+
+  public async loadNewerMessages(newestMessageId: string): Promise<void> {
+    window.reduxActions?.conversations?.setMessageLoadingState?.(
+      this.id,
+      TimelineMessageLoadingState.LoadingNewerMessages
+    );
+    await waitForTimelineLoadingStateRender();
+
+    const messages = getNewerConversationMessagePage(this.id, newestMessageId);
+    if (messages.length === 0) {
+      window.reduxActions?.conversations?.repairNewestMessage?.(this.id);
+      window.reduxActions?.conversations?.setMessageLoadingState?.(
+        this.id,
+        undefined
+      );
+      return;
+    }
+
+    window.reduxActions?.conversations?.messagesAdded?.({
+      conversationId: this.id,
+      isActive: document.visibilityState === 'visible',
+      isJustSent: false,
+      isNewMessage: false,
+      messages,
+    });
   }
 
   public async fetchLatestGroupV2Data(): Promise<void> {}
 
   public async updateLastMessage(): Promise<void> {
-    const newest = getConversationNewestMessage(this.id);
+    const { count, newest } = getConversationNewestMessageAndCount(this.id);
     if (!newest) {
       this.set({
         hasMessages: false,
@@ -1358,7 +1869,7 @@ class WebConversationModel {
       lastMessageReceivedAt: newest.sent_at,
       lastMessageReceivedAtMs: receivedAt,
       lastUpdated: receivedAt,
-      messageCount: getConversationMessages(this.id).length,
+      messageCount: count,
       snippet: text || this.attributes.snippet,
       timestamp: newest.sent_at,
     });
@@ -1943,8 +2454,23 @@ class WebConversationModel {
 
   public async updateVerified(): Promise<void> {}
 
-  public async loadAndScroll(): Promise<void> {
-    resetConversationMessages(this.id);
+  public async loadAndScroll(
+    messageId?: string,
+    options: {
+      disableScroll?: boolean;
+      shouldHighlight?: boolean;
+    } = {}
+  ): Promise<void> {
+    const messages = messageId
+      ? getConversationMessagePageAround(this.id, messageId)
+      : getNewestConversationMessagePage(this.id);
+    resetConversationMessagePage({
+      conversationId: this.id,
+      messages,
+      scrollToMessageId: options.disableScroll ? undefined : messageId,
+      shouldHighlight: options.shouldHighlight,
+      unboundedFetch: !messageId,
+    });
   }
 
   public async markRead(): Promise<void> {
@@ -1961,7 +2487,7 @@ class WebConversationModel {
       ...webRuntimeMessagesLookup,
       ...Object.fromEntries(messages.map(message => [message.id, message])),
     };
-    resetConversationMessages(this.id);
+    window.reduxActions?.conversations?.markOpenConversationRead?.(this.id);
   }
 
   public async maybeUpdateDraftPreview(): Promise<void> {}
@@ -3337,12 +3863,14 @@ export function setupWebGlobals({
         if (!Array.isArray(ids)) {
           return [];
         }
-        const lookup = getMessagesLookup();
-        return ids.map(id => lookup[String(id)]).filter(Boolean);
+        const reduxMessagesLookup = getReduxMessagesLookup();
+        return ids
+          .map(id => getMessageFromLookup(String(id), reduxMessagesLookup))
+          .filter(isNotNil);
       }
       if (name === 'getMessageById') {
         const id = args?.[0];
-        return typeof id === 'string' ? getMessagesLookup()[id] : undefined;
+        return typeof id === 'string' ? getMessageFromLookup(id) : undefined;
       }
       if (name === 'getMessagesBySentAt') {
         const sentAt = args?.[0];

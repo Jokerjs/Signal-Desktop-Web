@@ -2460,6 +2460,62 @@
     opacity: 100%;
   }
 
+  /*
+   * Tailwind v4 emits data-state variants with CSS nesting. Chrome 108 drops
+   * those nested rules, so Axo radio/checkbox/switch checked states look
+   * unchecked even though Radix has set data-state correctly.
+   */
+  .data-\[state\=checked\]\:translate-x-3\.5[data-state='checked'] {
+    --tw-translate-x: calc(var(--spacing) * 3.5);
+    translate: var(--tw-translate-x) var(--tw-translate-y);
+  }
+
+  .data-\[state\=checked\]\:bg-color-fill-primary[data-state='checked'] {
+    background-color: var(--color-color-fill-primary);
+  }
+
+  .data-\[state\=checked\]\:bg-label-primary-on-color[data-state='checked'] {
+    background-color: var(--color-label-primary-on-color);
+  }
+
+  .data-\[state\=checked\]\:text-label-primary-on-color[data-state='checked'] {
+    color: var(--color-label-primary-on-color);
+  }
+
+  .data-\[state\=checked\]\:active\:bg-color-fill-primary-pressed[data-state='checked']:active {
+    background-color: var(--color-color-fill-primary-pressed);
+  }
+
+  .data-\[state\=checked\]\:enabled\:active\:bg-color-fill-primary-pressed[data-state='checked']:enabled:active {
+    background-color: var(--color-color-fill-primary-pressed);
+  }
+
+  .data-\[state\=checked\]\:data-disabled\:bg-label-disabled-on-color[data-state='checked'][data-disabled] {
+    background-color: var(--color-label-disabled-on-color);
+  }
+
+  .data-\[state\=checked\]\:data-disabled\:text-label-disabled-on-color[data-state='checked'][data-disabled] {
+    color: var(--color-label-disabled-on-color);
+  }
+
+  .data-\[state\=unchecked\]\:bg-fill-primary[data-state='unchecked'] {
+    background-color: var(--color-fill-primary);
+  }
+
+  .data-\[state\=unchecked\]\:enabled\:active\:bg-fill-primary-pressed[data-state='unchecked']:enabled:active {
+    background-color: var(--color-fill-primary-pressed);
+  }
+
+  @media (forced-colors: active) {
+    .forced-colors\:data-\[state\=checked\]\:bg-\[SelectedItem\][data-state='checked'] {
+      background-color: SelectedItem;
+    }
+
+    .forced-colors\:data-\[state\=checked\]\:bg-\[SelectedItemText\][data-state='checked'] {
+      background-color: SelectedItemText;
+    }
+  }
+
   .group-data-\[state\=open\]\:opacity-100:is(
     :where(.group)[data-state='open'] *
   ) {
