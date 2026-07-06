@@ -194,6 +194,10 @@ CDN 地址覆盖项。普通部署保持为空。
 
 `runtime-config.js` 会被 `web/index.html` 和 `web-dist/index.html` 加载。
 
+生产环境需要对 `runtime-config.js` 和 `index.html` 禁用缓存。示例
+`nginx.production.conf` 已经为这两个文件设置了 `Cache-Control: no-store`；
+如果前面还有 CDN，也要在 CDN 上对 `/runtime-config.js` 关闭缓存或主动刷新。
+
 开发环境：
 
 ```js

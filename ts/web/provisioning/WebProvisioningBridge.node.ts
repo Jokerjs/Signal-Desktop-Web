@@ -422,9 +422,7 @@ function getStreamEventAccountKey(
   linkedPayload: LinkedPayloadWithProtocol | undefined,
   fallback: string
 ): string {
-  return (
-    linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci ?? fallback
-  );
+  return linkedPayload?.credentials?.username ?? fallback;
 }
 
 function getPersistedStreamEventId(
@@ -2966,13 +2964,7 @@ async function handleMessageStream(
     linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
 
   for (const [existingSessionId, existingSession] of streamSessions) {
-    const existingAci =
-      existingSession.linkedPayload?.credentials?.aci ??
-      existingSession.linkedPayload?.account.aci;
-    if (
-      existingSession.username === username ||
-      (streamAci != null && existingAci === streamAci)
-    ) {
+    if (existingSession.username === username) {
       existingSession.status = 'closed';
       existingSession.updatedAt = now();
       void existingSession.disconnect().catch(() => undefined);
@@ -3381,14 +3373,12 @@ async function handleMessageStreamAck(
   }
 
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  const accountKey =
-    aci ??
-    (streamSession
-      ? getStreamEventAccountKey(
-          streamSession.linkedPayload,
-          streamSession.username
-        )
-      : undefined);
+  const accountKey = streamSession
+    ? getStreamEventAccountKey(
+        streamSession.linkedPayload,
+        streamSession.username
+      )
+    : aci;
   if (!accountKey) {
     sendText(req, res, 400, 'Missing account key');
     return;
