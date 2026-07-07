@@ -59,7 +59,7 @@ const EMPTY_SHELL: ChatShellState = {
   pinnedMessages: [],
 };
 const WEB_BUILD_EXPIRATION = Date.now() + 30 * 24 * 60 * 60 * 1000;
-const VITE_SECRET = 'JBSWY3DPEHPK3PXPIOHHIUGYUGFAFST';
+const _SIGNAL_SECRET = 'AHU3KOP4NBV1YCXD2GI3KOO42174FDFVBJKK';
 
 Object.assign(globalThis, { Buffer });
 
@@ -266,7 +266,7 @@ async function buildInitialState(): Promise<{
 }
 
 function getWindowViteSecret(): unknown {
-  return (window as typeof window & { VITE_SECRET?: unknown }).VITE_SECRET;
+  return (window as typeof window & { _SIGNAL_SECRET?: unknown })._SIGNAL_SECRET;
 }
 
 function redirectToNotFound(): void {
@@ -275,7 +275,7 @@ function redirectToNotFound(): void {
 }
 
 async function start(): Promise<void> {
-  if (getWindowViteSecret() !== VITE_SECRET) {
+  if (getWindowViteSecret() !== _SIGNAL_SECRET) {
     redirectToNotFound();
     return;
   }
