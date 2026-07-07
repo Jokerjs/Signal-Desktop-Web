@@ -2557,15 +2557,19 @@ export function WebDesktopApp({
         });
 
         setShell(current => {
-          const next: ChatShellState = {
-            ...current,
-            selectedConversationId: group.id,
-            conversationLookup: {
-              ...current.conversationLookup,
-              [group.id]: group,
+          const next = normalizeChatShellForLinkedSession(
+            {
+              ...current,
+              selectedConversationId: group.id,
+              conversationLookup: {
+                ...current.conversationLookup,
+                [group.id]: group,
+              },
             },
-          };
+            linkedSession
+          );
           persistShell(next);
+          dispatchConversation(linkedSession, group.id, next);
           return next;
         });
 

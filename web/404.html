@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1"
+    />
+    <title>404 - Page Not Found</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        color: #353a3f;
+        background: #fff;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+      }
+
+      main {
+        box-sizing: border-box;
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        align-items: center;
+        gap: 72px;
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 72px 32px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 64px;
+        font-weight: 400;
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      h2 {
+        margin: 12px 0 48px;
+        color: #858b91;
+        font-size: 28px;
+        font-weight: 400;
+        line-height: 1.2;
+        letter-spacing: 0;
+      }
+
+      p {
+        max-width: 660px;
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+
+      .hint {
+        margin-top: 48px;
+        font-weight: 700;
+      }
+
+      .details {
+        margin-top: 12px;
+      }
+
+      .illustration {
+        width: 100%;
+        max-width: 360px;
+      }
+
+      @media (max-width: 760px) {
+        main {
+          grid-template-columns: 1fr;
+          gap: 40px;
+          padding: 56px 28px;
+        }
+
+        h1 {
+          font-size: 52px;
+        }
+
+        h2 {
+          margin-bottom: 32px;
+          font-size: 24px;
+        }
+
+        p {
+          font-size: 18px;
+        }
+
+        .illustration {
+          max-width: 280px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section aria-labelledby="error-title">
+        <h1 id="error-title">Error 404</h1>
+        <h2>Page not found</h2>
+        <p>
+          This page does not exist or is not publicly accessible at this URL.
+          Check the address and try again.
+        </p>
+        <p class="hint">Need access?</p>
+        <p class="details">Contact the site owner to enable access.</p>
+      </section>
+
+      <svg
+        class="illustration"
+        viewBox="0 0 360 240"
+        role="img"
+        aria-label="404 illustration"
+      >
+        <defs>
+          <linearGradient id="ground" x1="0" x2="1" y1="0" y2="1">
+            <stop offset="0" stop-color="#e6f8ff" />
+            <stop offset="1" stop-color="#d8f1fb" />
+          </linearGradient>
+        </defs>
+        <ellipse cx="190" cy="188" rx="142" ry="28" fill="url(#ground)" />
+        <g fill="none" stroke="#0b63f6" stroke-width="4" stroke-linecap="round">
+          <path d="M96 77v-20a46 46 0 0 1 92 0v20" fill="#dff7ff" />
+          <path d="M112 77h60v82h-60z" fill="#bff0ff" />
+          <path d="M96 101c-15 8-22 24-22 43" />
+          <path d="M188 101c15 8 22 24 22 43" />
+          <path d="M142 31v-20" />
+          <circle cx="142" cy="10" r="8" fill="#0b63f6" />
+          <circle cx="124" cy="58" r="10" fill="#fff" />
+          <circle cx="160" cy="58" r="10" fill="#fff" />
+          <path d="M130 88h26" />
+        </g>
+        <g fill="#0b63f6">
+          <circle cx="118" cy="132" r="6" />
+          <circle cx="142" cy="132" r="6" />
+          <circle cx="166" cy="132" r="6" />
+        </g>
+        <g fill="#8dd8ee">
+          <circle cx="108" cy="161" r="10" />
+          <circle cx="136" cy="161" r="10" />
+          <circle cx="164" cy="161" r="10" />
+          <circle cx="192" cy="161" r="10" />
+        </g>
+        <g fill="none" stroke="#0b63f6" stroke-width="4" stroke-linecap="round">
+          <path d="M242 88v-16a36 36 0 0 1 72 0v16" fill="#dff7ff" />
+          <path d="M254 88h48v68h-48z" fill="#bff0ff" />
+          <path d="M238 109c-4 12-14 15-20 4" />
+          <path d="M318 109c4 12 14 15 20 4" />
+          <path d="M278 43v-18" />
+          <circle cx="278" cy="24" r="7" fill="#0b63f6" />
+          <circle cx="266" cy="73" r="8" fill="#fff" />
+          <circle cx="292" cy="73" r="8" fill="#fff" />
+        </g>
+        <g fill="#0b63f6">
+          <circle cx="260" cy="132" r="5" />
+          <circle cx="278" cy="132" r="5" />
+          <circle cx="296" cy="132" r="5" />
+        </g>
+        <g fill="#aee8f5" stroke="#5ac7e5" stroke-width="3">
+          <path d="M18 117h64l-10 74H6z" />
+          <path d="M300 118h70l-12 64h-72z" />
+          <path d="M316 96h68v17h-68z" />
+          <path d="M332 180h44l-6 42h-48z" />
+        </g>
+      </svg>
+    </main>
+  </body>
+</html>
