@@ -6,166 +6,184 @@
       name="viewport"
       content="width=device-width, initial-scale=1, maximum-scale=1"
     />
-    <title>404 - Page Not Found</title>
+    <meta name="robots" content="noindex,nofollow" />
+    <title>404</title>
     <style>
       :root {
         color-scheme: light;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-        color: #353a3f;
-        background: #fff;
+        --bg: #f6f7f9;
+        --surface: #ffffff;
+        --surface-soft: #eef4ff;
+        --text: #101828;
+        --muted: #667085;
+        --line: #d7dce5;
+        --accent: #2563eb;
+        --accent-dark: #1d4ed8;
+        --shadow: 0 24px 70px rgba(16, 24, 40, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        min-width: 320px;
+        min-height: 100%;
+        margin: 0;
       }
 
       body {
-        margin: 0;
+        display: grid;
+        place-items: center;
         min-height: 100vh;
+        padding: 32px;
+        background:
+          linear-gradient(135deg, rgba(37, 99, 235, 0.1), transparent 38%),
+          radial-gradient(circle at 80% 20%, rgba(20, 184, 166, 0.12), transparent 34%),
+          var(--bg);
+        color: var(--text);
+        font-family:
+          Inter,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          "PingFang SC",
+          "Microsoft YaHei",
+          sans-serif;
       }
 
       main {
-        box-sizing: border-box;
-        min-height: 100vh;
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 360px;
+        width: min(100%, 760px);
+        padding: 48px;
+        border: 1px solid rgba(215, 220, 229, 0.9);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: var(--shadow);
+      }
+
+      .status {
+        display: inline-flex;
         align-items: center;
-        gap: 72px;
-        max-width: 1120px;
-        margin: 0 auto;
-        padding: 72px 32px;
+        gap: 10px;
+        margin: 0 0 28px;
+        padding: 8px 12px;
+        border: 1px solid #bfd2ff;
+        border-radius: 999px;
+        background: var(--surface-soft);
+        color: var(--accent-dark);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .status::before {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        content: "";
       }
 
       h1 {
         margin: 0;
-        font-size: 64px;
-        font-weight: 400;
-        line-height: 1.05;
+        font-size: clamp(64px, 14vw, 132px);
+        line-height: 0.9;
         letter-spacing: 0;
       }
 
       h2 {
-        margin: 12px 0 48px;
-        color: #858b91;
-        font-size: 28px;
-        font-weight: 400;
-        line-height: 1.2;
+        max-width: 600px;
+        margin: 24px 0 0;
+        font-size: clamp(24px, 5vw, 36px);
+        line-height: 1.18;
         letter-spacing: 0;
       }
 
       p {
-        max-width: 660px;
-        margin: 0;
-        font-size: 20px;
-        line-height: 1.3;
+        max-width: 560px;
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.75;
       }
 
-      .hint {
-        margin-top: 48px;
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 34px;
+      }
+
+      a,
+      button {
+        min-height: 44px;
+        border-radius: 6px;
+        font: inherit;
+        font-size: 15px;
         font-weight: 700;
+        letter-spacing: 0;
       }
 
-      .details {
-        margin-top: 12px;
+      a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0 18px;
+        background: var(--accent);
+        color: #ffffff;
+        text-decoration: none;
       }
 
-      .illustration {
-        width: 100%;
-        max-width: 360px;
+      a:hover {
+        background: var(--accent-dark);
       }
 
-      @media (max-width: 760px) {
+      button {
+        padding: 0 16px;
+        border: 1px solid var(--line);
+        background: var(--surface);
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      button:hover {
+        border-color: #aab4c3;
+        background: #f9fafb;
+      }
+
+      @media (max-width: 560px) {
+        body {
+          padding: 20px;
+        }
+
         main {
-          grid-template-columns: 1fr;
-          gap: 40px;
-          padding: 56px 28px;
+          padding: 32px 24px;
         }
 
-        h1 {
-          font-size: 52px;
+        .actions {
+          flex-direction: column;
         }
 
-        h2 {
-          margin-bottom: 32px;
-          font-size: 24px;
-        }
-
-        p {
-          font-size: 18px;
-        }
-
-        .illustration {
-          max-width: 280px;
+        a,
+        button {
+          width: 100%;
         }
       }
     </style>
   </head>
   <body>
     <main>
-      <section aria-labelledby="error-title">
-        <h1 id="error-title">Error 404</h1>
-        <h2>Page not found</h2>
-        <p>
-          This page does not exist or is not publicly accessible at this URL.
-          Check the address and try again.
-        </p>
-        <p class="hint">Need access?</p>
-        <p class="details">Contact the site owner to enable access.</p>
-      </section>
-
-      <svg
-        class="illustration"
-        viewBox="0 0 360 240"
-        role="img"
-        aria-label="404 illustration"
-      >
-        <defs>
-          <linearGradient id="ground" x1="0" x2="1" y1="0" y2="1">
-            <stop offset="0" stop-color="#e6f8ff" />
-            <stop offset="1" stop-color="#d8f1fb" />
-          </linearGradient>
-        </defs>
-        <ellipse cx="190" cy="188" rx="142" ry="28" fill="url(#ground)" />
-        <g fill="none" stroke="#0b63f6" stroke-width="4" stroke-linecap="round">
-          <path d="M96 77v-20a46 46 0 0 1 92 0v20" fill="#dff7ff" />
-          <path d="M112 77h60v82h-60z" fill="#bff0ff" />
-          <path d="M96 101c-15 8-22 24-22 43" />
-          <path d="M188 101c15 8 22 24 22 43" />
-          <path d="M142 31v-20" />
-          <circle cx="142" cy="10" r="8" fill="#0b63f6" />
-          <circle cx="124" cy="58" r="10" fill="#fff" />
-          <circle cx="160" cy="58" r="10" fill="#fff" />
-          <path d="M130 88h26" />
-        </g>
-        <g fill="#0b63f6">
-          <circle cx="118" cy="132" r="6" />
-          <circle cx="142" cy="132" r="6" />
-          <circle cx="166" cy="132" r="6" />
-        </g>
-        <g fill="#8dd8ee">
-          <circle cx="108" cy="161" r="10" />
-          <circle cx="136" cy="161" r="10" />
-          <circle cx="164" cy="161" r="10" />
-          <circle cx="192" cy="161" r="10" />
-        </g>
-        <g fill="none" stroke="#0b63f6" stroke-width="4" stroke-linecap="round">
-          <path d="M242 88v-16a36 36 0 0 1 72 0v16" fill="#dff7ff" />
-          <path d="M254 88h48v68h-48z" fill="#bff0ff" />
-          <path d="M238 109c-4 12-14 15-20 4" />
-          <path d="M318 109c4 12 14 15 20 4" />
-          <path d="M278 43v-18" />
-          <circle cx="278" cy="24" r="7" fill="#0b63f6" />
-          <circle cx="266" cy="73" r="8" fill="#fff" />
-          <circle cx="292" cy="73" r="8" fill="#fff" />
-        </g>
-        <g fill="#0b63f6">
-          <circle cx="260" cy="132" r="5" />
-          <circle cx="278" cy="132" r="5" />
-          <circle cx="296" cy="132" r="5" />
-        </g>
-        <g fill="#aee8f5" stroke="#5ac7e5" stroke-width="3">
-          <path d="M18 117h64l-10 74H6z" />
-          <path d="M300 118h70l-12 64h-72z" />
-          <path d="M316 96h68v17h-68z" />
-          <path d="M332 180h44l-6 42h-48z" />
-        </g>
-      </svg>
+      <div class="status">访问受限</div>
+      <h1>404</h1>
+      <h2>页面不存在或当前访问未通过校验</h2>
+      <p>
+        请检查访问地址是否正确，或确认当前页面已经加载有效的访问配置。
+      </p>
+      <div class="actions">
+        <a href="/">返回首页</a>
+        <button type="button" onclick="window.location.reload()">重新加载</button>
+      </div>
     </main>
   </body>
 </html>

@@ -59,7 +59,7 @@ const EMPTY_SHELL: ChatShellState = {
   pinnedMessages: [],
 };
 const WEB_BUILD_EXPIRATION = Date.now() + 30 * 24 * 60 * 60 * 1000;
-const EXPECTED_WEB_SECRET = 'AHUKOPNBV223YCXDGIKOO2174FDFVBJKK';
+const VITE_SECRET = 'JBSWY3DPEHPK3PXPIOHHIUGYUGFAFST';
 
 Object.assign(globalThis, { Buffer });
 
@@ -270,12 +270,12 @@ function getWindowViteSecret(): unknown {
 }
 
 function redirectToNotFound(): void {
-  const notFoundUrl = new URL('404.html', document.baseURI);
+  const notFoundUrl = new URL('/404.html', window.location.origin);
   window.location.replace(notFoundUrl.href);
 }
 
 async function start(): Promise<void> {
-  if (getWindowViteSecret() !== EXPECTED_WEB_SECRET) {
+  if (getWindowViteSecret() !== VITE_SECRET) {
     redirectToNotFound();
     return;
   }

@@ -11,7 +11,12 @@ const outDir = join(root, 'web-dist');
 await mkdir(outDir, { recursive: true });
 await mkdir(join(outDir, 'stylesheets'), { recursive: true });
 
-for (const file of ['runtime-config.js', 'web.css', 'chrome108-fallback.css']) {
+for (const file of [
+  '404.html',
+  'runtime-config.js',
+  'web.css',
+  'chrome108-fallback.css',
+]) {
   await copyFile(join(root, 'web', file), join(outDir, file));
 }
 
