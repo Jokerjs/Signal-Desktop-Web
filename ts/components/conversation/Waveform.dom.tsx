@@ -1,6 +1,7 @@
 // Copyright 2023 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { memo } from 'react';
 import type { JSX } from 'react';
 
 import classNames from 'classnames';
@@ -15,7 +16,7 @@ type Props = {
   duration: number | undefined;
 };
 
-export function Waveform({
+export const Waveform = memo(function Waveform({
   peaks,
   barMinHeight,
   barMaxHeight,
@@ -57,4 +58,4 @@ export function Waveform({
       })}
     </div>
   );
-}
+});

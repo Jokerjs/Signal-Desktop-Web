@@ -4,7 +4,7 @@
 import classNames from 'classnames';
 import lodash from 'lodash';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { ReactNode, ComponentProps, JSX, MouseEvent } from 'react';
+import type { ComponentProps, JSX, MouseEvent, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Manager, Popper, Reference } from 'react-popper';
 import type { PreventOverflowModifier } from '@popperjs/core/lib/modifiers/preventOverflow.js';
@@ -496,6 +496,12 @@ export function TimelineMessage(props: Props): JSX.Element {
   ]);
 
   const handleWrapperKeyDown = useAxoContextMenuOutsideKeyboardTrigger();
+  const handleToggleSelect = useCallback(
+    (selected: boolean, shift: boolean) => {
+      toggleSelectMessage(conversationId, id, shift, selected);
+    },
+    [conversationId, id, toggleSelectMessage]
+  );
 
   return (
     <Message
@@ -503,9 +509,7 @@ export function TimelineMessage(props: Props): JSX.Element {
       renderingContext="conversation/TimelineItem"
       renderMenu={isSignalConversation ? undefined : renderMenu}
       renderMessageContextMenu={renderMessageContextMenu}
-      onToggleSelect={(selected, shift) => {
-        toggleSelectMessage(conversationId, id, shift, selected);
-      }}
+      onToggleSelect={handleToggleSelect}
       onReplyToMessage={handleReplyToMessage}
       onWrapperKeyDown={handleWrapperKeyDown}
     />
@@ -558,15 +562,15 @@ function MessageMenu({
                   // oxlint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/interactive-supports-focus
                   <div
                     ref={maybePopperRef}
-	                    onClick={(event: MouseEvent) => {
-	                      event.stopPropagation();
-	                      event.preventDefault();
-	                      if (event.currentTarget instanceof HTMLElement) {
-	                        setReactionPickerReference(event.currentTarget);
-	                      }
+                    onClick={(event: MouseEvent) => {
+                      event.stopPropagation();
+                      event.preventDefault();
+                      if (event.currentTarget instanceof HTMLElement) {
+                        setReactionPickerReference(event.currentTarget);
+                      }
 
-	                      onReact();
-	                    }}
+                      onReact();
+                    }}
                     role="button"
                     className="module-message__buttons__react"
                     aria-label={i18n('icu:reactToMessage')}

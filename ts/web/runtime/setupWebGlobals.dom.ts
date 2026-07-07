@@ -2474,20 +2474,43 @@ class WebConversationModel {
   }
 
   public async markRead(): Promise<void> {
-    this.set({
-      markedUnread: false,
-      unreadCount: 0,
-    });
-    const messages = getConversationMessages(this.id).map(message =>
-      message.type === 'incoming' && message.readStatus === ReadStatus.Unread
-        ? { ...message, readStatus: ReadStatus.Read }
-        : message
+    const messages = getConversationMessages(this.id);
+    const unreadMessages = messages.filter(
+        message =>
+            message.type === 'incoming' && message.readStatus === ReadStatus.Unread
     );
-    webRuntimeMessagesLookup = {
-      ...webRuntimeMessagesLookup,
-      ...Object.fromEntries(messages.map(message => [message.id, message])),
-    };
-    window.reduxActions?.conversations?.markOpenConversationRead?.(this.id);
+
+    const unreadCount = this.get('unreadCount');
+    const markedUnread = this.get('markedUnread');
+
+    if (
+        unreadMessages.length === 0 &&
+        unreadCount === 0 &&
+        markedUnread !== true
+    ) {
+      return;
+    }
+
+    if (unreadCount !== 0 || markedUnread === true) {
+      this.set({
+        markedUnread: false,
+        unreadCount: 0,
+      });
+    }
+
+    if (unreadMessages.length > 0) {
+      webRuntimeMessagesLookup = {
+        ...webRuntimeMessagesLookup,
+        ...Object.fromEntries(
+            unreadMessages.map(message => [
+              message.id,
+              { ...message, readStatus: ReadStatus.Read },
+            ])
+        ),
+      };
+
+      window.reduxActions?.conversations?.markOpenConversationRead?.(this.id);
+    }
   }
 
   public async maybeUpdateDraftPreview(): Promise<void> {}

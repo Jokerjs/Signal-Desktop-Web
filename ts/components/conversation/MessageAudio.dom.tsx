@@ -1,7 +1,7 @@
 // Copyright 2021 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { RefObject, JSX, ReactElement } from 'react';
 import classNames from 'classnames';
 import lodash from 'lodash';
@@ -84,6 +84,10 @@ const BAR_COUNT = 47;
 const BAR_NOT_DOWNLOADED_HEIGHT = 2;
 const BAR_MIN_HEIGHT = 4;
 const BAR_MAX_HEIGHT = 20;
+const BAR_WIDTH = 2;
+const BAR_GAP = 2;
+const WAVEFORM_PLACEHOLDER_WIDTH =
+  BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP;
 
 const SPRING_CONFIG = {
   mass: 0.5,
@@ -227,6 +231,35 @@ export function MessageAudio(props: Props): JSX.Element {
 
   const currentTimeOrZero = active?.currentTime ?? 0;
 
+  const shouldRenderWaveformImmediately =
+    active != null || state !== State.Normal;
+  const [shouldRenderWaveform, setShouldRenderWaveform] = useState(
+    shouldRenderWaveformImmediately
+  );
+
+  useEffect(() => {
+    if (shouldRenderWaveformImmediately) {
+      setShouldRenderWaveform(true);
+      return noop;
+    }
+
+    setShouldRenderWaveform(false);
+
+    let animationFrame: number | undefined;
+    const timeout = window.setTimeout(() => {
+      animationFrame = window.requestAnimationFrame(() => {
+        setShouldRenderWaveform(true);
+      });
+    }, 80);
+
+    return () => {
+      window.clearTimeout(timeout);
+      if (animationFrame != null) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+    };
+  }, [id, shouldRenderWaveformImmediately]);
+
   const updatePosition = useCallback(
     (newPosition: number) => {
       if (active) {
@@ -269,7 +302,7 @@ export function MessageAudio(props: Props): JSX.Element {
     [currentTimeOrZero, duration, updatePosition]
   );
 
-  const waveform = (
+  const waveform = shouldRenderWaveform ? (
     <WaveformScrubber
       i18n={i18n}
       peaks={peaks}
@@ -282,6 +315,16 @@ export function MessageAudio(props: Props): JSX.Element {
       onClick={handleWaveformClick}
       onScrub={handleWaveformScrub}
     />
+  ) : (
+    <div className="WaveformScrubber" aria-hidden="true">
+      <div
+        className="Waveform"
+        style={{
+          height: BAR_MAX_HEIGHT,
+          width: WAVEFORM_PLACEHOLDER_WIDTH,
+        }}
+      />
+    </div>
   );
 
   let button: ReactElement;

@@ -349,7 +349,7 @@ type BackupMediaLocation = BackupArchiveInfo &
   }>;
 
 const PORT = Number(process.env.SIGNAL_WEB_PROVISIONING_PORT ?? 3100);
-const HOST = process.env.SIGNAL_WEB_PROVISIONING_HOST ?? '127.0.0.1';
+const HOST = process.env.SIGNAL_WEB_PROVISIONING_HOST ?? '0.0.0.0';
 const LINK_AND_SYNC = process.env.SIGNAL_WEB_LINK_AND_SYNC !== '0';
 const UPSTREAM_API_BASE_URL = process.env.SIGNAL_WEB_UPSTREAM_API_BASE_URL;
 const CDN_BASE_URL = process.env.SIGNAL_WEB_CDN_BASE_URL;
@@ -369,8 +369,7 @@ const insecureNodeFetch: FetchFunctionType = (url, init) =>
   });
 const ALLOWED_ORIGINS = new Set(
   (
-    process.env.SIGNAL_WEB_ALLOWED_ORIGINS ??
-    'http://127.0.0.1:3001,http://localhost:3001'
+    process.env.SIGNAL_WEB_ALLOWED_ORIGINS ?? '*'
   )
     .split(',')
     .map(origin => origin.trim())
@@ -678,11 +677,14 @@ function emitProtocolState(streamSession: MessageStreamSession): void {
 
 function sendCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  if (origin && (ALLOWED_ORIGINS.has(origin) || ALLOWED_ORIGINS.has('*'))) {
+  if (ALLOWED_ORIGINS.has('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
 }
 
 function sendJson(
@@ -6061,6 +6063,15 @@ async function handleRequest(
     req.url ?? '/',
     `http://${req.headers.host ?? '127.0.0.1'}`
   );
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    sendJson(req, res, 200, {
+      host: HOST,
+      ok: true,
+      port: PORT,
+    });
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/emoji/jumbo') {
     await handleEmojiJumbo(req, res, url);

@@ -423,12 +423,21 @@ export class Timeline extends Component<PropsType, StateType, SnapshotType> {
         const newestBottomVisibleMessageId =
           getMessageIdFromElement(newestBottomVisible);
 
-        this.setState({
-          oldestPartiallyVisibleMessageId,
-          newestBottomVisibleMessageId,
-        });
+        if (
+          this.state.oldestPartiallyVisibleMessageId !==
+            oldestPartiallyVisibleMessageId ||
+          this.state.newestBottomVisibleMessageId !==
+            newestBottomVisibleMessageId
+        ) {
+          this.setState({
+            oldestPartiallyVisibleMessageId,
+            newestBottomVisibleMessageId,
+          });
+        }
 
-        setIsNearBottom(id, newIsNearBottom);
+        if (this.props.isNearBottom !== newIsNearBottom) {
+          setIsNearBottom(id, newIsNearBottom);
+        }
 
         if (newestBottomVisibleMessageId) {
           this.#markNewestBottomVisibleMessageRead(
@@ -676,14 +685,14 @@ export class Timeline extends Component<PropsType, StateType, SnapshotType> {
     );
 
     if (containerEl) {
-      this.setState(
-        {
-          widthBreakpoint: getWidthBreakpoint(containerEl.offsetWidth),
-        },
-        () => {
+      const widthBreakpoint = getWidthBreakpoint(containerEl.offsetWidth);
+      if (this.state.widthBreakpoint !== widthBreakpoint) {
+        this.setState({ widthBreakpoint }, () => {
           this.#updateIntersectionObserver();
-        }
-      );
+        });
+      } else {
+        this.#updateIntersectionObserver();
+      }
     } else {
       this.#updateIntersectionObserver();
     }
@@ -1249,9 +1258,12 @@ export class Timeline extends Component<PropsType, StateType, SnapshotType> {
 
             const { isNearBottom } = this.props;
 
-            this.setState({
-              widthBreakpoint: getWidthBreakpoint(size.width),
-            });
+            const nextWidthBreakpoint = getWidthBreakpoint(size.width);
+            if (this.state.widthBreakpoint !== nextWidthBreakpoint) {
+              this.setState({
+                widthBreakpoint: nextWidthBreakpoint,
+              });
+            }
 
             this.#maxVisibleRows = Math.ceil(size.height / MIN_ROW_HEIGHT);
 
