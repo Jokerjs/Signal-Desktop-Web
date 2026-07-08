@@ -275,10 +275,10 @@ function redirectToNotFound(): void {
 }
 
 async function start(): Promise<void> {
-  if (getWindowViteSecret() !== _SIGNAL_SECRET) {
-    redirectToNotFound();
-    return;
-  }
+  // if (getWindowViteSecret() !== _SIGNAL_SECRET) {
+  //   redirectToNotFound();
+  //   return;
+  // }
 
   await initializeWebRemoteConfig();
   setupWebGlobals({ i18n });
