@@ -20,8 +20,7 @@ import { getWebAttachmentContentType } from './attachmentMime.std.ts';
 import { HTTPError } from '../types/HTTPError.std.ts';
 
 function apiUrl(path: string): URL {
-  const url = getRenderApiBaseUrl() + path;
-  return new URL(url);
+  return new URL(path.replace(/^\/+/, ''), getRenderApiBaseUrl());
 }
 
 let currentMessageRuntimeSessionId: string | undefined;

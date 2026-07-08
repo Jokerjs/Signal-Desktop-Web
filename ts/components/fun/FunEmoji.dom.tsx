@@ -25,7 +25,7 @@ function canLoadEmojiProtocol(): boolean {
 }
 
 function getWebEmojiJumboUrl(emoji: Emoji.Variant): string {
-  const url = new URL('/emoji/jumbo', getRenderApiBaseUrl());
+  const url = new URL('emoji/jumbo' + getRenderApiBaseUrl());
   url.searchParams.set('emoji', emoji);
   return url.toString();
 }
