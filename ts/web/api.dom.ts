@@ -129,7 +129,6 @@ function normalizeProvisioningSession(raw: unknown): ProvisioningSession {
 export async function startProvisioningSession(
   deviceName: string
 ): Promise<ProvisioningSession> {
-  console.log('=====', apiUrl('/provisioning/sessions'))
   const response = await fetch(apiUrl('/provisioning/sessions'), {
     method: 'POST',
     headers: {
