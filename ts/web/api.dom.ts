@@ -20,7 +20,8 @@ import { getWebAttachmentContentType } from './attachmentMime.std.ts';
 import { HTTPError } from '../types/HTTPError.std.ts';
 
 function apiUrl(path: string): URL {
-  return new URL(path, getRenderApiBaseUrl());
+  const url = getRenderApiBaseUrl() + path;
+  return new URL(url);
 }
 
 let currentMessageRuntimeSessionId: string | undefined;
@@ -128,6 +129,7 @@ function normalizeProvisioningSession(raw: unknown): ProvisioningSession {
 export async function startProvisioningSession(
   deviceName: string
 ): Promise<ProvisioningSession> {
+  console.log('=====', apiUrl('/provisioning/sessions'))
   const response = await fetch(apiUrl('/provisioning/sessions'), {
     method: 'POST',
     headers: {
