@@ -31,7 +31,6 @@ deploy/web/
 cd /opt/signal-web/Signal-Desktop
 pnpm install --frozen-lockfile
 pnpm run web:build
-cp deploy/web/runtime-config.production.js web-dist/runtime-config.js
 ```
 
 构建产物目录：

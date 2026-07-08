@@ -7,18 +7,16 @@ import { join } from 'node:path';
 
 const root = process.cwd();
 const outDir = join(root, 'web-dist');
+const runtimeConfigPath =
+  process.env.SIGNAL_WEB_RUNTIME_CONFIG ?? join(root, 'web', 'runtime-config.js');
 
 await mkdir(outDir, { recursive: true });
 await mkdir(join(outDir, 'stylesheets'), { recursive: true });
 
-for (const file of [
-  '404.html',
-  'runtime-config.js',
-  'web.css',
-  'chrome108-fallback.css',
-]) {
+for (const file of ['404.html', 'web.css', 'chrome108-fallback.css']) {
   await copyFile(join(root, 'web', file), join(outDir, file));
 }
+await copyFile(runtimeConfigPath, join(outDir, 'runtime-config.js'));
 
 const assetVersion = Date.now().toString();
 const indexHtml = await readFile(join(root, 'web', 'index.html'), 'utf8');

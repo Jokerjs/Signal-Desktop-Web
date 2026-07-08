@@ -13,9 +13,6 @@ declare global {
   }
 }
 
-const LOCAL_RENDER_API_PORT = '3100';
-const MY_RENDER_DEV_SERVER_PORT = '3001';
-
 function normalizeOptionalString(value: unknown): string | undefined {
   if (typeof value !== 'string') {
     return undefined;
@@ -41,43 +38,13 @@ export function getMyRenderRuntimeConfig(): RuntimeConfig | undefined {
   return { apiBaseUrl, cdnBaseUrl, sfuUrl };
 }
 
-export function resolveRenderApiBaseUrlFromHref(
-  href: string,
-  runtimeConfig = getMyRenderRuntimeConfig()
-): string {
-  const url = new URL(href);
-  const explicitApiBaseUrl = normalizeOptionalString(
-    url.searchParams.get('apiBase')
-  );
-  if (explicitApiBaseUrl) {
-    return explicitApiBaseUrl;
-  }
-
-  const configuredApiBaseUrl = runtimeConfig?.apiBaseUrl;
-  const isStandaloneFileMode = url.protocol === 'file:';
-  const isLocalHost =
-    url.hostname === '127.0.0.1' || url.hostname === 'localhost';
-  const defaultLocalApiBaseUrl = `${url.protocol}//${url.hostname}:${LOCAL_RENDER_API_PORT}`;
-
-  if (isStandaloneFileMode) {
-    return configuredApiBaseUrl ?? `http://127.0.0.1:${LOCAL_RENDER_API_PORT}`;
-  }
-
-  if (configuredApiBaseUrl) {
-    return configuredApiBaseUrl;
-  }
-
-  if (isLocalHost && url.port === MY_RENDER_DEV_SERVER_PORT) {
-    return url.origin;
-  }
-
-  return isLocalHost && url.port !== LOCAL_RENDER_API_PORT
-    ? defaultLocalApiBaseUrl
-    : url.origin;
-}
-
 export function getRenderApiBaseUrl(): string {
-  return resolveRenderApiBaseUrlFromHref(window.location.href);
+  const runtimeConfig = getMyRenderRuntimeConfig();
+  if (runtimeConfig?.apiBaseUrl) {
+    return runtimeConfig.apiBaseUrl;
+  }
+
+  throw new Error('Missing runtime config apiBaseUrl');
 }
 
 export function getRenderCdnBaseUrl(): string | undefined {

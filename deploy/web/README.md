@@ -36,7 +36,6 @@ cd /opt/signal-web/Signal-Desktop
 pnpm install --frozen-lockfile
 pnpm run web:build
 pnpm run web:build:server
-cp deploy/web/runtime-config.production.js web-dist/runtime-config.js
 ```
 
 上传静态页面和服务端产物：
@@ -193,6 +192,8 @@ CDN 地址覆盖项。普通部署保持为空。
 ## 前端运行时配置说明
 
 `runtime-config.js` 会被 `web/index.html` 和 `web-dist/index.html` 加载。
+执行 `pnpm run web:build` 时，`deploy/web/runtime-config.production.js`
+会被复制为 `web-dist/runtime-config.js`。
 
 生产环境需要对 `runtime-config.js` 和 `index.html` 禁用缓存。示例
 `nginx.production.conf` 已经为这两个文件设置了 `Cache-Control: no-store`；
