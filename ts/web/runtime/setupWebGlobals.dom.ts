@@ -46,6 +46,12 @@ import { deriveAccessKeyFromProfileKey } from '../../util/zkgroup.node.ts';
 import { getPinnedMessagesLimit } from '../../util/pinnedMessages.dom.ts';
 import { getPinnedMessageExpiresAt } from '../../util/pinnedMessages.std.ts';
 import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
+import { isBlocked } from '../../util/isBlocked.preload.ts';
+import {
+  isConversationEverUnregistered,
+  isConversationUnregistered,
+  isConversationUnregisteredAndStale,
+} from '../../util/isConversationUnregistered.dom.ts';
 import { DurationInSeconds } from '../../util/durations/duration-in-seconds.std.ts';
 import { INITIAL_EXPIRE_TIMER_VERSION } from '../../util/expirationTimer.std.ts';
 import { TimelineMessageLoadingState } from '../../util/timelineUtil.std.ts';
@@ -1729,6 +1735,28 @@ class WebConversationModel {
 
   public format(): ConversationRecord {
     return this.attributes;
+  }
+
+  public isEverUnregistered(): boolean {
+    return isConversationEverUnregistered(
+      this.attributes as ConversationAttributesType
+    );
+  }
+
+  public isUnregistered(): boolean {
+    return isConversationUnregistered(
+      this.attributes as ConversationAttributesType
+    );
+  }
+
+  public isUnregisteredAndStale(): boolean {
+    return isConversationUnregisteredAndStale(
+      this.attributes as ConversationAttributesType
+    );
+  }
+
+  public isBlocked(): boolean {
+    return isBlocked(this.attributes as ConversationAttributesType);
   }
 
   public onOpenStart(): void {}

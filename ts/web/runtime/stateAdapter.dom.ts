@@ -169,11 +169,27 @@ function mergeConversationForBootstrap({
   incoming: WebConversation;
   preserveExistingActivity: boolean;
 }>): WebConversation {
+  const shouldPreserveAcceptedMessageRequest =
+    existing?.messageRequestResponseType ===
+      Proto.SyncMessage.MessageRequestResponse.Type.ACCEPT &&
+    existing.acceptedMessageRequest === true &&
+    incoming.acceptedMessageRequest === false &&
+    incoming.profileSharing === false;
+  const localMessageRequestState = shouldPreserveAcceptedMessageRequest
+    ? {
+        acceptedMessageRequest: existing.acceptedMessageRequest,
+        messageRequestResponseType: existing.messageRequestResponseType,
+        profileSharing: existing.profileSharing,
+        removalStage: existing.removalStage,
+      }
+    : undefined;
+
   if (!existing || !preserveExistingActivity) {
     if (existing?.messagesDeleted === true && incoming.hasMessages !== true) {
       return {
         ...existing,
         ...incoming,
+        ...(localMessageRequestState ?? {}),
         activeAt: undefined,
         hasMessages: false,
         inboxPosition: undefined,
@@ -195,6 +211,7 @@ function mergeConversationForBootstrap({
     return {
       ...existing,
       ...incoming,
+      ...(localMessageRequestState ?? {}),
       left: incoming.left ?? existing?.left,
     };
   }
@@ -202,6 +219,7 @@ function mergeConversationForBootstrap({
   return {
     ...existing,
     ...incoming,
+    ...(localMessageRequestState ?? {}),
     activeAt: existing.activeAt,
     hasMessages: existing.hasMessages,
     inboxPosition: existing.inboxPosition,

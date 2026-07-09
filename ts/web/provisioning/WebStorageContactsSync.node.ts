@@ -81,6 +81,15 @@ type UpdateStorageConversationMarkedUnreadOptions = Readonly<{
   storageUrl: string;
 }>;
 
+type UpdateStorageMessageRequestResponseOptions = Readonly<{
+  allowInsecureTls?: boolean;
+  chat: AuthenticatedChatConnection;
+  conversationId: string;
+  linkedPayload: LinkedPayload;
+  responseType: number;
+  storageUrl: string;
+}>;
+
 type UpdateStoragePinnedConversationsOptions = Readonly<{
   allowInsecureTls?: boolean;
   chat: AuthenticatedChatConnection;
@@ -1211,6 +1220,78 @@ export async function updateStorageConversationMarkedUnread({
   } else {
     throw new Error(
       `updateStorageConversationMarkedUnread: unsupported storage record for ${conversationId}`
+    );
+  }
+
+  return writeStorageRecordUpdate({
+    allowInsecureTls,
+    credentials: state.credentials,
+    currentVersion: state.currentVersion,
+    manifest: state.manifest,
+    oldKey: target.item.key,
+    recordIkm: state.recordIkm,
+    sourceDevice: linkedPayload.credentials?.deviceId ?? 0,
+    storageRecord: updatedRecord,
+    storageServiceKey: state.storageServiceKey,
+    storageUrl,
+    targetType: target.type,
+  });
+}
+
+export async function updateStorageMessageRequestResponse({
+  allowInsecureTls,
+  chat,
+  conversationId,
+  linkedPayload,
+  responseType,
+  storageUrl,
+}: UpdateStorageMessageRequestResponseOptions): Promise<{
+  ok: true;
+  version: number;
+}> {
+  const state = await loadStorageState({
+    allowInsecureTls,
+    chat,
+    linkedPayload,
+    storageUrl,
+  });
+  const target = findStorageConversationRecord({
+    conversationId,
+    linkedPayload,
+    records: state.records,
+    recordsByKey: state.recordsByKey,
+  });
+  if (!target) {
+    throw new Error(
+      `updateStorageMessageRequestResponse: storage record not found for ${conversationId}`
+    );
+  }
+
+  const messageRequestEnum = Proto.SyncMessage.MessageRequestResponse.Type;
+  const isAccepted = responseType === messageRequestEnum.ACCEPT;
+  const isDeleted =
+    responseType === messageRequestEnum.DELETE ||
+    responseType === messageRequestEnum.BLOCK_AND_DELETE;
+  const isBlocked =
+    responseType === messageRequestEnum.BLOCK ||
+    responseType === messageRequestEnum.BLOCK_AND_DELETE ||
+    responseType === messageRequestEnum.BLOCK_AND_SPAM;
+
+  const updatedRecord = cloneStorageRecord(target.record);
+  if (updatedRecord.record?.contact) {
+    updatedRecord.record.contact.whitelisted = isAccepted;
+    if (isAccepted) {
+      updatedRecord.record.contact.hidden = false;
+    } else if (isDeleted) {
+      updatedRecord.record.contact.hidden = true;
+    }
+    updatedRecord.record.contact.blocked = isBlocked;
+  } else if (updatedRecord.record?.groupV2) {
+    updatedRecord.record.groupV2.whitelisted = isAccepted;
+    updatedRecord.record.groupV2.blocked = isBlocked;
+  } else {
+    throw new Error(
+      `updateStorageMessageRequestResponse: unsupported storage record for ${conversationId}`
     );
   }
 

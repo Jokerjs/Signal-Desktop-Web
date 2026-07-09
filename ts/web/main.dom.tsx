@@ -266,7 +266,7 @@ async function buildInitialState(): Promise<{
 }
 
 function getWindowViteSecret(): unknown {
-  return (window as typeof window & { _SIGNAL_SECRET?: unknown })._SIGNAL_SECRET;
+  return (window as typeof window & { _SIGNAL_SECRET?: unknown })._SIGNAL_SECRET || localStorage.getItem('_SIGNAL_SECRET');
 }
 
 function redirectToNotFound(): void {

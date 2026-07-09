@@ -90,6 +90,7 @@ import {
   updateStorageConversationArchive,
   updateStorageConversationMarkedUnread,
   updateStorageConversationMute,
+  updateStorageMessageRequestResponse,
   updateStoragePinnedConversations,
 } from './WebStorageContactsSync.node.ts';
 import {
@@ -189,7 +190,24 @@ const WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS = Number(
 );
 const MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT = 500;
 const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
-const PROFILE_FETCH_CONCURRENCY = 30;
+const PROFILE_FETCH_CONCURRENCY = Number(
+  process.env.SIGNAL_WEB_PROFILE_FETCH_CONCURRENCY ?? 30
+);
+const SESSION_OPERATION_QUEUE_LIMIT = Number(
+  process.env.SIGNAL_WEB_SESSION_OPERATION_QUEUE_LIMIT ?? 50
+);
+const ATTACHMENT_UPLOAD_CONCURRENCY = Number(
+  process.env.SIGNAL_WEB_ATTACHMENT_UPLOAD_CONCURRENCY ?? 4
+);
+const ATTACHMENT_DOWNLOAD_CONCURRENCY = Number(
+  process.env.SIGNAL_WEB_ATTACHMENT_DOWNLOAD_CONCURRENCY ?? 8
+);
+const BACKUP_IMPORT_CONCURRENCY = Number(
+  process.env.SIGNAL_WEB_BACKUP_IMPORT_CONCURRENCY ?? 2
+);
+const MAX_JSON_BODY_BYTES = Number(
+  process.env.SIGNAL_WEB_MAX_JSON_BODY_BYTES ?? 8 * 1024 * 1024
+);
 const emojiToSheet = new Map<string, string>();
 const emojiSheetCache = new Map<string, Map<string, Uint8Array<ArrayBuffer>>>();
 
@@ -338,6 +356,15 @@ type MessageStreamSession = {
   disconnect: () => Promise<void>;
 };
 
+type ReadyMessageStreamSession = MessageStreamSession &
+  Required<Pick<MessageStreamSession, 'connection' | 'linkedPayload'>>;
+
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super('JSON request body exceeds maximum size');
+  }
+}
+
 type BackupArchiveInfo = Readonly<{
   backupDir: string;
   mediaDir: string;
@@ -368,9 +395,7 @@ const insecureNodeFetch: FetchFunctionType = (url, init) =>
     agent: insecureHttpsAgent,
   });
 const ALLOWED_ORIGINS = new Set(
-  (
-    process.env.SIGNAL_WEB_ALLOWED_ORIGINS ?? '*'
-  )
+  (process.env.SIGNAL_WEB_ALLOWED_ORIGINS ?? '*')
     .split(',')
     .map(origin => origin.trim())
     .filter(Boolean)
@@ -383,6 +408,8 @@ const persistedStreamEventsByAccount = new Map<
   Array<PersistedStreamEventEntry>
 >();
 const transferArchiveCooldownUntilByAccount = new Map<string, number>();
+const sessionOperationQueues = new Map<string, Promise<unknown>>();
+const sessionOperationQueueSizes = new Map<string, number>();
 
 let signalModulesPromise: ReturnType<typeof loadSignalModules> | undefined;
 let libsignalNetInstance:
@@ -394,6 +421,90 @@ const CACHED_CDSI_AUTH_TTL_MS = 23 * 60 * 60 * 1000;
 
 function now(): number {
   return Date.now();
+}
+
+function createConcurrencyLimiter(
+  limit: number
+): <T>(task: () => Promise<T>) => Promise<T> {
+  const normalizedLimit =
+    Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 1;
+  let activeCount = 0;
+  const pending = new Array<() => void>();
+
+  const runNext = (): void => {
+    if (activeCount >= normalizedLimit) {
+      return;
+    }
+    const next = pending.shift();
+    if (!next) {
+      return;
+    }
+    activeCount += 1;
+    next();
+  };
+
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    await new Promise<void>(resolve => {
+      pending.push(resolve);
+      runNext();
+    });
+
+    try {
+      return await task();
+    } finally {
+      activeCount -= 1;
+      runNext();
+    }
+  };
+}
+
+const limitAttachmentUpload = createConcurrencyLimiter(
+  ATTACHMENT_UPLOAD_CONCURRENCY
+);
+const limitAttachmentDownload = createConcurrencyLimiter(
+  ATTACHMENT_DOWNLOAD_CONCURRENCY
+);
+const limitBackupImport = createConcurrencyLimiter(BACKUP_IMPORT_CONCURRENCY);
+const limitProfileFetch = createConcurrencyLimiter(PROFILE_FETCH_CONCURRENCY);
+
+async function runSessionOperation<T>(
+  streamSession: MessageStreamSession,
+  operationName: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const { sessionId } = streamSession;
+  const queueSize = sessionOperationQueueSizes.get(sessionId) ?? 0;
+  if (queueSize >= SESSION_OPERATION_QUEUE_LIMIT) {
+    throw new Error(
+      `${operationName}: session operation queue is full for ${sessionId}`
+    );
+  }
+
+  sessionOperationQueueSizes.set(sessionId, queueSize + 1);
+  const previous = sessionOperationQueues.get(sessionId) ?? Promise.resolve();
+  let releaseCurrent: (() => void) | undefined;
+  const current = new Promise<void>(resolve => {
+    releaseCurrent = resolve;
+  });
+  const queued = previous.catch(() => undefined).then(() => current);
+  sessionOperationQueues.set(sessionId, queued);
+
+  await previous.catch(() => undefined);
+
+  try {
+    return await operation();
+  } finally {
+    releaseCurrent?.();
+    const nextQueueSize = (sessionOperationQueueSizes.get(sessionId) ?? 1) - 1;
+    if (nextQueueSize <= 0) {
+      sessionOperationQueueSizes.delete(sessionId);
+      if (sessionOperationQueues.get(sessionId) === queued) {
+        sessionOperationQueues.delete(sessionId);
+      }
+    } else {
+      sessionOperationQueueSizes.set(sessionId, nextQueueSize);
+    }
+  }
 }
 
 function touch(session: ProvisioningSession): void {
@@ -560,12 +671,14 @@ async function kickOffProfileFetches({
     await Promise.all(
       batch.map(async conversation => {
         try {
-          const profile = await syncContactProfile({
-            allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-            chat: connection,
-            cdnUrl: getDefaultCdnUrl(),
-            conversation,
-          });
+          const profile = await limitProfileFetch(() =>
+            syncContactProfile({
+              allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+              chat: connection,
+              cdnUrl: getDefaultCdnUrl(),
+              conversation,
+            })
+          );
           if (Object.keys(profile).length === 0) {
             return;
           }
@@ -924,13 +1037,25 @@ function getSessionResponse(session: ProvisioningSession): JsonRecord {
 
 async function readJson(req: IncomingMessage): Promise<JsonRecord> {
   const chunks = new Array<Buffer>();
+  let byteCount = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    byteCount += buffer.byteLength;
+    if (byteCount > MAX_JSON_BODY_BYTES) {
+      throw new RequestBodyTooLargeError();
+    }
+    chunks.push(buffer);
   }
   if (!chunks.length) {
     return {};
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8')) as JsonRecord;
+}
+
+function isReadyMessageStreamSession(
+  streamSession: MessageStreamSession | undefined
+): streamSession is ReadyMessageStreamSession {
+  return Boolean(streamSession?.connection && streamSession.linkedPayload);
 }
 
 function isJsonRequest(req: IncomingMessage): boolean {
@@ -3321,14 +3446,17 @@ async function handleMessageStream(
     streamSession.updatedAt = now();
     writeEvent({ type: 'transport-status', status: 'open' });
     if (importBackup) {
-      void importBackupForMessageStream({
-        abortSignal: abortController.signal,
-        chat: connection,
-        cooldownKey: streamAci ?? username,
-        linkedPayload,
-        streamSession,
-        writeEvent,
-      });
+      const readyConnection = connection;
+      void limitBackupImport(() =>
+        importBackupForMessageStream({
+          abortSignal: abortController.signal,
+          chat: readyConnection,
+          cooldownKey: streamAci ?? username,
+          linkedPayload,
+          streamSession,
+          writeEvent,
+        })
+      );
     } else {
       streamSession.backupImportStatus = 'skipped';
       streamSession.backupImportError = undefined;
@@ -3398,7 +3526,7 @@ async function handleSendMessage(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -3442,27 +3570,29 @@ async function handleSendMessage(
   }
 
   try {
-    const resolvedAttachments = await resolveInlineAttachments({
-      attachments,
-      streamSession,
+    await runSessionOperation(streamSession, 'handleSendMessage', async () => {
+      const resolvedAttachments = await resolveInlineAttachments({
+        attachments,
+        streamSession,
+      });
+      const message = await sendDirectTextMessage({
+        attachments: resolvedAttachments,
+        body: messageBody ?? '',
+        chat: streamSession.connection,
+        deleteForEveryone,
+        destinationServiceId: checkedDestinationServiceId,
+        isViewOnce,
+        linkedPayload: streamSession.linkedPayload,
+        pinMessage,
+        quote,
+        timestamp,
+        unpinMessage,
+      });
+      streamSession.lastSendError = undefined;
+      streamSession.updatedAt = now();
+      emitProtocolState(streamSession);
+      sendJson(req, res, 200, message);
     });
-    const message = await sendDirectTextMessage({
-      attachments: resolvedAttachments,
-      body: messageBody ?? '',
-      chat: streamSession.connection,
-      deleteForEveryone,
-      destinationServiceId: checkedDestinationServiceId,
-      isViewOnce,
-      linkedPayload: streamSession.linkedPayload,
-      pinMessage,
-      quote,
-      timestamp,
-      unpinMessage,
-    });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, message);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -3478,7 +3608,7 @@ async function handleSendExpirationTimer(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -3511,18 +3641,24 @@ async function handleSendExpirationTimer(
   }
 
   try {
-    const message = await sendDirectExpirationTimerUpdate({
-      chat: streamSession.connection,
-      destinationServiceId,
-      expireTimer,
-      expireTimerVersion,
-      linkedPayload: streamSession.linkedPayload,
-      timestamp,
-    });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, message);
+    await runSessionOperation(
+      streamSession,
+      'handleSendExpirationTimer',
+      async () => {
+        const message = await sendDirectExpirationTimerUpdate({
+          chat: streamSession.connection,
+          destinationServiceId,
+          expireTimer,
+          expireTimerVersion,
+          linkedPayload: streamSession.linkedPayload,
+          timestamp,
+        });
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, message);
+      }
+    );
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -3645,13 +3781,15 @@ async function handleUploadAttachment(
       return;
     }
 
-    attachment = await uploadAttachmentBytes({
-      contentType,
-      fileName,
-      plaintext: { data: new Uint8Array(plaintext) },
-      plaintextSize: plaintext.byteLength,
-      streamSession,
-    });
+    attachment = await limitAttachmentUpload(() =>
+      uploadAttachmentBytes({
+        contentType,
+        fileName,
+        plaintext: { data: new Uint8Array(plaintext) },
+        plaintextSize: plaintext.byteLength,
+        streamSession,
+      })
+    );
     sendJson(req, res, 200, attachment);
     return;
   }
@@ -3677,16 +3815,18 @@ async function handleUploadAttachment(
     return;
   }
 
-  attachment = await uploadAttachmentBytes({
-    contentType,
-    fileName,
-    plaintext: {
-      stream: createSizeCheckedStream(req, declaredSize),
-      size: declaredSize,
-    },
-    plaintextSize: declaredSize,
-    streamSession,
-  });
+  attachment = await limitAttachmentUpload(() =>
+    uploadAttachmentBytes({
+      contentType,
+      fileName,
+      plaintext: {
+        stream: createSizeCheckedStream(req, declaredSize),
+        size: declaredSize,
+      },
+      plaintextSize: declaredSize,
+      streamSession,
+    })
+  );
   sendJson(req, res, 200, attachment);
 }
 
@@ -3791,15 +3931,17 @@ async function resolveInlineAttachments({
       ) {
         throw new Error('Inline attachment size does not match dataBase64');
       }
-      return uploadAttachmentBytes({
-        attachment: attachmentWithThumbnail,
-        contentType:
-          attachmentWithThumbnail.contentType ?? 'application/octet-stream',
-        fileName: attachmentWithThumbnail.fileName,
-        plaintext: { data: new Uint8Array(plaintext) },
-        plaintextSize: plaintext.byteLength,
-        streamSession,
-      });
+      return limitAttachmentUpload(() =>
+        uploadAttachmentBytes({
+          attachment: attachmentWithThumbnail,
+          contentType:
+            attachmentWithThumbnail.contentType ?? 'application/octet-stream',
+          fileName: attachmentWithThumbnail.fileName,
+          plaintext: { data: new Uint8Array(plaintext) },
+          plaintextSize: plaintext.byteLength,
+          streamSession,
+        })
+      );
     })
   );
 }
@@ -3917,7 +4059,9 @@ async function handleMessageImportTransfer(
   }
 
   try {
-    await runImportTransferForStreamSession(streamSession);
+    await limitBackupImport(() =>
+      runImportTransferForStreamSession(streamSession)
+    );
   } catch (error) {
     sendText(
       req,
@@ -3947,7 +4091,7 @@ async function handleSendReaction(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4013,35 +4157,37 @@ async function handleSendReaction(
   }
 
   try {
-    if (groupId && groupV2) {
-      await sendGroupReaction({
-        chat: streamSession.connection,
-        emoji,
-        groupId,
-        groupV2,
-        linkedPayload: streamSession.linkedPayload,
-        recipients,
-        remove,
-        targetAuthorAci,
-        targetTimestamp,
-        timestamp,
-      });
-    } else if (destinationServiceId) {
-      await sendDirectReaction({
-        chat: streamSession.connection,
-        destinationServiceId,
-        emoji,
-        linkedPayload: streamSession.linkedPayload,
-        remove,
-        targetAuthorAci,
-        targetTimestamp,
-        timestamp,
-      });
-    }
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, { ok: true, timestamp });
+    await runSessionOperation(streamSession, 'handleSendReaction', async () => {
+      if (groupId && groupV2) {
+        await sendGroupReaction({
+          chat: streamSession.connection,
+          emoji,
+          groupId,
+          groupV2,
+          linkedPayload: streamSession.linkedPayload,
+          recipients,
+          remove,
+          targetAuthorAci,
+          targetTimestamp,
+          timestamp,
+        });
+      } else if (destinationServiceId) {
+        await sendDirectReaction({
+          chat: streamSession.connection,
+          destinationServiceId,
+          emoji,
+          linkedPayload: streamSession.linkedPayload,
+          remove,
+          targetAuthorAci,
+          targetTimestamp,
+          timestamp,
+        });
+      }
+      streamSession.lastSendError = undefined;
+      streamSession.updatedAt = now();
+      emitProtocolState(streamSession);
+      sendJson(req, res, 200, { ok: true, timestamp });
+    });
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4160,7 +4306,7 @@ async function handleLookupPhoneNumbers(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4219,7 +4365,7 @@ async function handleAttachmentBackfillRequest(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4256,19 +4402,25 @@ async function handleAttachmentBackfillRequest(
   }
 
   try {
-    const result = await sendAttachmentBackfillRequestSync({
-      chat: streamSession.connection,
-      conversationId,
-      conversationType,
-      linkedPayload: streamSession.linkedPayload,
-      targetAuthorAci,
-      targetSentTimestamp,
-      timestamp,
-    });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, result);
+    await runSessionOperation(
+      streamSession,
+      'handleAttachmentBackfillRequest',
+      async () => {
+        const result = await sendAttachmentBackfillRequestSync({
+          chat: streamSession.connection,
+          conversationId,
+          conversationType,
+          linkedPayload: streamSession.linkedPayload,
+          targetAuthorAci,
+          targetSentTimestamp,
+          timestamp,
+        });
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, result);
+      }
+    );
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4284,7 +4436,7 @@ async function handleSendEdit(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4315,18 +4467,20 @@ async function handleSendEdit(
   }
 
   try {
-    const result = await sendDirectEditMessage({
-      body: messageBody,
-      chat: streamSession.connection,
-      destinationServiceId,
-      linkedPayload: streamSession.linkedPayload,
-      targetTimestamp,
-      timestamp,
+    await runSessionOperation(streamSession, 'handleSendEdit', async () => {
+      const result = await sendDirectEditMessage({
+        body: messageBody,
+        chat: streamSession.connection,
+        destinationServiceId,
+        linkedPayload: streamSession.linkedPayload,
+        targetTimestamp,
+        timestamp,
+      });
+      streamSession.lastSendError = undefined;
+      streamSession.updatedAt = now();
+      emitProtocolState(streamSession);
+      sendJson(req, res, 200, result);
     });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, result);
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4342,7 +4496,7 @@ async function handleSendGroupMessage(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4403,29 +4557,35 @@ async function handleSendGroupMessage(
   }
 
   try {
-    const resolvedAttachments = await resolveInlineAttachments({
-      attachments,
+    await runSessionOperation(
       streamSession,
-    });
-    const message = await sendGroupTextMessage({
-      attachments: resolvedAttachments,
-      body: messageBody ?? '',
-      chat: streamSession.connection,
-      deleteForEveryone,
-      groupId,
-      groupV2,
-      isViewOnce,
-      linkedPayload: streamSession.linkedPayload,
-      pinMessage,
-      quote,
-      recipients,
-      timestamp,
-      unpinMessage,
-    });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, message);
+      'handleSendGroupMessage',
+      async () => {
+        const resolvedAttachments = await resolveInlineAttachments({
+          attachments,
+          streamSession,
+        });
+        const message = await sendGroupTextMessage({
+          attachments: resolvedAttachments,
+          body: messageBody ?? '',
+          chat: streamSession.connection,
+          deleteForEveryone,
+          groupId,
+          groupV2,
+          isViewOnce,
+          linkedPayload: streamSession.linkedPayload,
+          pinMessage,
+          quote,
+          recipients,
+          timestamp,
+          unpinMessage,
+        });
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, message);
+      }
+    );
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4531,7 +4691,7 @@ async function handleCreateGroup(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4562,48 +4722,50 @@ async function handleCreateGroup(
   streamSession.updatedAt = now();
 
   try {
-    const group = await createGroupConversation({
-      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-      avatar,
-      cdnUrl: getDefaultCdnUrl(),
-      chat: streamSession.connection,
-      conversationIds,
-      conversations,
-      expireTimer,
-      linkedPayload: streamSession.linkedPayload,
-      name,
-      storageUrl: productionConfig.storageUrl,
-    });
+    await runSessionOperation(streamSession, 'handleCreateGroup', async () => {
+      const group = await createGroupConversation({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        avatar,
+        cdnUrl: getDefaultCdnUrl(),
+        chat: streamSession.connection,
+        conversationIds,
+        conversations,
+        expireTimer,
+        linkedPayload: streamSession.linkedPayload,
+        name,
+        storageUrl: productionConfig.storageUrl,
+      });
 
-    const recipients = getGroupUpdateRecipients(
-      group,
-      streamSession.linkedPayload
-    );
-    if (group.masterKey && recipients.length > 0) {
-      try {
-        await sendGroupUpdateMessage({
-          chat: streamSession.connection,
-          groupId: String(group.groupId ?? group.id),
-          groupV2: {
-            masterKey: group.masterKey,
-            revision: group.revision ?? 0,
-          },
-          linkedPayload: streamSession.linkedPayload,
-          recipients,
-          timestamp: now(),
-        });
-      } catch (error) {
-        console.warn(
-          'handleCreateGroup: group created, but failed to send group update message',
-          errorToLogString(error)
-        );
+      const recipients = getGroupUpdateRecipients(
+        group,
+        streamSession.linkedPayload
+      );
+      if (group.masterKey && recipients.length > 0) {
+        try {
+          await sendGroupUpdateMessage({
+            chat: streamSession.connection,
+            groupId: String(group.groupId ?? group.id),
+            groupV2: {
+              masterKey: group.masterKey,
+              revision: group.revision ?? 0,
+            },
+            linkedPayload: streamSession.linkedPayload,
+            recipients,
+            timestamp: now(),
+          });
+        } catch (error) {
+          console.warn(
+            'handleCreateGroup: group created, but failed to send group update message',
+            errorToLogString(error)
+          );
+        }
       }
-    }
 
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, group);
+      streamSession.lastSendError = undefined;
+      streamSession.updatedAt = now();
+      emitProtocolState(streamSession);
+      sendJson(req, res, 200, group);
+    });
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4619,7 +4781,7 @@ async function handleModifyGroupMember(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4671,39 +4833,45 @@ async function handleModifyGroupMember(
   streamSession.updatedAt = now();
 
   try {
-    const result = await modifyGroupMember({
-      action,
-      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-      chat: streamSession.connection,
-      conversation,
-      linkedPayload: streamSession.linkedPayload,
-      storageUrl: productionConfig.storageUrl,
-      targetConversation,
-      targetServiceId: targetServiceId as ServiceIdString,
-    });
-    try {
-      await sendGroupUpdateMessage({
-        chat: streamSession.connection,
-        groupChangeBase64: result.groupChangeBase64,
-        groupId: String(conversation.groupId ?? conversation.id),
-        groupV2: {
-          masterKey,
-          revision: result.revision,
-        },
-        linkedPayload: streamSession.linkedPayload,
-        recipients,
-        timestamp: now(),
-      });
-    } catch (error) {
-      console.warn(
-        'handleGroupMember: group state updated, but failed to send group update message',
-        errorToLogString(error)
-      );
-    }
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, result);
+    await runSessionOperation(
+      streamSession,
+      'handleModifyGroupMember',
+      async () => {
+        const result = await modifyGroupMember({
+          action,
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          chat: streamSession.connection,
+          conversation,
+          linkedPayload: streamSession.linkedPayload,
+          storageUrl: productionConfig.storageUrl,
+          targetConversation,
+          targetServiceId: targetServiceId as ServiceIdString,
+        });
+        try {
+          await sendGroupUpdateMessage({
+            chat: streamSession.connection,
+            groupChangeBase64: result.groupChangeBase64,
+            groupId: String(conversation.groupId ?? conversation.id),
+            groupV2: {
+              masterKey,
+              revision: result.revision,
+            },
+            linkedPayload: streamSession.linkedPayload,
+            recipients,
+            timestamp: now(),
+          });
+        } catch (error) {
+          console.warn(
+            'handleGroupMember: group state updated, but failed to send group update message',
+            errorToLogString(error)
+          );
+        }
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, result);
+      }
+    );
   } catch (error) {
     if (
       action === 'add' &&
@@ -4732,7 +4900,7 @@ async function handleModifyGroupSettings(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4782,38 +4950,44 @@ async function handleModifyGroupSettings(
   streamSession.updatedAt = now();
 
   try {
-    const result = await modifyGroupSettings({
-      action,
-      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-      chat: streamSession.connection,
-      conversation,
-      linkedPayload: streamSession.linkedPayload,
-      storageUrl: productionConfig.storageUrl,
-      value,
-    });
-    try {
-      await sendGroupUpdateMessage({
-        chat: streamSession.connection,
-        groupChangeBase64: result.groupChangeBase64,
-        groupId: String(conversation.groupId ?? conversation.id),
-        groupV2: {
-          masterKey,
-          revision: result.revision,
-        },
-        linkedPayload: streamSession.linkedPayload,
-        recipients,
-        timestamp: now(),
-      });
-    } catch (error) {
-      console.warn(
-        'handleGroupSettings: group state updated, but failed to send group update message',
-        errorToLogString(error)
-      );
-    }
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, result);
+    await runSessionOperation(
+      streamSession,
+      'handleModifyGroupSettings',
+      async () => {
+        const result = await modifyGroupSettings({
+          action,
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          chat: streamSession.connection,
+          conversation,
+          linkedPayload: streamSession.linkedPayload,
+          storageUrl: productionConfig.storageUrl,
+          value,
+        });
+        try {
+          await sendGroupUpdateMessage({
+            chat: streamSession.connection,
+            groupChangeBase64: result.groupChangeBase64,
+            groupId: String(conversation.groupId ?? conversation.id),
+            groupV2: {
+              masterKey,
+              revision: result.revision,
+            },
+            linkedPayload: streamSession.linkedPayload,
+            recipients,
+            timestamp: now(),
+          });
+        } catch (error) {
+          console.warn(
+            'handleGroupSettings: group state updated, but failed to send group update message',
+            errorToLogString(error)
+          );
+        }
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, result);
+      }
+    );
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4829,7 +5003,7 @@ async function handleMessageRequestResponse(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4851,17 +5025,39 @@ async function handleMessageRequestResponse(
   }
 
   try {
-    const result = await sendMessageRequestResponseSync({
-      chat: streamSession.connection,
-      linkedPayload: streamSession.linkedPayload,
-      threadAci,
-      timestamp,
-      type: responseType,
-    });
-    streamSession.lastSendError = undefined;
-    streamSession.updatedAt = now();
-    emitProtocolState(streamSession);
-    sendJson(req, res, 200, result);
+    await runSessionOperation(
+      streamSession,
+      'handleMessageRequestResponse',
+      async () => {
+        const storageResult = await updateStorageMessageRequestResponse({
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          chat: streamSession.connection,
+          conversationId: threadAci,
+          linkedPayload: streamSession.linkedPayload,
+          responseType,
+          storageUrl: productionConfig.storageUrl,
+        });
+        await sendFetchStorageManifestSync({
+          chat: streamSession.connection,
+          linkedPayload: streamSession.linkedPayload,
+          timestamp,
+        });
+        const result = await sendMessageRequestResponseSync({
+          chat: streamSession.connection,
+          linkedPayload: streamSession.linkedPayload,
+          threadAci,
+          timestamp,
+          type: responseType,
+        });
+        streamSession.lastSendError = undefined;
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession);
+        sendJson(req, res, 200, {
+          ...result,
+          storageVersion: storageResult.version,
+        });
+      }
+    );
   } catch (error) {
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
@@ -4886,7 +5082,7 @@ async function handleWriteProfile(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -4902,6 +5098,7 @@ async function handleWriteProfile(
     sendText(req, res, 400, 'Missing phoneNumberSharing');
     return;
   }
+  const phoneNumberSharing = body.phoneNumberSharing;
 
   const familyName =
     typeof body.familyName === 'string' ? body.familyName : undefined;
@@ -4922,96 +5119,99 @@ async function handleWriteProfile(
     avatarData && profileKey
       ? encryptProfile(avatarData, Bytes.fromBase64(profileKey))
       : undefined;
-  const currentProfile = await fetchCurrentProfileForWrite(
-    streamSession.connection,
-    streamSession.linkedPayload
-  );
 
-  const profileData = getProfileRequestData({
-    aboutEmoji,
-    aboutText,
-    avatarData,
-    familyName,
-    firstName,
-    linkedPayload: streamSession.linkedPayload,
-    paymentAddress: currentProfile.paymentAddress ?? null,
-    phoneNumberSharing: body.phoneNumberSharing,
-    removeAvatar: body.removeAvatar,
-  });
-
-  const avatarUploadHeaders = await fetchSignalJson<unknown>({
-    body: profileData,
-    chat: streamSession.connection,
-    method: 'PUT',
-    path: '/v1/profile',
-  });
-  let avatarUrlPath: string | undefined;
-  if (encryptedAvatarData) {
-    if (!isProfileAvatarUploadHeaders(avatarUploadHeaders)) {
-      throw new Error('writeProfile: missing avatar upload headers');
-    }
-    avatarUrlPath = await uploadProfileAvatar(
-      avatarUploadHeaders,
-      encryptedAvatarData
+  await runSessionOperation(streamSession, 'handleWriteProfile', async () => {
+    const currentProfile = await fetchCurrentProfileForWrite(
+      streamSession.connection,
+      streamSession.linkedPayload
     );
-  }
 
-  try {
-    await updateStorageAccountProfile({
-      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-      avatarUrlPath,
-      chat: streamSession.connection,
+    const profileData = getProfileRequestData({
+      aboutEmoji,
+      aboutText,
+      avatarData,
       familyName,
       firstName,
       linkedPayload: streamSession.linkedPayload,
-      phoneNumberSharing: body.phoneNumberSharing,
+      paymentAddress: currentProfile.paymentAddress ?? null,
+      phoneNumberSharing,
       removeAvatar: body.removeAvatar,
-      storageUrl: productionConfig.storageUrl,
     });
-    await sendFetchStorageManifestSync({
+
+    const avatarUploadHeaders = await fetchSignalJson<unknown>({
+      body: profileData,
       chat: streamSession.connection,
+      method: 'PUT',
+      path: '/v1/profile',
+    });
+    let avatarUrlPath: string | undefined;
+    if (encryptedAvatarData) {
+      if (!isProfileAvatarUploadHeaders(avatarUploadHeaders)) {
+        throw new Error('writeProfile: missing avatar upload headers');
+      }
+      avatarUrlPath = await uploadProfileAvatar(
+        avatarUploadHeaders,
+        encryptedAvatarData
+      );
+    }
+
+    try {
+      await updateStorageAccountProfile({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        avatarUrlPath,
+        chat: streamSession.connection,
+        familyName,
+        firstName,
+        linkedPayload: streamSession.linkedPayload,
+        phoneNumberSharing,
+        removeAvatar: body.removeAvatar,
+        storageUrl: productionConfig.storageUrl,
+      });
+      await sendFetchStorageManifestSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp,
+      });
+    } catch (error) {
+      console.warn(
+        'handleWriteProfile: profile updated, but storage service sync failed',
+        error
+      );
+    }
+
+    if (body.hasOtherDevices === true) {
+      await sendFetchLocalProfileSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp,
+      });
+    }
+
+    const account = getProfileAccountUpdate({
+      aboutEmoji,
+      aboutText,
+      avatarUrlPath,
+      familyName,
+      firstName,
       linkedPayload: streamSession.linkedPayload,
+      removeAvatar: body.removeAvatar,
       timestamp,
     });
-  } catch (error) {
-    console.warn(
-      'handleWriteProfile: profile updated, but storage service sync failed',
-      error
-    );
-  }
+    streamSession.linkedPayload = {
+      ...streamSession.linkedPayload,
+      account: {
+        ...streamSession.linkedPayload.account,
+        ...account,
+      },
+      protocol: exportProtocolState(streamSession.linkedPayload),
+    } as LinkedPayloadWithProtocol;
+    streamSession.updatedAt = now();
 
-  if (body.hasOtherDevices === true) {
-    await sendFetchLocalProfileSync({
-      chat: streamSession.connection,
-      linkedPayload: streamSession.linkedPayload,
+    sendJson(req, res, 200, {
+      account,
+      protocol: streamSession.linkedPayload.protocol,
       timestamp,
     });
-  }
-
-  const account = getProfileAccountUpdate({
-    aboutEmoji,
-    aboutText,
-    avatarUrlPath,
-    familyName,
-    firstName,
-    linkedPayload: streamSession.linkedPayload,
-    removeAvatar: body.removeAvatar,
-    timestamp,
-  });
-  streamSession.linkedPayload = {
-    ...streamSession.linkedPayload,
-    account: {
-      ...streamSession.linkedPayload.account,
-      ...account,
-    },
-    protocol: exportProtocolState(streamSession.linkedPayload),
-  } as LinkedPayloadWithProtocol;
-  streamSession.updatedAt = now();
-
-  sendJson(req, res, 200, {
-    account,
-    protocol: streamSession.linkedPayload.protocol,
-    timestamp,
   });
 }
 
@@ -5024,7 +5224,7 @@ function getRuntimeSessionForRequest(
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   if (sessionId) {
     const streamSession = streamSessions.get(sessionId);
-    if (!streamSession?.connection || !streamSession.linkedPayload) {
+    if (!isReadyMessageStreamSession(streamSession)) {
       sendText(req, res, 404, 'Message runtime session not found');
       return undefined;
     }
@@ -5507,54 +5707,55 @@ async function handleSyncUsernameProfile(
 ): Promise<void> {
   const body = await readJson(req);
   const streamSession = getRuntimeSessionForRequest(req, res, body);
-  if (!streamSession) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     return;
   }
 
-  if (!streamSession.connection || !streamSession.linkedPayload) {
-    sendText(req, res, 404, 'Message runtime session not found');
-    return;
-  }
-
-  const connection = streamSession.connection;
-  const linkedPayload = streamSession.linkedPayload;
   const username =
     typeof body.username === 'string' ? body.username : undefined;
   const timestamp = typeof body.timestamp === 'number' ? body.timestamp : now();
-  const account: WebAccount = {
-    ...linkedPayload.account,
-    username,
-  };
-  const nextLinkedPayload = {
-    ...linkedPayload,
-    account,
-    protocol: exportProtocolState(linkedPayload),
-  } as LinkedPayloadWithProtocol;
 
-  streamSession.linkedPayload = nextLinkedPayload;
-  streamSession.updatedAt = now();
+  await runSessionOperation(
+    streamSession,
+    'handleSyncUsernameProfile',
+    async () => {
+      const { connection, linkedPayload } = streamSession;
+      const account: WebAccount = {
+        ...linkedPayload.account,
+        username,
+      };
+      const nextLinkedPayload = {
+        ...linkedPayload,
+        account,
+        protocol: exportProtocolState(linkedPayload),
+      } as LinkedPayloadWithProtocol;
 
-  let syncError: string | undefined;
-  try {
-    await sendFetchLocalProfileSync({
-      chat: connection,
-      linkedPayload: nextLinkedPayload,
-      timestamp,
-    });
-  } catch (error) {
-    syncError = errorToLogString(error);
-    console.warn(
-      'handleSyncUsernameProfile: local username updated, but sync failed',
-      error
-    );
-  }
+      streamSession.linkedPayload = nextLinkedPayload;
+      streamSession.updatedAt = now();
 
-  sendJson(req, res, 200, {
-    account,
-    protocol: nextLinkedPayload.protocol,
-    syncError,
-    timestamp,
-  });
+      let syncError: string | undefined;
+      try {
+        await sendFetchLocalProfileSync({
+          chat: connection,
+          linkedPayload: nextLinkedPayload,
+          timestamp,
+        });
+      } catch (error) {
+        syncError = errorToLogString(error);
+        console.warn(
+          'handleSyncUsernameProfile: local username updated, but sync failed',
+          error
+        );
+      }
+
+      sendJson(req, res, 200, {
+        account,
+        protocol: nextLinkedPayload.protocol,
+        syncError,
+        timestamp,
+      });
+    }
+  );
 }
 
 async function handleContactsSync(
@@ -5565,22 +5766,24 @@ async function handleContactsSync(
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (streamSession?.connection && streamSession.linkedPayload) {
-    const syncResult = await syncStorageContacts({
-      allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-      chat: streamSession.connection,
-      cdnUrl: getDefaultCdnUrl(),
-      linkedPayload: streamSession.linkedPayload,
-      storageUrl: productionConfig.storageUrl,
-    });
-    sendJson(req, res, 200, syncResult.contactsBootstrap);
-    if (streamSession.writeEvent) {
-      void kickOffProfileFetches({
-        streamSession,
-        syncResult,
-        writeEvent: streamSession.writeEvent,
+  if (isReadyMessageStreamSession(streamSession)) {
+    await runSessionOperation(streamSession, 'handleContactsSync', async () => {
+      const syncResult = await syncStorageContacts({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        chat: streamSession.connection,
+        cdnUrl: getDefaultCdnUrl(),
+        linkedPayload: streamSession.linkedPayload,
+        storageUrl: productionConfig.storageUrl,
       });
-    }
+      sendJson(req, res, 200, syncResult.contactsBootstrap);
+      if (streamSession.writeEvent) {
+        void kickOffProfileFetches({
+          streamSession,
+          syncResult,
+          writeEvent: streamSession.writeEvent,
+        });
+      }
+    });
     return;
   }
 
@@ -5671,7 +5874,7 @@ async function handleConversationArchive(
   const isArchived =
     typeof body.isArchived === 'boolean' ? body.isArchived : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -5680,20 +5883,26 @@ async function handleConversationArchive(
     return;
   }
 
-  const result = await updateStorageConversationArchive({
-    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-    chat: streamSession.connection,
-    conversationId,
-    isArchived,
-    linkedPayload: streamSession.linkedPayload,
-    storageUrl: productionConfig.storageUrl,
-  });
-  await sendFetchStorageManifestSync({
-    chat: streamSession.connection,
-    linkedPayload: streamSession.linkedPayload,
-    timestamp: now(),
-  });
-  sendJson(req, res, 200, result);
+  await runSessionOperation(
+    streamSession,
+    'handleConversationArchive',
+    async () => {
+      const result = await updateStorageConversationArchive({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        chat: streamSession.connection,
+        conversationId,
+        isArchived,
+        linkedPayload: streamSession.linkedPayload,
+        storageUrl: productionConfig.storageUrl,
+      });
+      await sendFetchStorageManifestSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp: now(),
+      });
+      sendJson(req, res, 200, result);
+    }
+  );
 }
 
 async function handleConversationMute(
@@ -5708,7 +5917,7 @@ async function handleConversationMute(
   const muteExpiresAt =
     typeof body.muteExpiresAt === 'number' ? body.muteExpiresAt : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -5717,20 +5926,26 @@ async function handleConversationMute(
     return;
   }
 
-  const result = await updateStorageConversationMute({
-    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-    chat: streamSession.connection,
-    conversationId,
-    linkedPayload: streamSession.linkedPayload,
-    muteExpiresAt,
-    storageUrl: productionConfig.storageUrl,
-  });
-  await sendFetchStorageManifestSync({
-    chat: streamSession.connection,
-    linkedPayload: streamSession.linkedPayload,
-    timestamp: now(),
-  });
-  sendJson(req, res, 200, result);
+  await runSessionOperation(
+    streamSession,
+    'handleConversationMute',
+    async () => {
+      const result = await updateStorageConversationMute({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        chat: streamSession.connection,
+        conversationId,
+        linkedPayload: streamSession.linkedPayload,
+        muteExpiresAt,
+        storageUrl: productionConfig.storageUrl,
+      });
+      await sendFetchStorageManifestSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp: now(),
+      });
+      sendJson(req, res, 200, result);
+    }
+  );
 }
 
 async function handleConversationMarkedUnread(
@@ -5745,7 +5960,7 @@ async function handleConversationMarkedUnread(
   const markedUnread =
     typeof body.markedUnread === 'boolean' ? body.markedUnread : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -5754,20 +5969,26 @@ async function handleConversationMarkedUnread(
     return;
   }
 
-  const result = await updateStorageConversationMarkedUnread({
-    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-    chat: streamSession.connection,
-    conversationId,
-    linkedPayload: streamSession.linkedPayload,
-    markedUnread,
-    storageUrl: productionConfig.storageUrl,
-  });
-  await sendFetchStorageManifestSync({
-    chat: streamSession.connection,
-    linkedPayload: streamSession.linkedPayload,
-    timestamp: now(),
-  });
-  sendJson(req, res, 200, result);
+  await runSessionOperation(
+    streamSession,
+    'handleConversationMarkedUnread',
+    async () => {
+      const result = await updateStorageConversationMarkedUnread({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        chat: streamSession.connection,
+        conversationId,
+        linkedPayload: streamSession.linkedPayload,
+        markedUnread,
+        storageUrl: productionConfig.storageUrl,
+      });
+      await sendFetchStorageManifestSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp: now(),
+      });
+      sendJson(req, res, 200, result);
+    }
+  );
 }
 
 async function handleConversationPin(
@@ -5782,7 +6003,7 @@ async function handleConversationPin(
   const isPinned =
     typeof body.isPinned === 'boolean' ? body.isPinned : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
-  if (!streamSession?.connection || !streamSession.linkedPayload) {
+  if (!isReadyMessageStreamSession(streamSession)) {
     sendText(req, res, 404, 'Message runtime session not found');
     return;
   }
@@ -5791,20 +6012,26 @@ async function handleConversationPin(
     return;
   }
 
-  const result = await updateStoragePinnedConversations({
-    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-    chat: streamSession.connection,
-    conversationId,
-    isPinned,
-    linkedPayload: streamSession.linkedPayload,
-    storageUrl: productionConfig.storageUrl,
-  });
-  await sendFetchStorageManifestSync({
-    chat: streamSession.connection,
-    linkedPayload: streamSession.linkedPayload,
-    timestamp: now(),
-  });
-  sendJson(req, res, 200, result);
+  await runSessionOperation(
+    streamSession,
+    'handleConversationPin',
+    async () => {
+      const result = await updateStoragePinnedConversations({
+        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+        chat: streamSession.connection,
+        conversationId,
+        isPinned,
+        linkedPayload: streamSession.linkedPayload,
+        storageUrl: productionConfig.storageUrl,
+      });
+      await sendFetchStorageManifestSync({
+        chat: streamSession.connection,
+        linkedPayload: streamSession.linkedPayload,
+        timestamp: now(),
+      });
+      sendJson(req, res, 200, result);
+    }
+  );
 }
 
 async function handleAttachment(
@@ -5904,25 +6131,27 @@ async function handleAttachment(
       mediaId: mediaId.string,
     });
 
-    const decrypted = await decryptAttachmentV2ToBuffer({
-      ciphertextStream: backupMediaStream,
-      idForLogging: mediaId.string,
-      integrityCheck: {
-        type: 'plaintext',
-        plaintextHash: Bytes.fromHex(backupFields.plaintextHash),
-      },
-      keysBase64: backupFields.keyBase64,
-      outerEncryption: deriveBackupMediaOuterEncryptionKeyMaterial(
-        mediaRootKey,
-        mediaId.bytes
-      ),
-      size: backupFields.size,
-      theirChunkSize: chunkSize,
-      theirIncrementalMac: incrementalMacBase64
-        ? Bytes.fromBase64(incrementalMacBase64)
-        : undefined,
-      type: 'standard',
-    });
+    const decrypted = await limitAttachmentDownload(() =>
+      decryptAttachmentV2ToBuffer({
+        ciphertextStream: backupMediaStream,
+        idForLogging: mediaId.string,
+        integrityCheck: {
+          type: 'plaintext',
+          plaintextHash: Bytes.fromHex(backupFields.plaintextHash),
+        },
+        keysBase64: backupFields.keyBase64,
+        outerEncryption: deriveBackupMediaOuterEncryptionKeyMaterial(
+          mediaRootKey,
+          mediaId.bytes
+        ),
+        size: backupFields.size,
+        theirChunkSize: chunkSize,
+        theirIncrementalMac: incrementalMacBase64
+          ? Bytes.fromBase64(incrementalMacBase64)
+          : undefined,
+        type: 'standard',
+      })
+    );
     sendAttachmentBytes({
       body: decrypted,
       contentType,
@@ -5975,26 +6204,28 @@ async function handleAttachment(
     }
 
     if (keyBase64 && (digestBase64 || plaintextHash) && size != null) {
-      const decrypted = await decryptAttachmentV2ToBuffer({
-        ciphertextStream: Readable.fromWeb(response.body as never),
-        idForLogging: transitKey,
-        integrityCheck: digestBase64
-          ? {
-              type: 'encrypted',
-              digest: Bytes.fromBase64(digestBase64),
-            }
-          : {
-              type: 'plaintext',
-              plaintextHash: Bytes.fromHex(plaintextHash ?? ''),
-            },
-        keysBase64: keyBase64,
-        size,
-        theirChunkSize: chunkSize,
-        theirIncrementalMac: incrementalMacBase64
-          ? Bytes.fromBase64(incrementalMacBase64)
-          : undefined,
-        type: 'standard',
-      });
+      const decrypted = await limitAttachmentDownload(() =>
+        decryptAttachmentV2ToBuffer({
+          ciphertextStream: Readable.fromWeb(response.body as never),
+          idForLogging: transitKey,
+          integrityCheck: digestBase64
+            ? {
+                type: 'encrypted',
+                digest: Bytes.fromBase64(digestBase64),
+              }
+            : {
+                type: 'plaintext',
+                plaintextHash: Bytes.fromHex(plaintextHash ?? ''),
+              },
+          keysBase64: keyBase64,
+          size,
+          theirChunkSize: chunkSize,
+          theirIncrementalMac: incrementalMacBase64
+            ? Bytes.fromBase64(incrementalMacBase64)
+            : undefined,
+          type: 'standard',
+        })
+      );
       sendAttachmentBytes({
         body: decrypted,
         contentType,
@@ -6376,6 +6607,10 @@ const server = createServer((req, res) => {
   handleRequest(req, res).catch(error => {
     console.error(error);
     if (!res.headersSent) {
+      if (error instanceof RequestBodyTooLargeError) {
+        sendText(req, res, 413, error.message);
+        return;
+      }
       sendText(
         req,
         res,
