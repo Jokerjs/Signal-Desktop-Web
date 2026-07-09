@@ -3121,7 +3121,6 @@ async function handleMessageStream(
     sendAttemptCount: 0,
     linkedPayload,
     closeStream: () => {
-      console.log('=====断开连接了')
       if (didCloseStream) {
         return;
       }
