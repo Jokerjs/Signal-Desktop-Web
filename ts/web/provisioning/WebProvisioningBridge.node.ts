@@ -3121,6 +3121,7 @@ async function handleMessageStream(
     sendAttemptCount: 0,
     linkedPayload,
     closeStream: () => {
+      console.log('=====断开连接了')
       if (didCloseStream) {
         return;
       }
@@ -3503,9 +3504,13 @@ async function handleMessageStream(
     throw error;
   }
 
-  req.on('close', () => {
+  const closeStream = () => {
     streamSession.closeStream?.();
-  });
+  };
+  req.on('aborted', closeStream);
+  req.on('close', closeStream);
+  res.on('close', closeStream);
+  res.on('error', closeStream);
 }
 
 async function handleMessageStreamAck(
