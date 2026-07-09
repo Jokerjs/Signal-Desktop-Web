@@ -353,6 +353,7 @@ type MessageStreamSession = {
   };
   backupUnauthConnection?: UnauthenticatedChatConnection;
   writeEvent?: (event: unknown) => void;
+  closeStream?: () => void;
   disconnect: () => Promise<void>;
 };
 
@@ -3087,6 +3088,8 @@ async function handleMessageStream(
   const sessionId = randomUUID();
   const abortController = new AbortController();
   let connection: AuthenticatedChatConnection | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let didCloseStream = false;
   const streamAci =
     linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
 
@@ -3094,9 +3097,13 @@ async function handleMessageStream(
     if (existingSession.username === username) {
       existingSession.status = 'closed';
       existingSession.updatedAt = now();
-      void existingSession.disconnect().catch(() => undefined);
-      void cleanupAttachmentTmpDir(existingSession).catch(() => undefined);
-      streamSessions.delete(existingSessionId);
+      if (existingSession.closeStream) {
+        existingSession.closeStream();
+      } else {
+        void existingSession.disconnect().catch(() => undefined);
+        void cleanupAttachmentTmpDir(existingSession).catch(() => undefined);
+        streamSessions.delete(existingSessionId);
+      }
     }
   }
 
@@ -3113,6 +3120,26 @@ async function handleMessageStream(
     queueEmptyCount: 0,
     sendAttemptCount: 0,
     linkedPayload,
+    closeStream: () => {
+      if (didCloseStream) {
+        return;
+      }
+      didCloseStream = true;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+      abortController.abort();
+      void connection?.disconnect().catch(() => undefined);
+      void streamSession.backupUnauthConnection
+        ?.disconnect()
+        .catch(() => undefined);
+      void cleanupAttachmentTmpDir(streamSession).catch(() => undefined);
+      streamSessions.delete(sessionId);
+      if (!res.destroyed && !res.writableEnded) {
+        res.end();
+      }
+    },
     disconnect: async () => {
       abortController.abort();
       await connection?.disconnect();
@@ -3153,7 +3180,7 @@ async function handleMessageStream(
   writeEvent({ type: 'session', sessionId });
   writeEvent({ type: 'ready', sessionId });
   writeEvent({ type: 'transport-status', status: 'connecting' });
-  const heartbeat = setInterval(() => {
+  heartbeat = setInterval(() => {
     writeEvent({ type: 'heartbeat' });
   }, 25_000);
 
@@ -3477,14 +3504,7 @@ async function handleMessageStream(
   }
 
   req.on('close', () => {
-    clearInterval(heartbeat);
-    abortController.abort();
-    void connection?.disconnect().catch(() => undefined);
-    void streamSession.backupUnauthConnection
-      ?.disconnect()
-      .catch(() => undefined);
-    void cleanupAttachmentTmpDir(streamSession).catch(() => undefined);
-    streamSessions.delete(sessionId);
+    streamSession.closeStream?.();
   });
 }
 

@@ -3678,7 +3678,7 @@ export function WebDesktopApp({
     const showBackfillFailureModal = (kind: BackfillFailureModalKind): void => {
       window.reduxActions?.globalModals?.showBackfillFailureModal?.(kind);
     };
-    const handleEvent = (event: MessageStreamEvent) => {
+    const handleEvent = async (event: MessageStreamEvent): Promise<void> => {
       const currentLinkedSession = getCurrentLinkedSession();
       if (event.type === 'session') {
         runtimeSessionId = event.sessionId;
@@ -3910,15 +3910,11 @@ export function WebDesktopApp({
                   : ReadStatus.Unread,
               }
             : event.message;
-        let shouldDispatchMessage = false;
-        setShell(current => {
-          const nextMessages = appendUniqueMessagesSorted(current.messages, [
-            message,
-          ]);
-          if (nextMessages === current.messages) {
-            return current;
-          }
-          shouldDispatchMessage = true;
+        const current = shellRef.current;
+        const nextMessages = appendUniqueMessagesSorted(current.messages, [
+          message,
+        ]);
+        if (nextMessages !== current.messages) {
           const ourConversationId =
             currentLinkedSession.credentials?.aci ??
             currentLinkedSession.account.aci;
@@ -3931,16 +3927,19 @@ export function WebDesktopApp({
             ...withConversation,
             messages: nextMessages,
           };
-          persistShell(next);
+          shellRef.current = next;
+          setWebRuntimeChatShell(next);
+          setShell(next);
           dispatchConversation(
             currentLinkedSession,
             message.conversationId,
             next
           );
-          return next;
-        });
-        if (shouldDispatchMessage) {
           dispatchMessage({ ...event, message });
+          await persistChatShellStateToStorage(
+            next,
+            currentLinkedSession.credentials?.aci
+          );
         }
       } else if (event.type === 'pin-message') {
         void applyRemotePinnedMessage(event).then(applied => {
