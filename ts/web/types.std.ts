@@ -77,9 +77,9 @@ export type ProtocolState = Readonly<{
     pni?: IdentityKeyPair;
   }>;
   identityRecords: ReadonlyArray<unknown>;
-  preKeys: ReadonlyArray<unknown>;
+  preKeys: ReadonlyArray<ProtocolPreKeyRecord>;
   signedPreKeys: ReadonlyArray<unknown>;
-  kyberPreKeys: ReadonlyArray<unknown>;
+  kyberPreKeys: ReadonlyArray<ProtocolKyberPreKeyRecord>;
   sessions: ReadonlyArray<ProtocolSessionRecord>;
   senderKeys: ReadonlyArray<ProtocolSenderKeyRecord>;
 }>;
@@ -98,6 +98,19 @@ export type ProtocolSessionRecord = Readonly<{
 export type ProtocolSenderKeyRecord = Readonly<{
   namespace: string;
   senderKey: string;
+  recordBase64: string;
+}>;
+
+export type ProtocolPreKeyRecord = Readonly<{
+  namespace: string;
+  keyId: number;
+  recordBase64: string;
+}>;
+
+export type ProtocolKyberPreKeyRecord = Readonly<{
+  namespace: string;
+  keyId: number;
+  isLastResort?: boolean;
   recordBase64: string;
 }>;
 
@@ -284,67 +297,71 @@ export type WebPollTerminateEvent = Readonly<{
   timestamp: number;
 }>;
 
-export type WebMessage = Readonly<Partial<Omit<
-  ProcessedDataMessage,
-  | 'attachments'
-  | 'bodyAttachment'
-  | 'body'
-  | 'delete'
-  | 'adminDelete'
-  | 'pinMessage'
-  | 'reaction'
-  | 'timestamp'
-  | 'unpinMessage'
->> & {
-  id: string;
-  conversationId: string;
-  body?: string;
-  timestamp: number;
-  receivedAt?: number;
-  direction: 'incoming' | 'outgoing';
-  desktopType?:
-    | 'change-number-notification'
-    | 'chat-session-refreshed'
-    | 'delivery-issue'
-    | 'group-v2-change'
-    | 'incoming'
-    | 'joined-signal-notification'
-    | 'keychange'
-    | 'message-request-response-event'
-    | 'outgoing'
-    | 'pinned-message-notification'
-    | 'timer-notification'
-    | 'verified-change';
-  readStatus?: ReadStatus;
-  status?: 'queued' | 'sent' | 'delivered' | 'read' | 'error';
-  attachments?: ReadonlyArray<WebAttachment>;
-  sourceServiceId?: string;
-  reactions?: ReadonlyArray<MessageReactionType>;
-  editHistory?: ReadonlyArray<EditHistoryType>;
-  editMessageTimestamp?: number;
-  editMessageReceivedAt?: number;
-  editMessageReceivedAtMs?: number;
-  pinMessage?: WebPinMessage;
-  unpinMessage?: WebUnpinMessage;
-  poll?: PollMessageAttribute;
-  bodyAttachment?: WebAttachment;
-  deletedForEveryone?: boolean;
-  deletedForEveryoneByAdminAci?: string;
-  deletedForEveryoneTimestamp?: number;
-  expirationTimerUpdate?: {
-    expireTimer?: DurationInSeconds;
-    fromSync?: boolean;
-    source?: string;
+export type WebMessage = Readonly<
+  Partial<
+    Omit<
+      ProcessedDataMessage,
+      | 'attachments'
+      | 'bodyAttachment'
+      | 'body'
+      | 'delete'
+      | 'adminDelete'
+      | 'pinMessage'
+      | 'reaction'
+      | 'timestamp'
+      | 'unpinMessage'
+    >
+  > & {
+    id: string;
+    conversationId: string;
+    body?: string;
+    timestamp: number;
+    receivedAt?: number;
+    direction: 'incoming' | 'outgoing';
+    desktopType?:
+      | 'change-number-notification'
+      | 'chat-session-refreshed'
+      | 'delivery-issue'
+      | 'group-v2-change'
+      | 'incoming'
+      | 'joined-signal-notification'
+      | 'keychange'
+      | 'message-request-response-event'
+      | 'outgoing'
+      | 'pinned-message-notification'
+      | 'timer-notification'
+      | 'verified-change';
+    readStatus?: ReadStatus;
+    status?: 'queued' | 'sent' | 'delivered' | 'read' | 'error';
+    attachments?: ReadonlyArray<WebAttachment>;
     sourceServiceId?: string;
-  };
-  groupV2Change?: GroupV2ChangeType;
-  isErased?: boolean;
-  key_changed?: string;
-  messageRequestResponseEvent?: MessageRequestResponseEvent;
-  supportedVersionAtReceive?: number;
-  verified?: boolean;
-  verifiedChanged?: string;
-}>;
+    reactions?: ReadonlyArray<MessageReactionType>;
+    editHistory?: ReadonlyArray<EditHistoryType>;
+    editMessageTimestamp?: number;
+    editMessageReceivedAt?: number;
+    editMessageReceivedAtMs?: number;
+    pinMessage?: WebPinMessage;
+    unpinMessage?: WebUnpinMessage;
+    poll?: PollMessageAttribute;
+    bodyAttachment?: WebAttachment;
+    deletedForEveryone?: boolean;
+    deletedForEveryoneByAdminAci?: string;
+    deletedForEveryoneTimestamp?: number;
+    expirationTimerUpdate?: {
+      expireTimer?: DurationInSeconds;
+      fromSync?: boolean;
+      source?: string;
+      sourceServiceId?: string;
+    };
+    groupV2Change?: GroupV2ChangeType;
+    isErased?: boolean;
+    key_changed?: string;
+    messageRequestResponseEvent?: MessageRequestResponseEvent;
+    supportedVersionAtReceive?: number;
+    verified?: boolean;
+    verifiedChanged?: string;
+  }
+>;
 
 export type WebConversation = Readonly<{
   id: string;
@@ -529,9 +546,20 @@ type MessageStreamEventPayload =
   | WebTypingEvent
   | WebPollVoteEvent
   | WebPollTerminateEvent
-  | Readonly<{ type: 'message-status'; id: string; status: WebMessage['status'] }>
+  | Readonly<{
+      type: 'message-status';
+      id: string;
+      status: WebMessage['status'];
+    }>
   | Readonly<{ type: 'queue-empty' }>
-  | Readonly<{ type: 'error'; error: string }>;
+  | Readonly<{
+      type: 'error';
+      error: string;
+      timestamp?: number;
+      envelopeSize?: number;
+      lastDecryptionErrorRetry?: unknown;
+      lastDecryptionErrorRetryError?: string;
+    }>;
 
 export type MessageStreamEvent = MessageStreamEventPayload &
   Readonly<{ streamEventId?: string }>;

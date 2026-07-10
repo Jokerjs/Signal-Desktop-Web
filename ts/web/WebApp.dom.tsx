@@ -114,7 +114,9 @@ function formatTime(timestamp: number | undefined): string {
   }).format(timestamp);
 }
 
-function getConversationTitle(conversation: WebConversation | undefined): string {
+function getConversationTitle(
+  conversation: WebConversation | undefined
+): string {
   if (!conversation) {
     return '';
   }
@@ -129,7 +131,9 @@ function getConversationTitle(conversation: WebConversation | undefined): string
   );
 }
 
-function getConversationInitial(conversation: WebConversation | undefined): string {
+function getConversationInitial(
+  conversation: WebConversation | undefined
+): string {
   const title = getConversationTitle(conversation);
   return title.trim().slice(0, 1).toUpperCase() || '#';
 }
@@ -160,7 +164,8 @@ function ensureNoteToSelf(
   shell: ChatShellState,
   linkedSession: LinkedSessionRecord
 ): ChatShellState {
-  const sessionAci = linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  const sessionAci =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci;
   if (!sessionAci || shell.conversationLookup['note-to-self']) {
     return shell;
   }
@@ -281,12 +286,14 @@ function upsertConversation(
         ...conversation,
       },
     },
-    selectedConversationId:
-      shell.selectedConversationId ?? conversation.id,
+    selectedConversationId: shell.selectedConversationId ?? conversation.id,
   };
 }
 
-function upsertMessage(shell: ChatShellState, message: WebMessage): ChatShellState {
+function upsertMessage(
+  shell: ChatShellState,
+  message: WebMessage
+): ChatShellState {
   const messages = shell.messages.some(item => item.id === message.id)
     ? shell.messages.map(item => (item.id === message.id ? message : item))
     : [...shell.messages, message];
@@ -341,10 +348,7 @@ function QrCode({ url }: Readonly<{ url: string | undefined }>) {
   }, [url]);
 
   return (
-    <div
-      className="WebApp__qr"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className="WebApp__qr" dangerouslySetInnerHTML={{ __html: svg }} />
   );
 }
 
@@ -442,7 +446,9 @@ function ConversationAvatar({
   );
 }
 
-function MessageAttachment({ attachment }: Readonly<{ attachment: WebAttachment }>) {
+function MessageAttachment({
+  attachment,
+}: Readonly<{ attachment: WebAttachment }>) {
   const contentType = attachment.contentType ?? '';
   const url = buildAttachmentAccessUrl(attachment);
   if (contentType.startsWith('image/')) {
@@ -502,10 +508,16 @@ function SettingsView({
         <h2>账号</h2>
         <div className="WebApp__settingsRow">
           <div>
-            <strong>{linkedSession.account.title ?? linkedSession.credentials?.number}</strong>
+            <strong>
+              {linkedSession.account.title ?? linkedSession.credentials?.number}
+            </strong>
             <p>{linkedSession.credentials?.username}</p>
           </div>
-          <button className="WebApp__dangerButton" type="button" onClick={onLogout}>
+          <button
+            className="WebApp__dangerButton"
+            type="button"
+            onClick={onLogout}
+          >
             退出登录
           </button>
         </div>
@@ -521,7 +533,9 @@ function SettingsView({
           <input
             checked={settings.notifications}
             type="checkbox"
-            onChange={event => update('notifications', event.currentTarget.checked)}
+            onChange={event =>
+              update('notifications', event.currentTarget.checked)
+            }
           />
         </label>
       </div>
@@ -536,7 +550,9 @@ function SettingsView({
           <input
             checked={settings.readReceipts}
             type="checkbox"
-            onChange={event => update('readReceipts', event.currentTarget.checked)}
+            onChange={event =>
+              update('readReceipts', event.currentTarget.checked)
+            }
           />
         </label>
         <label className="WebApp__settingsRow">
@@ -576,7 +592,9 @@ function SettingsView({
         <div className="WebApp__settingsRow">
           <div>
             <strong>API 地址</strong>
-            <p>{settings.apiBaseUrl || window.__MY_RENDER_CONFIG__?.apiBaseUrl}</p>
+            <p>
+              {settings.apiBaseUrl || window.__MY_RENDER_CONFIG__?.apiBaseUrl}
+            </p>
           </div>
         </div>
         <div className="WebApp__settingsRow">
@@ -699,13 +717,18 @@ export function WebApp() {
         return;
       }
       if (event.type === 'protocol-state') {
-        if (linkedSession) {
-          void persistLinkedSessionRecordToIndexedDb({
-            ...linkedSession,
+        setLinkedSession(current => {
+          if (!current) {
+            return current;
+          }
+          const next: LinkedSessionRecord = {
+            ...current,
             lastUpdatedAt: Date.now(),
             protocol: event.protocol,
-          });
-        }
+          };
+          void persistLinkedSessionRecordToIndexedDb(next);
+          return next;
+        });
         return;
       }
       if (event.type === 'contacts-bootstrap' && linkedSession) {
@@ -733,7 +756,9 @@ export function WebApp() {
         return;
       }
       if (event.type === 'message-status') {
-        setChatShell(current => setMessageStatus(current, event.id, event.status));
+        setChatShell(current =>
+          setMessageStatus(current, event.id, event.status)
+        );
         return;
       }
       if (event.type === 'error') {
@@ -818,20 +843,19 @@ export function WebApp() {
         timestamp: localMessage.timestamp,
       });
       setChatShell(current =>
-        upsertMessage(
-          setMessageStatus(current, localMessage.id, 'sent'),
-          {
-            ...sent,
-            id: sent.id ?? localMessage.id,
-            conversationId: sent.conversationId ?? selectedConversation.id,
-            direction: 'outgoing',
-            timestamp: sent.timestamp ?? localMessage.timestamp,
-            status: sent.status ?? 'sent',
-          }
-        )
+        upsertMessage(setMessageStatus(current, localMessage.id, 'sent'), {
+          ...sent,
+          id: sent.id ?? localMessage.id,
+          conversationId: sent.conversationId ?? selectedConversation.id,
+          direction: 'outgoing',
+          timestamp: sent.timestamp ?? localMessage.timestamp,
+          status: sent.status ?? 'sent',
+        })
       );
     } catch (error) {
-      setChatShell(current => setMessageStatus(current, localMessage.id, 'error'));
+      setChatShell(current =>
+        setMessageStatus(current, localMessage.id, 'error')
+      );
       setStreamError(error instanceof Error ? error.message : String(error));
     }
   }, [composerValue, linkedSession, selectedConversation, transportSessionId]);
@@ -935,11 +959,18 @@ export function WebApp() {
           </>
         ) : (
           <div className="WebApp__conversationList">
-            <button className="WebApp__conversation WebApp__conversation--active" type="button">
-              <ConversationAvatar conversation={{ id: 'settings', title: '设置' }} />
+            <button
+              className="WebApp__conversation WebApp__conversation--active"
+              type="button"
+            >
+              <ConversationAvatar
+                conversation={{ id: 'settings', title: '设置' }}
+              />
               <span className="WebApp__conversationBody">
                 <span className="WebApp__conversationTitle">偏好设置</span>
-                <span className="WebApp__conversationSnippet">账号、隐私、通知</span>
+                <span className="WebApp__conversationSnippet">
+                  账号、隐私、通知
+                </span>
               </span>
             </button>
           </div>
@@ -1006,7 +1037,9 @@ export function WebApp() {
                 <textarea
                   placeholder="输入消息"
                   value={composerValue}
-                  onChange={event => setComposerValue(event.currentTarget.value)}
+                  onChange={event =>
+                    setComposerValue(event.currentTarget.value)
+                  }
                   onKeyDown={event => {
                     if (event.key === 'Enter' && !event.shiftKey) {
                       event.preventDefault();

@@ -1,8 +1,11 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { randomBytes } from 'node:crypto';
 import {
   CiphertextMessageType,
+  ContentHint,
+  DecryptionErrorMessage,
   Direction,
   ErrorCode,
   IdentityChange,
@@ -12,6 +15,7 @@ import {
   KyberPreKeyRecord,
   KyberPreKeyStore,
   PreKeyBundle,
+  PreKeyRecord,
   PreKeySignalMessage,
   PreKeyStore,
   PrivateKey,
@@ -75,6 +79,8 @@ import type {
   WebPinMessageEvent,
   WebPollTerminateEvent,
   WebPollVoteEvent,
+  ProtocolKyberPreKeyRecord,
+  ProtocolPreKeyRecord,
   ProtocolSenderKeyRecord,
   ProtocolSessionRecord,
   ProtocolState,
@@ -236,14 +242,49 @@ type FetchLocalProfileSyncOptions = Readonly<{
   timestamp: number;
 }>;
 
-function isProtocolSessionRecord(value: unknown): value is ProtocolSessionRecord {
+export type WebRetryRequestResult = Readonly<{
+  archivedSession?: boolean;
+  error?: string;
+  foundSentProto: boolean;
+  requesterAci: string;
+  requesterDevice: number;
+  sentNullMessage?: boolean;
+  senderDevice: number;
+  sentAt: number;
+  resent: boolean;
+}>;
+
+export type WebDecryptionErrorRetryResult = Readonly<{
+  envelopeType: number;
+  reason?: string;
+  retryCount?: number;
+  sent: boolean;
+  sourceDevice?: number;
+  sourceServiceId?: string;
+  timestamp?: number;
+}>;
+
+type WebSentProtoRecord = Readonly<{
+  contentHint: ContentHint;
+  groupId?: string;
+  protoBase64: string;
+  recipients: Record<string, ReadonlyArray<number>>;
+  timestamp: number;
+  urgent: boolean;
+}>;
+
+const WEB_REQUIRE_PQ_RATIO = 0;
+
+function isProtocolSessionRecord(
+  value: unknown
+): value is ProtocolSessionRecord {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      (value as ProtocolSessionRecord).namespace != null &&
-      typeof (value as ProtocolSessionRecord).namespace === 'string' &&
-      typeof (value as ProtocolSessionRecord).addressKey === 'string' &&
-      typeof (value as ProtocolSessionRecord).recordBase64 === 'string'
+    typeof value === 'object' &&
+    (value as ProtocolSessionRecord).namespace != null &&
+    typeof (value as ProtocolSessionRecord).namespace === 'string' &&
+    typeof (value as ProtocolSessionRecord).addressKey === 'string' &&
+    typeof (value as ProtocolSessionRecord).recordBase64 === 'string'
   );
 }
 
@@ -252,11 +293,35 @@ function isProtocolSenderKeyRecord(
 ): value is ProtocolSenderKeyRecord {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      (value as ProtocolSenderKeyRecord).namespace != null &&
-      typeof (value as ProtocolSenderKeyRecord).namespace === 'string' &&
-      typeof (value as ProtocolSenderKeyRecord).senderKey === 'string' &&
-      typeof (value as ProtocolSenderKeyRecord).recordBase64 === 'string'
+    typeof value === 'object' &&
+    (value as ProtocolSenderKeyRecord).namespace != null &&
+    typeof (value as ProtocolSenderKeyRecord).namespace === 'string' &&
+    typeof (value as ProtocolSenderKeyRecord).senderKey === 'string' &&
+    typeof (value as ProtocolSenderKeyRecord).recordBase64 === 'string'
+  );
+}
+
+function isProtocolPreKeyRecord(value: unknown): value is ProtocolPreKeyRecord {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    (value as ProtocolPreKeyRecord).namespace != null &&
+    typeof (value as ProtocolPreKeyRecord).namespace === 'string' &&
+    typeof (value as ProtocolPreKeyRecord).keyId === 'number' &&
+    typeof (value as ProtocolPreKeyRecord).recordBase64 === 'string'
+  );
+}
+
+function isProtocolKyberPreKeyRecord(
+  value: unknown
+): value is ProtocolKyberPreKeyRecord {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    (value as ProtocolKyberPreKeyRecord).namespace != null &&
+    typeof (value as ProtocolKyberPreKeyRecord).namespace === 'string' &&
+    typeof (value as ProtocolKyberPreKeyRecord).keyId === 'number' &&
+    typeof (value as ProtocolKyberPreKeyRecord).recordBase64 === 'string'
   );
 }
 
@@ -303,6 +368,41 @@ function loadProtocolSenderKeys(
   );
 }
 
+function loadProtocolPreKeys(
+  namespace: string,
+  protocol: ProtocolState | undefined
+): Map<number, PreKeyRecord> {
+  return new Map(
+    (protocol?.preKeys ?? [])
+      .filter(isProtocolPreKeyRecord)
+      .filter(record => record.namespace === namespace)
+      .map(record => [
+        record.keyId,
+        PreKeyRecord.deserialize(Bytes.fromBase64(record.recordBase64)),
+      ])
+  );
+}
+
+function loadProtocolKyberPreKeys(
+  namespace: string,
+  protocol: ProtocolState | undefined
+): Map<number, ProtocolKyberPreKeyRecord & { record: KyberPreKeyRecord }> {
+  return new Map(
+    (protocol?.kyberPreKeys ?? [])
+      .filter(isProtocolKyberPreKeyRecord)
+      .filter(record => record.namespace === namespace)
+      .map(record => [
+        record.keyId,
+        {
+          ...record,
+          record: KyberPreKeyRecord.deserialize(
+            Bytes.fromBase64(record.recordBase64)
+          ),
+        },
+      ])
+  );
+}
+
 class WebSessionStore extends SessionStore {
   readonly #namespace: string;
   readonly #sessions = new Map<string, SessionRecord>();
@@ -321,7 +421,9 @@ class WebSessionStore extends SessionStore {
     this.#sessions.set(addressKey, record);
   }
 
-  override async getSession(address: ProtocolAddress): Promise<SessionRecord | null> {
+  override async getSession(
+    address: ProtocolAddress
+  ): Promise<SessionRecord | null> {
     return this.#sessions.get(getProtocolAddressKey(address)) ?? null;
   }
 
@@ -350,6 +452,9 @@ class WebSessionStore extends SessionStore {
       if (!Number.isInteger(deviceId) || deviceId === localDeviceId) {
         continue;
       }
+      if (!record.hasCurrentState(WEB_REQUIRE_PQ_RATIO)) {
+        continue;
+      }
       result.push({
         address: ProtocolAddress.new(serviceId, deviceId),
         record,
@@ -366,6 +471,22 @@ class WebSessionStore extends SessionStore {
       const addressKey = `${serviceId}.${deviceId}`;
       this.#sessions.delete(addressKey);
     }
+  }
+
+  public async archiveSessionOnRatchetKeyMatch(
+    address: ProtocolAddress,
+    ratchetKey: PublicKey | undefined
+  ): Promise<boolean> {
+    if (!ratchetKey) {
+      return false;
+    }
+    const record = await this.getSession(address);
+    if (!record || !record.currentRatchetKeyMatches(ratchetKey)) {
+      return false;
+    }
+    record.archiveCurrentState();
+    await this.saveSession(address, record);
+    return true;
   }
 
   public removeAllKnownSessionsForServiceId(
@@ -413,7 +534,11 @@ class WebSenderKeyStore extends SenderKeyStore {
     sender: ProtocolAddress,
     distributionId: Uuid
   ): Promise<SenderKeyRecord | null> {
-    return this.#senderKeys.get(getSenderKeyPersistenceKey(sender, distributionId)) ?? null;
+    return (
+      this.#senderKeys.get(
+        getSenderKeyPersistenceKey(sender, distributionId)
+      ) ?? null
+    );
   }
 
   public exportRecords(): Array<ProtocolSenderKeyRecord> {
@@ -425,17 +550,38 @@ class WebSenderKeyStore extends SenderKeyStore {
   }
 }
 
-class EmptyWebPreKeyStore extends PreKeyStore {
-  override async savePreKey(): Promise<void> {
-    throw new Error('EmptyWebPreKeyStore.savePreKey should not be called');
+class WebPreKeyStore extends PreKeyStore {
+  readonly #namespace: string;
+  readonly #records: Map<number, PreKeyRecord>;
+
+  public constructor(namespace: string, protocol: ProtocolState | undefined) {
+    super();
+    this.#namespace = namespace;
+    this.#records = loadProtocolPreKeys(namespace, protocol);
   }
 
-  override async getPreKey(id: number): Promise<never> {
-    throw new Error(`EmptyWebPreKeyStore.getPreKey: PreKey ${id} not found`);
+  override async savePreKey(id: number, record: PreKeyRecord): Promise<void> {
+    this.#records.set(id, record);
   }
 
-  override async removePreKey(): Promise<void> {
-    return undefined;
+  override async getPreKey(id: number): Promise<PreKeyRecord> {
+    const record = this.#records.get(id);
+    if (!record) {
+      throw new Error(`WebPreKeyStore.getPreKey: PreKey ${id} not found`);
+    }
+    return record;
+  }
+
+  override async removePreKey(id: number): Promise<void> {
+    this.#records.delete(id);
+  }
+
+  public exportRecords(): Array<ProtocolPreKeyRecord> {
+    return [...this.#records].map(([keyId, record]) => ({
+      namespace: this.#namespace,
+      keyId,
+      recordBase64: Bytes.toBase64(record.serialize()),
+    }));
   }
 }
 
@@ -450,7 +596,9 @@ class WebSignedPreKeyStore extends SignedPreKeyStore {
   }
 
   override async saveSignedPreKey(): Promise<void> {
-    throw new Error('WebSignedPreKeyStore.saveSignedPreKey should not be called');
+    throw new Error(
+      'WebSignedPreKeyStore.saveSignedPreKey should not be called'
+    );
   }
 
   override async getSignedPreKey(id: number): Promise<SignedPreKeyRecord> {
@@ -463,29 +611,73 @@ class WebSignedPreKeyStore extends SignedPreKeyStore {
 }
 
 class WebKyberPreKeyStore extends KyberPreKeyStore {
-  readonly #records = new Map<number, KyberPreKeyRecord>();
+  readonly #namespace: string;
+  readonly #records = new Map<
+    number,
+    ProtocolKyberPreKeyRecord & { record: KyberPreKeyRecord }
+  >();
 
-  public constructor(records: ReadonlyArray<KyberPreKeyRecord>) {
+  public constructor({
+    lastResortRecord,
+    namespace,
+    protocol,
+  }: Readonly<{
+    lastResortRecord: KyberPreKeyRecord;
+    namespace: string;
+    protocol: ProtocolState | undefined;
+  }>) {
     super();
-    for (const record of records) {
-      this.#records.set(record.id(), record);
-    }
+    this.#namespace = namespace;
+    this.#records = loadProtocolKyberPreKeys(namespace, protocol);
+    this.#records.set(lastResortRecord.id(), {
+      namespace,
+      keyId: lastResortRecord.id(),
+      isLastResort: true,
+      recordBase64: Bytes.toBase64(lastResortRecord.serialize()),
+      record: lastResortRecord,
+    });
   }
 
-  override async saveKyberPreKey(): Promise<void> {
-    throw new Error('WebKyberPreKeyStore.saveKyberPreKey should not be called');
+  override async saveKyberPreKey(
+    kyberPreKeyId: number,
+    record: KyberPreKeyRecord
+  ): Promise<void> {
+    this.#records.set(kyberPreKeyId, {
+      namespace: this.#namespace,
+      keyId: kyberPreKeyId,
+      recordBase64: Bytes.toBase64(record.serialize()),
+      record,
+    });
   }
 
   override async getKyberPreKey(id: number): Promise<KyberPreKeyRecord> {
-    const record = this.#records.get(id);
-    if (!record) {
+    const entry = this.#records.get(id);
+    if (!entry) {
       throw new Error(`WebKyberPreKeyStore.getKyberPreKey: ${id} not found`);
     }
-    return record;
+    return entry.record;
   }
 
-  override async markKyberPreKeyUsed(): Promise<void> {
+  override async markKyberPreKeyUsed(
+    kyberPreKeyId: number,
+    _signedPreKeyId: number,
+    _baseKey: PublicKey
+  ): Promise<void> {
+    const entry = this.#records.get(kyberPreKeyId);
+    if (!entry || entry.isLastResort) {
+      return undefined;
+    }
+    this.#records.delete(kyberPreKeyId);
     return undefined;
+  }
+
+  public exportRecords(): Array<ProtocolKyberPreKeyRecord> {
+    return [...this.#records].map(([keyId, entry]) => ({
+      namespace: this.#namespace,
+      keyId,
+      isLastResort: entry.isLastResort,
+      recordBase64: Bytes.toBase64(entry.record.serialize()),
+    }));
   }
 }
 
@@ -538,7 +730,9 @@ class WebIdentityKeyStore extends IdentityKeyStore {
     return true;
   }
 
-  override async getIdentity(address: ProtocolAddress): Promise<PublicKey | null> {
+  override async getIdentity(
+    address: ProtocolAddress
+  ): Promise<PublicKey | null> {
     return this.#remoteIdentities.get(getProtocolAddressKey(address)) ?? null;
   }
 }
@@ -548,13 +742,106 @@ type WebProtocolStore = Readonly<{
   namespace: string;
   identityStore: WebIdentityKeyStore;
   kyberPreKeyStore: WebKyberPreKeyStore;
-  preKeyStore: EmptyWebPreKeyStore;
+  preKeyStore: WebPreKeyStore;
   senderKeyStore: WebSenderKeyStore;
   sessionStore: WebSessionStore;
   signedPreKeyStore: WebSignedPreKeyStore;
 }>;
 
-const protocolStores = new Map<string, WebProtocolStore>();
+type WebProtocolStoreEntry = Readonly<{
+  externalProtocolSignature?: string;
+  store: WebProtocolStore;
+}>;
+
+const protocolStores = new Map<string, WebProtocolStoreEntry>();
+const serverKeyFetchRetryAfterByKey = new Map<string, number>();
+const serverKeyFetchesByKey = new Map<string, Promise<ServerKeys>>();
+const DEFAULT_SERVER_KEY_FETCH_RETRY_AFTER_MS = 10 * 60 * 1000;
+const DECRYPTION_ERROR_RETRY_LIMIT = 5;
+const decryptionErrorRetryCounts = new Map<string, number>();
+const sentProtoRecords = new Map<string, WebSentProtoRecord>();
+const sentProtoRecordOrder = new Array<string>();
+
+const MAX_SENT_PROTO_RECORDS = 500;
+const SENT_PROTO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function getSentProtoKey(
+  recipientServiceId: string,
+  timestamp: number
+): string {
+  return `${recipientServiceId}:${timestamp}`;
+}
+
+function pruneSentProtoRecords(nowMs = Date.now()): void {
+  const minTimestamp = nowMs - SENT_PROTO_MAX_AGE_MS;
+  while (sentProtoRecordOrder.length > 0) {
+    const key = sentProtoRecordOrder[0];
+    if (!key) {
+      sentProtoRecordOrder.shift();
+      continue;
+    }
+    const record = sentProtoRecords.get(key);
+    if (
+      record &&
+      record.timestamp >= minTimestamp &&
+      sentProtoRecords.size <= MAX_SENT_PROTO_RECORDS
+    ) {
+      break;
+    }
+    sentProtoRecordOrder.shift();
+    sentProtoRecords.delete(key);
+  }
+}
+
+function saveSentProtoRecord({
+  contentHint,
+  groupId,
+  plaintext,
+  recipientDeviceIdsByServiceId,
+  timestamp,
+  urgent,
+}: Readonly<{
+  contentHint: ContentHint;
+  groupId?: string;
+  plaintext: Uint8Array<ArrayBuffer>;
+  recipientDeviceIdsByServiceId: Record<string, ReadonlyArray<number>>;
+  timestamp: number;
+  urgent: boolean;
+}>): void {
+  pruneSentProtoRecords();
+  const protoBase64 = Bytes.toBase64(unpad(plaintext));
+  for (const [recipientServiceId, deviceIds] of Object.entries(
+    recipientDeviceIdsByServiceId
+  )) {
+    const key = getSentProtoKey(recipientServiceId, timestamp);
+    sentProtoRecords.set(key, {
+      contentHint,
+      groupId,
+      protoBase64,
+      recipients: {
+        [recipientServiceId]: deviceIds,
+      },
+      timestamp,
+      urgent,
+    });
+    sentProtoRecordOrder.push(key);
+  }
+  pruneSentProtoRecords();
+}
+
+function getSentProtoRecord(
+  recipientServiceId: string,
+  timestamp: number
+): WebSentProtoRecord | undefined {
+  pruneSentProtoRecords();
+  return sentProtoRecords.get(getSentProtoKey(recipientServiceId, timestamp));
+}
+
+function getRandomPadding(): Uint8Array<ArrayBuffer> {
+  const buffer = randomBytes(2);
+  const paddingLength = ((buffer[0] ?? 0) + (buffer[1] ?? 0) * 256) % 512;
+  return new Uint8Array(randomBytes(paddingLength + 1));
+}
 
 function getProtocolAddressKey(address: ProtocolAddress): string {
   return `${address.name()}.${address.deviceId()}`;
@@ -582,6 +869,7 @@ function getErrorSummary(error: unknown): Record<string, unknown> {
   const extra = error as Error & {
     code?: unknown;
     responseBody?: unknown;
+    retryAfterMs?: unknown;
     status?: unknown;
   };
 
@@ -589,9 +877,49 @@ function getErrorSummary(error: unknown): Record<string, unknown> {
     name: error.name,
     message: error.message,
     code: extra.code,
+    retryAfterMs: extra.retryAfterMs,
     status: extra.status,
     responseBody: extra.responseBody,
   };
+}
+
+function getChatResponseHeader(
+  headers: ReadonlyArray<readonly [string, string]>,
+  name: string
+): string | undefined {
+  const normalizedName = name.toLowerCase();
+  return headers.find(([key]) => key.toLowerCase() === normalizedName)?.[1];
+}
+
+function getRetryAfterMs(
+  headers: ReadonlyArray<readonly [string, string]>
+): number {
+  const retryAfter = getChatResponseHeader(headers, 'retry-after');
+  if (!retryAfter) {
+    return DEFAULT_SERVER_KEY_FETCH_RETRY_AFTER_MS;
+  }
+  const seconds = Number(retryAfter);
+  return Number.isFinite(seconds) && seconds > 0
+    ? seconds * 1000
+    : DEFAULT_SERVER_KEY_FETCH_RETRY_AFTER_MS;
+}
+
+function createChatResponseError({
+  message,
+  responseBody,
+  retryAfterMs,
+  status,
+}: Readonly<{
+  message: string;
+  responseBody?: string;
+  retryAfterMs?: number;
+  status: number;
+}>): Error {
+  return Object.assign(new Error(message), {
+    responseBody,
+    retryAfterMs,
+    status,
+  });
 }
 
 function deserializeSignedPreKeyRecord(base64: string): SignedPreKeyRecord {
@@ -600,6 +928,45 @@ function deserializeSignedPreKeyRecord(base64: string): SignedPreKeyRecord {
 
 function deserializeKyberPreKeyRecord(base64: string): KyberPreKeyRecord {
   return KyberPreKeyRecord.deserialize(Bytes.fromBase64(base64));
+}
+
+function getProtocolStoreExternalSignature(
+  namespace: string,
+  protocol: ProtocolState | undefined
+): string | undefined {
+  if (!protocol) {
+    return undefined;
+  }
+
+  const sessions = protocol.sessions
+    .filter(isProtocolSessionRecord)
+    .filter(record => record.namespace === namespace)
+    .map(record => [record.addressKey, record.recordBase64] as const)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const senderKeys = protocol.senderKeys
+    .filter(isProtocolSenderKeyRecord)
+    .filter(record => record.namespace === namespace)
+    .map(record => [record.senderKey, record.recordBase64] as const)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const preKeys = protocol.preKeys
+    .filter(isProtocolPreKeyRecord)
+    .filter(record => record.namespace === namespace)
+    .map(record => [record.keyId, record.recordBase64] as const)
+    .sort(([left], [right]) => left - right);
+  const kyberPreKeys = protocol.kyberPreKeys
+    .filter(isProtocolKyberPreKeyRecord)
+    .filter(record => record.namespace === namespace)
+    .map(
+      record =>
+        [
+          record.keyId,
+          Boolean(record.isLastResort),
+          record.recordBase64,
+        ] as const
+    )
+    .sort(([left], [right]) => left - right);
+
+  return JSON.stringify({ kyberPreKeys, preKeys, sessions, senderKeys });
 }
 
 export function getLinkedPayloadProtocolKeyIds(
@@ -689,9 +1056,17 @@ function getProtocolStoreForServiceId(
     signedPreKeyRecord.id(),
     pqLastResortPreKeyRecord.id(),
   ].join(':');
+  const externalProtocolSignature = getProtocolStoreExternalSignature(
+    storeKey,
+    linkedPayload.protocol
+  );
   const existing = protocolStores.get(storeKey);
-  if (existing) {
-    return existing;
+  if (
+    existing &&
+    (externalProtocolSignature == null ||
+      externalProtocolSignature === existing.externalProtocolSignature)
+  ) {
+    return existing.store;
   }
 
   const identityKeyPair = new IdentityKeyPair(
@@ -706,18 +1081,27 @@ function getProtocolStoreForServiceId(
       identityKeyPair,
       registrationId,
     }),
-    kyberPreKeyStore: new WebKyberPreKeyStore([pqLastResortPreKeyRecord]),
-    preKeyStore: new EmptyWebPreKeyStore(),
+    kyberPreKeyStore: new WebKyberPreKeyStore({
+      lastResortRecord: pqLastResortPreKeyRecord,
+      namespace: storeKey,
+      protocol: linkedPayload.protocol,
+    }),
+    preKeyStore: new WebPreKeyStore(storeKey, linkedPayload.protocol),
     senderKeyStore: new WebSenderKeyStore(storeKey, linkedPayload.protocol),
     sessionStore: new WebSessionStore(storeKey, linkedPayload.protocol),
     signedPreKeyStore: new WebSignedPreKeyStore([signedPreKeyRecord]),
   };
-  protocolStores.set(storeKey, store);
+  protocolStores.set(storeKey, { externalProtocolSignature, store });
   return store;
 }
 
-function getProtocolStore(linkedPayload: WebSendLinkedPayload): WebProtocolStore {
-  return getProtocolStoreForServiceId(linkedPayload, getLinkedAci(linkedPayload));
+function getProtocolStore(
+  linkedPayload: WebSendLinkedPayload
+): WebProtocolStore {
+  return getProtocolStoreForServiceId(
+    linkedPayload,
+    getLinkedAci(linkedPayload)
+  );
 }
 
 export function exportProtocolState(
@@ -726,7 +1110,7 @@ export function exportProtocolState(
   const aci = getLinkedAci(linkedPayload);
   const stores = [...protocolStores.entries()]
     .filter(([storeKey]) => storeKey.startsWith(`${aci}:`))
-    .map(([, store]) => store);
+    .map(([, entry]) => entry.store);
 
   return {
     registrationIds: {
@@ -735,14 +1119,16 @@ export function exportProtocolState(
     },
     identityKeys: {
       aci:
-        linkedPayload.aciIdentityKeyPublic || linkedPayload.aciIdentityKeyPrivate
+        linkedPayload.aciIdentityKeyPublic ||
+        linkedPayload.aciIdentityKeyPrivate
           ? {
               publicKey: linkedPayload.aciIdentityKeyPublic,
               privateKey: linkedPayload.aciIdentityKeyPrivate,
             }
           : undefined,
       pni:
-        linkedPayload.pniIdentityKeyPublic || linkedPayload.pniIdentityKeyPrivate
+        linkedPayload.pniIdentityKeyPublic ||
+        linkedPayload.pniIdentityKeyPrivate
           ? {
               publicKey: linkedPayload.pniIdentityKeyPublic,
               privateKey: linkedPayload.pniIdentityKeyPrivate,
@@ -750,9 +1136,11 @@ export function exportProtocolState(
           : undefined,
     },
     identityRecords: linkedPayload.protocol?.identityRecords ?? [],
-    preKeys: linkedPayload.protocol?.preKeys ?? [],
+    preKeys: stores.flatMap(store => store.preKeyStore.exportRecords()),
     signedPreKeys: linkedPayload.protocol?.signedPreKeys ?? [],
-    kyberPreKeys: linkedPayload.protocol?.kyberPreKeys ?? [],
+    kyberPreKeys: stores.flatMap(store =>
+      store.kyberPreKeyStore.exportRecords()
+    ),
     sessions: stores.flatMap(store => store.sessionStore.exportRecords()),
     senderKeys: stores.flatMap(store => store.senderKeyStore.exportRecords()),
   };
@@ -766,7 +1154,11 @@ function createAttachmentPointer(
   const incrementalMacBase64 =
     attachment.incrementalMacBase64 ?? attachment.incrementalMac;
 
-  if ((!attachment.cdnKey && !attachment.cdnId) || !keyBase64 || !digestBase64) {
+  if (
+    (!attachment.cdnKey && !attachment.cdnId) ||
+    !keyBase64 ||
+    !digestBase64
+  ) {
     throw new Error(
       'createAttachmentPointer: attachment is missing cdnKey or cdnId, keyBase64, or digestBase64'
     );
@@ -796,7 +1188,9 @@ function createAttachmentPointer(
     height: attachment.height ?? null,
     caption: attachment.caption ?? null,
     blurHash: attachment.blurHash ?? null,
-    clientUuid: attachment.clientUuid ? uuidToBytes(attachment.clientUuid) : null,
+    clientUuid: attachment.clientUuid
+      ? uuidToBytes(attachment.clientUuid)
+      : null,
     thumbnail: null,
   };
 }
@@ -892,7 +1286,9 @@ function createQuote(
   return {
     id: typeof quote.id === 'number' ? BigInt(quote.id) : null,
     authorAci: null,
-    authorAciBinary: toAciObject(quote.authorAci as AciString).getRawUuidBytes(),
+    authorAciBinary: toAciObject(
+      quote.authorAci as AciString
+    ).getRawUuidBytes(),
     text: typeof quote.text === 'string' ? quote.text : null,
     attachments: (quote.attachments ?? []).slice(0, 1).map(attachment => ({
       contentType: attachment.contentType ?? null,
@@ -990,7 +1386,9 @@ function createReactionDataMessage({
       emoji: emoji ?? null,
       remove,
       targetAuthorAci: null,
-      targetAuthorAciBinary: toAciObject(targetAuthorAci as AciString).getRawUuidBytes(),
+      targetAuthorAciBinary: toAciObject(
+        targetAuthorAci as AciString
+      ).getRawUuidBytes(),
       targetSentTimestamp: BigInt(targetTimestamp),
     },
   };
@@ -1012,26 +1410,28 @@ function createTextContent(
     flags?: number;
   }>
 ): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      dataMessage: createDataMessage({
-        attachments,
-        body,
-        deleteForEveryone,
-        expireTimer: expirationTimerUpdate?.expireTimer,
-        expireTimerVersion: expirationTimerUpdate?.expireTimerVersion,
-        flags: expirationTimerUpdate?.flags,
-        groupV2,
-        isViewOnce,
-        pinMessage,
-        quote,
-        timestamp,
-        unpinMessage,
-      }),
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        dataMessage: createDataMessage({
+          attachments,
+          body,
+          deleteForEveryone,
+          expireTimer: expirationTimerUpdate?.expireTimer,
+          expireTimerVersion: expirationTimerUpdate?.expireTimerVersion,
+          flags: expirationTimerUpdate?.flags,
+          groupV2,
+          isViewOnce,
+          pinMessage,
+          quote,
+          timestamp,
+          unpinMessage,
+        }),
+      },
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createReactionContent(
@@ -1044,13 +1444,15 @@ function createReactionContent(
     timestamp: number;
   }>
 ): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      dataMessage: createReactionDataMessage(options),
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        dataMessage: createReactionDataMessage(options),
+      },
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createEditContent({
@@ -1062,16 +1464,18 @@ function createEditContent({
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      editMessage: {
-        dataMessage: createDataMessage({ body, timestamp }),
-        targetSentTimestamp: BigInt(targetTimestamp),
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        editMessage: {
+          dataMessage: createDataMessage({ body, timestamp }),
+          targetSentTimestamp: BigInt(targetTimestamp),
+        },
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createSentSyncContent({
@@ -1103,46 +1507,48 @@ function createSentSyncContent({
   timestamp: number;
   unpinMessage?: WebUnpinMessage;
 }>): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          sent: {
-            destinationE164: null,
-            destinationServiceId: destinationServiceId ?? null,
-            destinationServiceIdBinary: null,
-            editMessage: null,
-            expirationStartTimestamp: null,
-            isRecipientUpdate: false,
-            message: createDataMessage({
-              attachments,
-              body,
-              deleteForEveryone,
-              expireTimer,
-              expireTimerVersion,
-              flags,
-              groupV2,
-              isViewOnce,
-              pinMessage,
-              quote,
-              timestamp,
-              unpinMessage,
-            }),
-            storyMessage: null,
-            storyMessageRecipients: [],
-            timestamp: BigInt(timestamp),
-            unidentifiedStatus: [],
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            sent: {
+              destinationE164: null,
+              destinationServiceId: destinationServiceId ?? null,
+              destinationServiceIdBinary: null,
+              editMessage: null,
+              expirationStartTimestamp: null,
+              isRecipientUpdate: false,
+              message: createDataMessage({
+                attachments,
+                body,
+                deleteForEveryone,
+                expireTimer,
+                expireTimerVersion,
+                flags,
+                groupV2,
+                isViewOnce,
+                pinMessage,
+                quote,
+                timestamp,
+                unpinMessage,
+              }),
+              storyMessage: null,
+              storyMessageRecipients: [],
+              timestamp: BigInt(timestamp),
+              unidentifiedStatus: [],
+            },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createSentReactionSyncContent({
@@ -1162,40 +1568,42 @@ function createSentReactionSyncContent({
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          sent: {
-            destinationE164: null,
-            destinationServiceId: destinationServiceId ?? null,
-            destinationServiceIdBinary: null,
-            editMessage: null,
-            expirationStartTimestamp: null,
-            isRecipientUpdate: false,
-            message: createReactionDataMessage({
-              emoji,
-              groupV2,
-              remove,
-              targetAuthorAci,
-              targetTimestamp,
-              timestamp,
-            }),
-            storyMessage: null,
-            storyMessageRecipients: [],
-            timestamp: BigInt(timestamp),
-            unidentifiedStatus: [],
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            sent: {
+              destinationE164: null,
+              destinationServiceId: destinationServiceId ?? null,
+              destinationServiceIdBinary: null,
+              editMessage: null,
+              expirationStartTimestamp: null,
+              isRecipientUpdate: false,
+              message: createReactionDataMessage({
+                emoji,
+                groupV2,
+                remove,
+                targetAuthorAci,
+                targetTimestamp,
+                timestamp,
+              }),
+              storyMessage: null,
+              storyMessageRecipients: [],
+              timestamp: BigInt(timestamp),
+              unidentifiedStatus: [],
+            },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createSentEditSyncContent({
@@ -1209,36 +1617,38 @@ function createSentEditSyncContent({
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          sent: {
-            destinationE164: null,
-            destinationServiceId,
-            destinationServiceIdBinary: null,
-            editMessage: {
-              dataMessage: createDataMessage({ body, timestamp }),
-              targetSentTimestamp: BigInt(targetTimestamp),
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            sent: {
+              destinationE164: null,
+              destinationServiceId,
+              destinationServiceIdBinary: null,
+              editMessage: {
+                dataMessage: createDataMessage({ body, timestamp }),
+                targetSentTimestamp: BigInt(targetTimestamp),
+              },
+              expirationStartTimestamp: null,
+              isRecipientUpdate: false,
+              message: null,
+              storyMessage: null,
+              storyMessageRecipients: [],
+              timestamp: BigInt(timestamp),
+              unidentifiedStatus: [],
             },
-            expirationStartTimestamp: null,
-            isRecipientUpdate: false,
-            message: null,
-            storyMessage: null,
-            storyMessageRecipients: [],
-            timestamp: BigInt(timestamp),
-            unidentifiedStatus: [],
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createMessageRequestResponseSyncContent({
@@ -1248,66 +1658,74 @@ function createMessageRequestResponseSyncContent({
   threadAci: string;
   type: number;
 }>): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          messageRequestResponse: {
-            groupId: null,
-            threadAci: null,
-            threadAciBinary: toAciObject(threadAci as AciString).getRawUuidBytes(),
-            type,
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            messageRequestResponse: {
+              groupId: null,
+              threadAci: null,
+              threadAciBinary: toAciObject(
+                threadAci as AciString
+              ).getRawUuidBytes(),
+              type,
+            },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createFetchLocalProfileSyncContent(): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          fetchLatest: {
-            type: Proto.SyncMessage.FetchLatest.Type.LOCAL_PROFILE,
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            fetchLatest: {
+              type: Proto.SyncMessage.FetchLatest.Type.LOCAL_PROFILE,
+            },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createFetchStorageManifestSyncContent(): Uint8Array<ArrayBuffer> {
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          fetchLatest: {
-            type: Proto.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST,
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            fetchLatest: {
+              type: Proto.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST,
+            },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
 function createAttachmentBackfillRequestSyncContent({
@@ -1334,32 +1752,36 @@ function createAttachmentBackfillRequestSyncContent({
           },
         };
 
-  return padMessage(Proto.Content.encode({
-    content: {
-      syncMessage: {
-        content: {
-          attachmentBackfillRequest: {
-            targetConversation,
-            targetMessage: {
-              author: {
-                authorServiceId: targetAuthorAci,
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        syncMessage: {
+          content: {
+            attachmentBackfillRequest: {
+              targetConversation,
+              targetMessage: {
+                author: {
+                  authorServiceId: targetAuthorAci,
+                },
+                sentTimestamp: BigInt(targetSentTimestamp),
               },
-              sentTimestamp: BigInt(targetSentTimestamp),
             },
           },
+          padding: null,
+          read: [],
+          stickerPackOperation: [],
+          viewed: [],
         },
-        padding: null,
-        read: [],
-        stickerPackOperation: [],
-        viewed: [],
       },
-    },
-    pniSignatureMessage: null,
-    senderKeyDistributionMessage: null,
-  }));
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
 }
 
-function padMessage(messageBuffer: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+function padMessage(
+  messageBuffer: Uint8Array<ArrayBuffer>
+): Uint8Array<ArrayBuffer> {
   const paddingBlock = 80;
   const messageLengthWithTerminator = messageBuffer.byteLength + 1;
   const paddedLength =
@@ -1370,7 +1792,9 @@ function padMessage(messageBuffer: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuf
   return plaintext;
 }
 
-function toNumber(value: bigint | number | null | undefined): number | undefined {
+function toNumber(
+  value: bigint | number | null | undefined
+): number | undefined {
   if (typeof value === 'number') {
     return value;
   }
@@ -1490,7 +1914,9 @@ function convertQuote(
       fileName: attachment.fileName ?? '',
       thumbnail: convertAttachmentPointer(attachment.thumbnail),
     })),
-    bodyRanges: quote.bodyRanges.map(convertBodyRange).filter(item => item != null),
+    bodyRanges: quote.bodyRanges
+      .map(convertBodyRange)
+      .filter(item => item != null),
     type: quote.type ?? Proto.DataMessage.Quote.Type.NORMAL,
   } as unknown as WebMessage['quote'];
 }
@@ -1571,7 +1997,9 @@ function convertGroupV2Change({
   }
 
   const secretParams = deriveGroupSecretParams(groupV2.masterKey);
-  const clientZkGroupCipher = getClientZkGroupCipher(Bytes.toBase64(secretParams));
+  const clientZkGroupCipher = getClientZkGroupCipher(
+    Bytes.toBase64(secretParams)
+  );
 
   try {
     const groupChange = Proto.GroupChange.decode(groupV2.groupChange);
@@ -1587,7 +2015,10 @@ function convertGroupV2Change({
       try {
         from = decryptServiceId(clientZkGroupCipher, actions.sourceUserId);
       } catch (error) {
-        console.warn('convertGroupV2Change: failed to decrypt sourceUserId', error);
+        console.warn(
+          'convertGroupV2Change: failed to decrypt sourceUserId',
+          error
+        );
       }
     }
 
@@ -1622,7 +2053,10 @@ function convertGroupV2Change({
     };
 
     for (const addMember of actions.addMembers ?? []) {
-      const aci = decryptActionAci(addMember.added?.userId, 'addMembers.userId');
+      const aci = decryptActionAci(
+        addMember.added?.userId,
+        'addMembers.userId'
+      );
       if (!aci) {
         continue;
       }
@@ -1725,7 +2159,8 @@ function convertGroupV2Change({
       });
     }
 
-    for (const pendingMember of actions.promoteMembersPendingPniAciProfileKey ?? []) {
+    for (const pendingMember of actions.promoteMembersPendingPniAciProfileKey ??
+      []) {
       const aci = decryptActionAci(
         pendingMember.userId,
         'promoteMembersPendingPniAciProfileKey.userId'
@@ -1753,7 +2188,8 @@ function convertGroupV2Change({
       });
     }
 
-    for (const pendingMember of actions.deleteMembersPendingAdminApproval ?? []) {
+    for (const pendingMember of actions.deleteMembersPendingAdminApproval ??
+      []) {
       const aci = decryptActionAci(
         pendingMember.deletedUserId,
         'deleteMembersPendingAdminApproval.deletedUserId'
@@ -1767,7 +2203,8 @@ function convertGroupV2Change({
       });
     }
 
-    for (const pendingMember of actions.promoteMembersPendingAdminApproval ?? []) {
+    for (const pendingMember of actions.promoteMembersPendingAdminApproval ??
+      []) {
       const aci = decryptActionAci(
         pendingMember.userId,
         'promoteMembersPendingAdminApproval.userId'
@@ -1822,7 +2259,8 @@ function convertGroupV2Change({
     if (actions.modifyAddFromInviteLinkAccess) {
       details.push({
         type: 'access-invite-link',
-        newPrivilege: actions.modifyAddFromInviteLinkAccess.addFromInviteLinkAccess,
+        newPrivilege:
+          actions.modifyAddFromInviteLinkAccess.addFromInviteLinkAccess,
       });
     }
 
@@ -1863,7 +2301,9 @@ function convertGroupV2Change({
     if (actions.modifyAnnouncementsOnly) {
       details.push({
         type: 'announcements-only',
-        announcementsOnly: Boolean(actions.modifyAnnouncementsOnly.announcementsOnly),
+        announcementsOnly: Boolean(
+          actions.modifyAnnouncementsOnly.announcementsOnly
+        ),
       });
     }
 
@@ -1974,8 +2414,7 @@ function convertDataMessageToWebMessage({
   });
   // oxlint-disable-next-line no-bitwise
   const isExpirationTimerUpdate = Boolean(
-    (dataMessage.flags ?? 0) &
-      Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE
+    (dataMessage.flags ?? 0) & Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE
   );
   const expirationTimer =
     DurationInSeconds.fromSeconds(dataMessage.expireTimer ?? 0) || undefined;
@@ -1997,7 +2436,9 @@ function convertDataMessageToWebMessage({
         : undefined,
     status,
     attachments,
-    bodyRanges: dataMessage.bodyRanges.map(convertBodyRange).filter(item => item != null),
+    bodyRanges: dataMessage.bodyRanges
+      .map(convertBodyRange)
+      .filter(item => item != null),
     contact: convertContact(dataMessage.contact),
     expireTimer: DurationInSeconds.fromSeconds(dataMessage.expireTimer ?? 0),
     expireTimerVersion: dataMessage.expireTimerVersion ?? 0,
@@ -2027,7 +2468,9 @@ function convertDataMessageToWebMessage({
   } as unknown as WebMessage;
 }
 
-function unpad(paddedPlaintext: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+function unpad(
+  paddedPlaintext: Uint8Array<ArrayBuffer>
+): Uint8Array<ArrayBuffer> {
   for (let index = paddedPlaintext.length - 1; index >= 0; index -= 1) {
     const value = paddedPlaintext[index];
     if (value === 0x80) {
@@ -2042,6 +2485,114 @@ function unpad(paddedPlaintext: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer
 
 function getEnvelopeType(decoded: Proto.Envelope): Proto.Envelope.Type {
   return decoded.type ?? Proto.Envelope.Type.UNKNOWN;
+}
+
+function envelopeTypeToCiphertextMessageType(
+  type: Proto.Envelope.Type
+): CiphertextMessageType {
+  if (type === Proto.Envelope.Type.DOUBLE_RATCHET) {
+    return CiphertextMessageType.Whisper;
+  }
+  if (type === Proto.Envelope.Type.PLAINTEXT_CONTENT) {
+    return CiphertextMessageType.Plaintext;
+  }
+  if (type === Proto.Envelope.Type.PREKEY_MESSAGE) {
+    return CiphertextMessageType.PreKey;
+  }
+  if (type === Proto.Envelope.Type.SERVER_DELIVERY_RECEIPT) {
+    return CiphertextMessageType.Plaintext;
+  }
+  throw new Error(`Unsupported envelope type for retry request: ${type}`);
+}
+
+function isRetryableCiphertextMessageType(
+  type: CiphertextMessageType
+): boolean {
+  return (
+    type === CiphertextMessageType.PreKey ||
+    type === CiphertextMessageType.SenderKey ||
+    type === CiphertextMessageType.Whisper
+  );
+}
+
+async function getUnidentifiedSenderRetryContext({
+  envelope,
+  linkedPayload,
+}: Readonly<{
+  envelope: Proto.Envelope;
+  linkedPayload: WebSendLinkedPayload;
+}>): Promise<
+  | Readonly<{
+      ciphertext: Uint8Array<ArrayBuffer>;
+      ciphertextMessageType: CiphertextMessageType;
+      sourceDevice: number;
+      sourceServiceId: string;
+    }>
+  | undefined
+> {
+  const ciphertext = envelope.content;
+  if (!ciphertext || ciphertext.byteLength === 0) {
+    return undefined;
+  }
+
+  const linkedAci = getLinkedAci(linkedPayload);
+  const explicitDestinationServiceId = fromServiceIdBinaryOrString(
+    envelope.destinationServiceIdBinary,
+    envelope.destinationServiceId,
+    'getUnidentifiedSenderRetryContext.destinationServiceId'
+  );
+  let destinationServiceId = explicitDestinationServiceId ?? linkedAci;
+  let protocolStore = getProtocolStoreForServiceId(
+    linkedPayload,
+    destinationServiceId
+  );
+  let messageContent;
+  try {
+    messageContent = await sealedSenderDecryptToUsmc(
+      ciphertext,
+      protocolStore.identityStore
+    );
+  } catch (error) {
+    const linkedPni = getLinkedPni(linkedPayload);
+    if (
+      explicitDestinationServiceId ||
+      !linkedPni ||
+      destinationServiceId === linkedPni
+    ) {
+      return undefined;
+    }
+    const pniProtocolStore = getProtocolStoreForServiceId(
+      linkedPayload,
+      linkedPni
+    );
+    try {
+      messageContent = await sealedSenderDecryptToUsmc(
+        ciphertext,
+        pniProtocolStore.identityStore
+      );
+    } catch {
+      return undefined;
+    }
+    protocolStore = pniProtocolStore;
+    destinationServiceId = pniProtocolStore.localServiceId;
+  }
+
+  const sourceServiceId = messageContent.senderCertificate().senderUuid();
+  if (!sourceServiceId || sourceServiceId === destinationServiceId) {
+    return undefined;
+  }
+
+  const ciphertextMessageType = messageContent.msgType();
+  if (!isRetryableCiphertextMessageType(ciphertextMessageType)) {
+    return undefined;
+  }
+
+  return {
+    ciphertext: messageContent.contents(),
+    ciphertextMessageType,
+    sourceDevice: messageContent.senderCertificate().senderDeviceId(),
+    sourceServiceId,
+  };
 }
 
 async function decryptEnvelopeContent({
@@ -2065,12 +2616,11 @@ async function decryptEnvelopeContent({
     throw new Error('decryptIncomingSignalEnvelope: missing linked device id');
   }
 
-  const explicitDestinationServiceId =
-    fromServiceIdBinaryOrString(
-      decoded.destinationServiceIdBinary,
-      decoded.destinationServiceId,
-      'decryptIncomingSignalEnvelope.destinationServiceId'
-    );
+  const explicitDestinationServiceId = fromServiceIdBinaryOrString(
+    decoded.destinationServiceIdBinary,
+    decoded.destinationServiceId,
+    'decryptIncomingSignalEnvelope.destinationServiceId'
+  );
   let destinationServiceId = explicitDestinationServiceId ?? linkedAci;
   let sourceServiceId: string | undefined = fromServiceIdBinaryOrString(
     decoded.sourceServiceIdBinary,
@@ -2094,10 +2644,17 @@ async function decryptEnvelopeContent({
       );
     } catch (error) {
       const linkedPni = getLinkedPni(linkedPayload);
-      if (explicitDestinationServiceId || !linkedPni || destinationServiceId === linkedPni) {
+      if (
+        explicitDestinationServiceId ||
+        !linkedPni ||
+        destinationServiceId === linkedPni
+      ) {
         throw error;
       }
-      const pniProtocolStore = getProtocolStoreForServiceId(linkedPayload, linkedPni);
+      const pniProtocolStore = getProtocolStoreForServiceId(
+        linkedPayload,
+        linkedPni
+      );
       messageContent = await sealedSenderDecryptToUsmc(
         ciphertext,
         pniProtocolStore.identityStore
@@ -2108,7 +2665,9 @@ async function decryptEnvelopeContent({
     const certificate = messageContent.senderCertificate();
     sourceServiceId = certificate.senderUuid();
     if (!sourceServiceId) {
-      throw new Error('decryptIncomingSignalEnvelope: missing sealed sender source service id');
+      throw new Error(
+        'decryptIncomingSignalEnvelope: missing sealed sender source service id'
+      );
     }
     sourceDevice = certificate.senderDeviceId();
     ciphertext = messageContent.contents();
@@ -2147,7 +2706,9 @@ async function decryptEnvelopeContent({
     }
   } else {
     if (!sourceServiceId) {
-      throw new Error('decryptIncomingSignalEnvelope: missing source service id');
+      throw new Error(
+        'decryptIncomingSignalEnvelope: missing source service id'
+      );
     }
     if (type === Proto.Envelope.Type.PLAINTEXT_CONTENT) {
       plaintext = PlaintextContent.deserialize(ciphertext).body();
@@ -2178,7 +2739,9 @@ async function decryptEnvelopeContent({
   }
 
   if (!sourceServiceId) {
-    throw new Error('decryptIncomingSignalEnvelope: missing unsealed source service id');
+    throw new Error(
+      'decryptIncomingSignalEnvelope: missing unsealed source service id'
+    );
   }
 
   return {
@@ -2214,7 +2777,9 @@ async function maybeProcessSenderKeyDistributionMessage({
   return true;
 }
 
-function isProfileKeyUpdateDataMessage(dataMessage: Proto.DataMessage): boolean {
+function isProfileKeyUpdateDataMessage(
+  dataMessage: Proto.DataMessage
+): boolean {
   return Boolean(
     // eslint-disable-next-line no-bitwise
     (dataMessage.flags ?? 0) & Proto.DataMessage.Flags.PROFILE_KEY_UPDATE
@@ -2291,7 +2856,8 @@ function convertContentToWebMessage({
       dataMessage: sentMessage,
       direction: 'outgoing',
       receivedAt: Date.now(),
-      sourceServiceId: linkedPayload.credentials?.aci ?? linkedPayload.account.aci,
+      sourceServiceId:
+        linkedPayload.credentials?.aci ?? linkedPayload.account.aci,
       status: 'sent',
     });
   }
@@ -2380,7 +2946,8 @@ function convertContentToWebPinMessageEvent({
   if (sent && sentMessage?.pinMessage) {
     const conversationId = getSentDataMessageConversationId({
       dataMessage: sentMessage,
-      logContext: 'convertContentToWebPinMessageEvent.sent.destinationServiceId',
+      logContext:
+        'convertContentToWebPinMessageEvent.sent.destinationServiceId',
       sent,
     });
     const senderAci =
@@ -2468,8 +3035,7 @@ function convertContentToWebReactionEvent({
   if (sent && sentMessage?.reaction) {
     const conversationId = getSentDataMessageConversationId({
       dataMessage: sentMessage,
-      logContext:
-        'convertContentToWebReactionEvent.sent.destinationServiceId',
+      logContext: 'convertContentToWebReactionEvent.sent.destinationServiceId',
       sent,
     });
     const senderAci =
@@ -2678,7 +3244,8 @@ function convertContentToWebDeleteEvent({
   const dataMessage = content.content?.dataMessage;
   if (dataMessage?.delete || dataMessage?.adminDelete) {
     return convertDataMessageDeleteToWebEvent({
-      conversationId: convertGroupV2(dataMessage.groupV2)?.id ?? sourceServiceId,
+      conversationId:
+        convertGroupV2(dataMessage.groupV2)?.id ?? sourceServiceId,
       dataMessage,
       senderAci: sourceServiceId,
       timestamp,
@@ -2802,10 +3369,12 @@ function convertContentToWebTypingEvent({
 
 function convertAddressableMessage(
   target: Proto.AddressableMessage | null | undefined
-): Readonly<{
-  authorAci?: string;
-  sentAt: number;
-}> | undefined {
+):
+  | Readonly<{
+      authorAci?: string;
+      sentAt: number;
+    }>
+  | undefined {
   if (!target?.author) {
     return undefined;
   }
@@ -2951,11 +3520,7 @@ function convertDataMessagePollVoteToWebEvent({
     'PollVote.targetAuthorAci'
   );
   const targetTimestamp = toNumber(pollVote.targetSentTimestamp);
-  if (
-    !targetAuthorAci ||
-    targetTimestamp == null ||
-    !pollVote.optionIndexes
-  ) {
+  if (!targetAuthorAci || targetTimestamp == null || !pollVote.optionIndexes) {
     return undefined;
   }
 
@@ -2987,7 +3552,9 @@ function convertDataMessagePollTerminateToWebEvent({
   }
 
   const dataMessageTimestamp = toNumber(dataMessage.timestamp) ?? timestamp;
-  const targetTimestamp = toNumber(dataMessage.pollTerminate.targetSentTimestamp);
+  const targetTimestamp = toNumber(
+    dataMessage.pollTerminate.targetSentTimestamp
+  );
   if (targetTimestamp == null) {
     return undefined;
   }
@@ -3133,15 +3700,238 @@ function describeDecryptedContent(content: Proto.Content): string {
 function isStorageManifestFetchLatest(content: Proto.Content): boolean {
   const fetchLatest = content.content?.syncMessage?.content?.fetchLatest;
   return (
-    fetchLatest?.type ===
-    Proto.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST
+    fetchLatest?.type === Proto.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST
   );
 }
 
+function isDecryptionErrorMessageContent(content: Proto.Content): boolean {
+  const decryptionErrorMessage = content.content?.decryptionErrorMessage;
+  return Boolean(
+    decryptionErrorMessage && Bytes.isNotEmpty(decryptionErrorMessage)
+  );
+}
+
+function createNullMessageContent(): Uint8Array<ArrayBuffer> {
+  return padMessage(
+    Proto.Content.encode({
+      content: {
+        nullMessage: {
+          padding: getRandomPadding(),
+        },
+      },
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: null,
+    })
+  );
+}
+
+async function sendNullMessageToRequester({
+  chat,
+  linkedPayload,
+  requesterAci,
+  timestamp,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  linkedPayload: WebSendLinkedPayload;
+  requesterAci: string;
+  timestamp: number;
+}>): Promise<void> {
+  const plaintext = createNullMessageContent();
+  let messages = await encryptForDestination({
+    chat,
+    destinationServiceId: requesterAci,
+    linkedPayload,
+    plaintext,
+  });
+
+  try {
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(requesterAci),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: false,
+    });
+  } catch (error) {
+    const mismatchedEntries = getMismatchedDevicesEntries(error, requesterAci);
+    if (!mismatchedEntries) {
+      throw error;
+    }
+    await handleWebMismatchedDevices({
+      chat,
+      entries: mismatchedEntries,
+      linkedPayload,
+    });
+    messages = await encryptForDestination({
+      chat,
+      destinationServiceId: requesterAci,
+      linkedPayload,
+      plaintext,
+    });
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(requesterAci),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: false,
+    });
+  }
+}
+
+async function resendSentProtoToRequester({
+  chat,
+  linkedPayload,
+  requesterAci,
+  sentProto,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  linkedPayload: WebSendLinkedPayload;
+  requesterAci: string;
+  sentProto: WebSentProtoRecord;
+}>): Promise<void> {
+  const proto = Proto.Content.decode(Bytes.fromBase64(sentProto.protoBase64));
+  const plaintext = padMessage(Proto.Content.encode(proto));
+  let messages = await encryptForDestination({
+    chat,
+    destinationServiceId: requesterAci,
+    linkedPayload,
+    plaintext,
+  });
+
+  try {
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(requesterAci),
+      contents: messages,
+      timestamp: sentProto.timestamp,
+      onlineOnly: false,
+      urgent: sentProto.urgent,
+    });
+  } catch (error) {
+    const mismatchedEntries = getMismatchedDevicesEntries(error, requesterAci);
+    if (!mismatchedEntries) {
+      throw error;
+    }
+    await handleWebMismatchedDevices({
+      chat,
+      entries: mismatchedEntries,
+      linkedPayload,
+    });
+    messages = await encryptForDestination({
+      chat,
+      destinationServiceId: requesterAci,
+      linkedPayload,
+      plaintext,
+    });
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(requesterAci),
+      contents: messages,
+      timestamp: sentProto.timestamp,
+      onlineOnly: false,
+      urgent: sentProto.urgent,
+    });
+  }
+}
+
+async function handleRetryRequestMessage({
+  chat,
+  content,
+  linkedPayload,
+  sourceDevice,
+  sourceServiceId,
+}: Readonly<{
+  chat?: AuthenticatedChatConnection;
+  content: Proto.Content;
+  linkedPayload: WebSendLinkedPayload;
+  sourceDevice: number;
+  sourceServiceId: string;
+}>): Promise<WebRetryRequestResult | undefined> {
+  const decryptionErrorMessage = content.content?.decryptionErrorMessage;
+  if (!decryptionErrorMessage || Bytes.isEmpty(decryptionErrorMessage)) {
+    return undefined;
+  }
+
+  const request = DecryptionErrorMessage.deserialize(decryptionErrorMessage);
+  const sentAt = request.timestamp();
+  const requesterAci = sourceServiceId;
+  const requesterDevice = sourceDevice;
+  const senderDevice = request.deviceId();
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  const archivedSession =
+    typeof ourDeviceId === 'number' && ourDeviceId === senderDevice
+      ? await getProtocolStore(
+          linkedPayload
+        ).sessionStore.archiveSessionOnRatchetKeyMatch(
+          ProtocolAddress.new(requesterAci, requesterDevice),
+          request.ratchetKey()
+        )
+      : false;
+  const sentProto = getSentProtoRecord(requesterAci, sentAt);
+  const resultBase = {
+    archivedSession,
+    foundSentProto: Boolean(sentProto),
+    requesterAci,
+    requesterDevice,
+    senderDevice,
+    sentAt,
+  };
+
+  if (!chat) {
+    return {
+      ...resultBase,
+      resent: false,
+    };
+  }
+
+  if (!sentProto) {
+    try {
+      await sendNullMessageToRequester({
+        chat,
+        linkedPayload,
+        requesterAci,
+        timestamp: Date.now(),
+      });
+      return {
+        ...resultBase,
+        resent: false,
+        sentNullMessage: true,
+      };
+    } catch (error) {
+      return {
+        ...resultBase,
+        error: error instanceof Error ? error.message : String(error),
+        resent: false,
+        sentNullMessage: false,
+      };
+    }
+  }
+
+  try {
+    await resendSentProtoToRequester({
+      chat,
+      linkedPayload,
+      requesterAci,
+      sentProto,
+    });
+  } catch (error) {
+    return {
+      ...resultBase,
+      error: error instanceof Error ? error.message : String(error),
+      resent: false,
+    };
+  }
+
+  return {
+    ...resultBase,
+    resent: true,
+  };
+}
+
 export async function decryptIncomingSignalEnvelope({
+  chat,
   envelopeBytes,
   linkedPayload,
 }: Readonly<{
+  chat?: AuthenticatedChatConnection;
   envelopeBytes: Uint8Array<ArrayBuffer>;
   linkedPayload: WebSendLinkedPayload;
 }>): Promise<{
@@ -3158,10 +3948,13 @@ export async function decryptIncomingSignalEnvelope({
   typing?: WebTypingEvent;
   pollVote?: WebPollVoteEvent;
   pollTerminate?: WebPollTerminateEvent;
+  retryRequest?: WebRetryRequestResult;
   storageManifestFetchLatest?: boolean;
 }> {
   const envelope = Proto.Envelope.decode(envelopeBytes);
-  if (getEnvelopeType(envelope) === Proto.Envelope.Type.SERVER_DELIVERY_RECEIPT) {
+  if (
+    getEnvelopeType(envelope) === Proto.Envelope.Type.SERVER_DELIVERY_RECEIPT
+  ) {
     return {
       contentSummary: JSON.stringify({
         envelopeType: 'SERVER_DELIVERY_RECEIPT',
@@ -3170,7 +3963,18 @@ export async function decryptIncomingSignalEnvelope({
     };
   }
 
-  const decrypted = await decryptEnvelopeContent({ envelopeBytes, linkedPayload });
+  const decrypted = await decryptEnvelopeContent({
+    envelopeBytes,
+    linkedPayload,
+  });
+  decryptionErrorRetryCounts.delete(
+    getDecryptionErrorRetryKey({
+      linkedPayload,
+      sourceDevice: decrypted.sourceDevice,
+      sourceServiceId: decrypted.sourceServiceId,
+      timestamp: decrypted.timestamp,
+    })
+  );
   const processedSenderKeyDistributionMessage =
     await maybeProcessSenderKeyDistributionMessage({
       content: decrypted.content,
@@ -3178,11 +3982,25 @@ export async function decryptIncomingSignalEnvelope({
       sourceDevice: decrypted.sourceDevice,
       sourceServiceId: decrypted.sourceServiceId,
     });
+  const isDecryptionErrorMessage = isDecryptionErrorMessageContent(
+    decrypted.content
+  );
+  const retryRequest = isDecryptionErrorMessage
+    ? await handleRetryRequestMessage({
+        chat,
+        content: decrypted.content,
+        linkedPayload,
+        sourceDevice: decrypted.sourceDevice,
+        sourceServiceId: decrypted.sourceServiceId,
+      })
+    : undefined;
   return {
     contentSummary: describeDecryptedContent(decrypted.content),
-    ignoredReason: processedSenderKeyDistributionMessage
-      ? 'senderKeyDistributionMessage'
-      : undefined,
+    ignoredReason: isDecryptionErrorMessage
+      ? 'decryptionErrorMessage'
+      : processedSenderKeyDistributionMessage
+        ? 'senderKeyDistributionMessage'
+        : undefined,
     message: convertContentToWebMessage({
       content: decrypted.content,
       linkedPayload,
@@ -3243,31 +4061,74 @@ export async function decryptIncomingSignalEnvelope({
       sourceServiceId: decrypted.sourceServiceId,
       timestamp: decrypted.timestamp,
     }),
+    retryRequest,
     storageManifestFetchLatest: isStorageManifestFetchLatest(decrypted.content),
   };
 }
 
 async function fetchServerKeys(
   chat: AuthenticatedChatConnection,
-  destinationServiceId: string
+  destinationServiceId: string,
+  targetDeviceId: number | null,
+  rateLimitKey: string
 ): Promise<ServerKeys> {
-  const response = await chat.fetch({
-    verb: 'GET',
-    path: `/v2/keys/${destinationServiceId}/*`,
-    headers: [],
-    timeoutMillis: 30_000,
-  });
-  const responseBody = Buffer.from(response.body ?? new Uint8Array()).toString(
-    'utf8'
-  );
-  if (response.status !== 200) {
-    throw new Error(
-      responseBody
-        ? `getKeysForServiceId failed with status ${response.status}: ${responseBody}`
-        : `getKeysForServiceId failed with status ${response.status}`
-    );
+  const retryAfterUntil = serverKeyFetchRetryAfterByKey.get(rateLimitKey);
+  if (retryAfterUntil && retryAfterUntil > Date.now()) {
+    const retryAfterMs = retryAfterUntil - Date.now();
+    throw createChatResponseError({
+      message: `getKeysForServiceId rate limited locally; retry after ${Math.ceil(
+        retryAfterMs / 1000
+      )}s`,
+      retryAfterMs,
+      status: 429,
+    });
   }
-  return JSON.parse(responseBody) as ServerKeys;
+
+  const inFlight = serverKeyFetchesByKey.get(rateLimitKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async () => {
+    const response = await chat.fetch({
+      verb: 'GET',
+      path: `/v2/keys/${destinationServiceId}/${targetDeviceId ?? '*'}`,
+      headers: [],
+      timeoutMillis: 30_000,
+    });
+    const responseBody = Buffer.from(
+      response.body ?? new Uint8Array()
+    ).toString('utf8');
+    if (response.status !== 200) {
+      const retryAfterMs =
+        response.status === 429 ? getRetryAfterMs(response.headers) : undefined;
+      if (retryAfterMs != null) {
+        serverKeyFetchRetryAfterByKey.set(
+          rateLimitKey,
+          Date.now() + retryAfterMs
+        );
+      }
+      throw createChatResponseError({
+        message: responseBody
+          ? `getKeysForServiceId failed with status ${response.status}: ${responseBody}`
+          : `getKeysForServiceId failed with status ${response.status}`,
+        responseBody,
+        retryAfterMs,
+        status: response.status,
+      });
+    }
+    serverKeyFetchRetryAfterByKey.delete(rateLimitKey);
+    return JSON.parse(responseBody) as ServerKeys;
+  })();
+
+  serverKeyFetchesByKey.set(rateLimitKey, request);
+  try {
+    return await request;
+  } finally {
+    if (serverKeyFetchesByKey.get(rateLimitKey) === request) {
+      serverKeyFetchesByKey.delete(rateLimitKey);
+    }
+  }
 }
 
 async function createSessionsFromServerKeys({
@@ -3289,55 +4150,64 @@ async function createSessionsFromServerKeys({
 
   const { identityStore, sessionStore } = getProtocolStore(linkedPayload);
   const localAddress = ProtocolAddress.new(aci, ourDeviceId);
-  const serverKeys = await fetchServerKeys(chat, destinationServiceId);
-  const identityKey = PublicKey.deserialize(Bytes.fromBase64(serverKeys.identityKey));
-  const allowedDeviceIds = deviceIds == null ? null : new Set(deviceIds);
+  const targetDeviceIds = deviceIds == null ? [null] : [...deviceIds];
 
-  for (const device of serverKeys.devices) {
-    if (destinationServiceId === aci && device.deviceId === ourDeviceId) {
-      continue;
-    }
-    if (allowedDeviceIds && !allowedDeviceIds.has(device.deviceId)) {
-      continue;
-    }
-
-    const signedPreKey = device.signedPreKey;
-    const pqPreKey = device.pqPreKey;
-    if (!signedPreKey) {
-      throw new Error(
-        `getKeysForServiceId/${destinationServiceId}: Missing signed prekey for deviceId ${device.deviceId}`
-      );
-    }
-    if (!pqPreKey) {
-      throw new Error(
-        `getKeysForServiceId/${destinationServiceId}: Missing signed PQ prekey for deviceId ${device.deviceId}`
-      );
-    }
-
-    const destinationAddress = ProtocolAddress.new(
+  for (const targetDeviceId of targetDeviceIds) {
+    const serverKeys = await fetchServerKeys(
+      chat,
       destinationServiceId,
-      device.deviceId
+      targetDeviceId,
+      `${aci}.${ourDeviceId}:${destinationServiceId}:${targetDeviceId ?? '*'}`
     );
-    const preKeyBundle = PreKeyBundle.new(
-      device.registrationId,
-      device.deviceId,
-      device.preKey?.keyId ?? null,
-      device.preKey ? PublicKey.deserialize(Bytes.fromBase64(device.preKey.publicKey)) : null,
-      signedPreKey.keyId,
-      PublicKey.deserialize(Bytes.fromBase64(signedPreKey.publicKey)),
-      Bytes.fromBase64(signedPreKey.signature),
-      identityKey,
-      pqPreKey.keyId,
-      KEMPublicKey.deserialize(Bytes.fromBase64(pqPreKey.publicKey)),
-      Bytes.fromBase64(pqPreKey.signature)
+    const identityKey = PublicKey.deserialize(
+      Bytes.fromBase64(serverKeys.identityKey)
     );
-    await processPreKeyBundle(
-      preKeyBundle,
-      destinationAddress,
-      localAddress,
-      sessionStore,
-      identityStore
-    );
+
+    for (const device of serverKeys.devices) {
+      if (destinationServiceId === aci && device.deviceId === ourDeviceId) {
+        continue;
+      }
+
+      const signedPreKey = device.signedPreKey;
+      const pqPreKey = device.pqPreKey;
+      if (!signedPreKey) {
+        throw new Error(
+          `getKeysForServiceId/${destinationServiceId}: Missing signed prekey for deviceId ${device.deviceId}`
+        );
+      }
+      if (!pqPreKey) {
+        throw new Error(
+          `getKeysForServiceId/${destinationServiceId}: Missing signed PQ prekey for deviceId ${device.deviceId}`
+        );
+      }
+
+      const destinationAddress = ProtocolAddress.new(
+        destinationServiceId,
+        device.deviceId
+      );
+      const preKeyBundle = PreKeyBundle.new(
+        device.registrationId,
+        device.deviceId,
+        device.preKey?.keyId ?? null,
+        device.preKey
+          ? PublicKey.deserialize(Bytes.fromBase64(device.preKey.publicKey))
+          : null,
+        signedPreKey.keyId,
+        PublicKey.deserialize(Bytes.fromBase64(signedPreKey.publicKey)),
+        Bytes.fromBase64(signedPreKey.signature),
+        identityKey,
+        pqPreKey.keyId,
+        KEMPublicKey.deserialize(Bytes.fromBase64(pqPreKey.publicKey)),
+        Bytes.fromBase64(pqPreKey.signature)
+      );
+      await processPreKeyBundle(
+        preKeyBundle,
+        destinationAddress,
+        localAddress,
+        sessionStore,
+        identityStore
+      );
+    }
   }
 }
 
@@ -3397,6 +4267,52 @@ async function encryptForDestination({
     throw new Error('sendDirectTextMessage: no destination devices to send');
   }
   return encrypted;
+}
+
+async function createPlaintextContentMessages({
+  chat,
+  destinationServiceId,
+  linkedPayload,
+  plaintext,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  destinationServiceId: string;
+  linkedPayload: WebSendLinkedPayload;
+  plaintext: PlaintextContent;
+}>): Promise<ReadonlyArray<SingleOutboundUnsealedMessage>> {
+  const aci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  if (typeof ourDeviceId !== 'number') {
+    throw new Error('createPlaintextContentMessages: missing linked device id');
+  }
+
+  const { sessionStore } = getProtocolStore(linkedPayload);
+  let knownSessions = sessionStore.getKnownSessionsForServiceId(
+    destinationServiceId,
+    destinationServiceId === aci ? ourDeviceId : -1
+  );
+  if (knownSessions.length === 0) {
+    await createSessionsFromServerKeys({
+      chat,
+      destinationServiceId,
+      deviceIds: null,
+      linkedPayload,
+    });
+    knownSessions = sessionStore.getKnownSessionsForServiceId(
+      destinationServiceId,
+      destinationServiceId === aci ? ourDeviceId : -1
+    );
+  }
+
+  const messages = knownSessions.map(({ address, record }) => ({
+    deviceId: address.deviceId(),
+    registrationId: record.remoteRegistrationId(),
+    contents: plaintext.asCiphertextMessage(),
+  }));
+  if (messages.length === 0) {
+    throw new Error('createPlaintextContentMessages: no destination devices');
+  }
+  return messages;
 }
 
 type WebMismatchedDevicesEntry = Readonly<{
@@ -3504,10 +4420,16 @@ async function handleWebMismatchedDevices({
       );
     }
     if (entry.extraDevices.length > 0) {
-      sessionStore.removeSessionsForServiceId(entry.serviceId, entry.extraDevices);
+      sessionStore.removeSessionsForServiceId(
+        entry.serviceId,
+        entry.extraDevices
+      );
     }
     if (entry.staleDevices.length > 0) {
-      sessionStore.removeSessionsForServiceId(entry.serviceId, entry.staleDevices);
+      sessionStore.removeSessionsForServiceId(
+        entry.serviceId,
+        entry.staleDevices
+      );
     }
 
     if (shouldFetchAll) {
@@ -3537,6 +4459,180 @@ async function handleWebMismatchedDevices({
   }
 }
 
+function getDecryptionErrorRetryKey({
+  linkedPayload,
+  sourceDevice,
+  sourceServiceId,
+  timestamp,
+}: Readonly<{
+  linkedPayload: WebSendLinkedPayload;
+  sourceDevice: number;
+  sourceServiceId: string;
+  timestamp: number;
+}>): string {
+  const ourAci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId ?? 'unknown';
+  return `${ourAci}.${ourDeviceId}:${sourceServiceId}.${sourceDevice}:${timestamp}`;
+}
+
+export async function sendDecryptionErrorMessage({
+  chat,
+  envelopeBytes,
+  linkedPayload,
+  receivedAt,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  envelopeBytes: Uint8Array<ArrayBuffer>;
+  linkedPayload: WebSendLinkedPayload;
+  receivedAt: number;
+}>): Promise<WebDecryptionErrorRetryResult> {
+  const envelope = Proto.Envelope.decode(envelopeBytes);
+  const envelopeType = getEnvelopeType(envelope);
+  const unidentifiedSenderRetryContext =
+    envelopeType === Proto.Envelope.Type.UNIDENTIFIED_SENDER
+      ? await getUnidentifiedSenderRetryContext({ envelope, linkedPayload })
+      : undefined;
+
+  const sourceServiceId =
+    unidentifiedSenderRetryContext?.sourceServiceId ??
+    fromServiceIdBinaryOrString(
+      envelope.sourceServiceIdBinary,
+      envelope.sourceServiceId,
+      'sendDecryptionErrorMessage.sourceServiceId'
+    );
+  const ourAci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  const sourceDevice =
+    unidentifiedSenderRetryContext?.sourceDevice ??
+    envelope.sourceDeviceId ??
+    1;
+  if (!sourceServiceId || typeof ourDeviceId !== 'number') {
+    return {
+      envelopeType,
+      reason: 'missingSourceServiceIdOrLinkedDeviceId',
+      sent: false,
+      sourceDevice,
+      sourceServiceId,
+    };
+  }
+  if (sourceServiceId === ourAci && sourceDevice === ourDeviceId) {
+    return {
+      envelopeType,
+      reason: 'sourceDeviceIsOurLinkedDevice',
+      sent: false,
+      sourceDevice,
+      sourceServiceId,
+    };
+  }
+  const ciphertext =
+    unidentifiedSenderRetryContext?.ciphertext ?? envelope.content;
+  if (!ciphertext || ciphertext.byteLength === 0) {
+    return {
+      envelopeType,
+      reason: 'missingCiphertext',
+      sent: false,
+      sourceServiceId,
+    };
+  }
+
+  let ciphertextMessageType: CiphertextMessageType;
+  try {
+    ciphertextMessageType =
+      unidentifiedSenderRetryContext?.ciphertextMessageType ??
+      envelopeTypeToCiphertextMessageType(envelopeType);
+  } catch (error) {
+    return {
+      envelopeType,
+      reason: error instanceof Error ? error.message : String(error),
+      sent: false,
+      sourceDevice,
+      sourceServiceId,
+    };
+  }
+  const timestamp = toNumber(envelope.clientTimestamp) ?? receivedAt;
+  const retryKey = getDecryptionErrorRetryKey({
+    linkedPayload,
+    sourceDevice,
+    sourceServiceId,
+    timestamp,
+  });
+  const retryCount = (decryptionErrorRetryCounts.get(retryKey) ?? 0) + 1;
+  decryptionErrorRetryCounts.set(retryKey, retryCount);
+  if (retryCount > DECRYPTION_ERROR_RETRY_LIMIT) {
+    return {
+      envelopeType,
+      reason: 'retryLimitExceeded',
+      retryCount,
+      sent: false,
+      sourceDevice,
+      sourceServiceId,
+      timestamp,
+    };
+  }
+
+  try {
+    const decryptionErrorMessage = DecryptionErrorMessage.forOriginal(
+      ciphertext,
+      ciphertextMessageType,
+      timestamp,
+      sourceDevice
+    );
+    const plaintext = PlaintextContent.from(decryptionErrorMessage);
+    let messages = await createPlaintextContentMessages({
+      chat,
+      destinationServiceId: sourceServiceId,
+      linkedPayload,
+      plaintext,
+    });
+
+    try {
+      await chat.sendMessage({
+        destination: ServiceId.parseFromServiceIdString(sourceServiceId),
+        contents: messages,
+        timestamp,
+        onlineOnly: false,
+        urgent: false,
+      });
+    } catch (error) {
+      const mismatchedEntries = getMismatchedDevicesEntries(
+        error,
+        sourceServiceId
+      );
+      if (!mismatchedEntries) {
+        throw error;
+      }
+      await handleWebMismatchedDevices({
+        chat,
+        entries: mismatchedEntries,
+        linkedPayload,
+      });
+      messages = await createPlaintextContentMessages({
+        chat,
+        destinationServiceId: sourceServiceId,
+        linkedPayload,
+        plaintext,
+      });
+      await chat.sendMessage({
+        destination: ServiceId.parseFromServiceIdString(sourceServiceId),
+        contents: messages,
+        timestamp,
+        onlineOnly: false,
+        urgent: false,
+      });
+    }
+
+    return {
+      envelopeType,
+      sent: true,
+      sourceDevice,
+      sourceServiceId,
+      timestamp,
+    };
+  } catch (error) {
+    throw error;
+  }
+}
+
 export async function sendDirectTextMessage({
   attachments = [],
   body,
@@ -3552,7 +4648,9 @@ export async function sendDirectTextMessage({
   quote,
   timestamp,
   unpinMessage,
-}: DirectTextSendOptions): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
+}: DirectTextSendOptions): Promise<
+  WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
+> {
   const ourAci = getLinkedAci(linkedPayload);
   const plaintext = createTextContent(
     body,
@@ -3646,6 +4744,16 @@ export async function sendDirectTextMessage({
         );
       }
     }
+
+    saveSentProtoRecord({
+      contentHint: ContentHint.Resendable,
+      plaintext,
+      recipientDeviceIdsByServiceId: {
+        [destinationServiceId]: messages.map(message => message.deviceId),
+      },
+      timestamp,
+      urgent: true,
+    });
 
     try {
       const syncMessages = await encryptForDestination({
@@ -3777,7 +4885,17 @@ export async function sendGroupUpdateMessage({
   const groupContext = groupChangeBase64
     ? createGroupUpdateContextV2(groupV2, groupChangeBase64)
     : createGroupContextV2(groupV2);
-  const plaintext = createTextContent('', timestamp, [], undefined, undefined, undefined, undefined, undefined, groupContext);
+  const plaintext = createTextContent(
+    '',
+    timestamp,
+    [],
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    groupContext
+  );
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
   );
@@ -3833,6 +4951,17 @@ export async function sendGroupUpdateMessage({
         urgent: true,
       });
     }
+
+    saveSentProtoRecord({
+      contentHint: ContentHint.Resendable,
+      groupId,
+      plaintext,
+      recipientDeviceIdsByServiceId: {
+        [destinationServiceId]: messages.map(message => message.deviceId),
+      },
+      timestamp,
+      urgent: true,
+    });
   }
 
   try {
@@ -3876,7 +5005,9 @@ export async function sendGroupTextMessage({
   recipients,
   timestamp,
   unpinMessage,
-}: GroupTextSendOptions): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
+}: GroupTextSendOptions): Promise<
+  WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
+> {
   const ourAci = getLinkedAci(linkedPayload);
   const groupContext = createGroupContextV2(groupV2);
   const plaintext = createTextContent(
@@ -3952,6 +5083,17 @@ export async function sendGroupTextMessage({
         urgent: true,
       });
     }
+
+    saveSentProtoRecord({
+      contentHint: ContentHint.Resendable,
+      groupId,
+      plaintext,
+      recipientDeviceIdsByServiceId: {
+        [destinationServiceId]: messages.map(message => message.deviceId),
+      },
+      timestamp,
+      urgent: true,
+    });
   }
 
   try {
@@ -3986,7 +5128,9 @@ export async function sendGroupTextMessage({
     );
   }
 
-  const secretParams = deriveGroupSecretParams(Bytes.fromBase64(groupV2.masterKey));
+  const secretParams = deriveGroupSecretParams(
+    Bytes.fromBase64(groupV2.masterKey)
+  );
   const publicParams = deriveGroupPublicParams(secretParams);
 
   return {

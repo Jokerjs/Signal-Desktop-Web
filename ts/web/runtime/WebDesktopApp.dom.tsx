@@ -72,7 +72,7 @@ import {
   getWebConversationLastMessage,
   getWebMessagePreviewText,
   normalizeChatShellForLinkedSession,
-  registerMessageInCache,
+  registerMessageInCache as registerMessageInCacheImmediately,
   toDesktopConversation,
   toDesktopMessage,
 } from './stateAdapter.dom.ts';
@@ -139,6 +139,69 @@ const ATTACHMENT_BACKFILL_STATUS_PENDING =
 const ATTACHMENT_BACKFILL_STATUS_TERMINAL_ERROR =
   Proto.SyncMessage.AttachmentBackfillResponse.AttachmentData.Status
     .TERMINAL_ERROR;
+
+function deferWebRuntimeSideEffect(effect: () => void): Promise<void> {
+  return new Promise(resolve => {
+    queueMicrotask(() => {
+      try {
+        effect();
+      } catch (error) {
+        console.error('Web runtime side effect failed', error);
+      } finally {
+        resolve();
+      }
+    });
+  });
+}
+
+function queueWebRuntimeSideEffect(effect: () => void): void {
+  void deferWebRuntimeSideEffect(effect);
+}
+
+function registerMessageInCache(message: WebMessage): void {
+  queueWebRuntimeSideEffect(() => {
+    registerMessageInCacheImmediately(message);
+  });
+}
+
+function dispatchMessageChanged(
+  messageId: string,
+  conversationId: string,
+  desktopMessage: ReturnType<typeof toDesktopMessage>
+): void {
+  queueWebRuntimeSideEffect(() => {
+    window.reduxActions?.conversations?.messageChanged?.(
+      messageId,
+      conversationId,
+      desktopMessage
+    );
+  });
+}
+
+function dispatchMessagesAdded(
+  options: Parameters<
+    NonNullable<
+      NonNullable<typeof window.reduxActions>['conversations']
+    >['messagesAdded']
+  >[0]
+): Promise<void> {
+  return deferWebRuntimeSideEffect(() => {
+    window.reduxActions?.conversations?.messagesAdded?.(options);
+  });
+}
+
+function dispatchMessagesAddedSoon(
+  options: Parameters<
+    NonNullable<
+      NonNullable<typeof window.reduxActions>['conversations']
+    >['messagesAdded']
+  >[0]
+): void {
+  queueWebRuntimeSideEffect(() => {
+    window.reduxActions?.conversations?.messagesAdded?.(options);
+  });
+}
+
 const ATTACHMENT_BACKFILL_ERROR_MESSAGE_NOT_FOUND =
   Proto.SyncMessage.AttachmentBackfillResponse.Error.MESSAGE_NOT_FOUND;
 const { isEqual } = lodash;
@@ -874,18 +937,32 @@ function WebDesktopAppBody({
   );
 }
 
+function dispatchConversationNow(
+  linkedSession: LinkedSessionRecord,
+  conversationId: string,
+  shell: ChatShellState
+): Promise<void> {
+  const conversation = shell.conversationLookup[conversationId];
+  if (!conversation) {
+    return Promise.resolve();
+  }
+  const desktopConversation = toDesktopConversation(
+    conversation,
+    linkedSession
+  );
+  return deferWebRuntimeSideEffect(() => {
+    window.reduxActions?.conversations?.conversationsUpdated?.([
+      desktopConversation as never,
+    ]);
+  });
+}
+
 function dispatchConversation(
   linkedSession: LinkedSessionRecord,
   conversationId: string,
   shell: ChatShellState
 ): void {
-  const conversation = shell.conversationLookup[conversationId];
-  if (!conversation) {
-    return;
-  }
-  window.reduxActions?.conversations?.conversationsUpdated?.([
-    toDesktopConversation(conversation, linkedSession) as never,
-  ]);
+  void dispatchConversationNow(linkedSession, conversationId, shell);
 }
 
 function dispatchConversations(
@@ -896,9 +973,11 @@ function dispatchConversations(
     conversation => toDesktopConversation(conversation, linkedSession)
   );
   if (conversations.length > 0) {
-    window.reduxActions?.conversations?.conversationsUpdated?.(
-      conversations as never
-    );
+    deferWebRuntimeSideEffect(() => {
+      window.reduxActions?.conversations?.conversationsUpdated?.(
+        conversations as never
+      );
+    });
   }
 }
 
@@ -1031,12 +1110,12 @@ function hasLoadedConversationMessages(conversationId: string): boolean {
   return Array.isArray(messageIds) && messageIds.length > 0;
 }
 
-function dispatchConversationMessages(
+function dispatchConversationMessagesNow(
   conversationId: string,
   shell: ChatShellState
-): void {
+): Promise<boolean> {
   if (hasLoadedConversationMessages(conversationId)) {
-    return;
+    return Promise.resolve(false);
   }
 
   const { desktopMessages, metrics } = getConversationDesktopMessages(
@@ -1045,18 +1124,29 @@ function dispatchConversationMessages(
   );
   const resetKey = getMessagesResetKey(conversationId, shell);
   if (lastMessagesResetKeyByConversationId.get(conversationId) === resetKey) {
-    return;
+    return Promise.resolve(false);
   }
 
-  window.reduxActions?.conversations?.messagesReset?.({
-    conversationId,
-    messages: desktopMessages,
-    metrics,
-    pinnedMessagesPreloadData:
-      getWebPinnedMessagesPreloadDataForConversation(conversationId),
-    unboundedFetch: true,
+  const pinnedMessagesPreloadData =
+    getWebPinnedMessagesPreloadDataForConversation(conversationId);
+  const result = deferWebRuntimeSideEffect(() => {
+    window.reduxActions?.conversations?.messagesReset?.({
+      conversationId,
+      messages: desktopMessages,
+      metrics,
+      pinnedMessagesPreloadData,
+      unboundedFetch: true,
+    });
   });
   lastMessagesResetKeyByConversationId.set(conversationId, resetKey);
+  return result.then(() => true);
+}
+
+function dispatchConversationMessages(
+  conversationId: string,
+  shell: ChatShellState
+): void {
+  void dispatchConversationMessagesNow(conversationId, shell);
 }
 
 function getActiveConversationId(shell: ChatShellState): string | undefined {
@@ -1082,18 +1172,22 @@ function dispatchShell(
   }
 }
 
-function dispatchMessage(event: MessageStreamEvent): void {
+function dispatchMessage(event: MessageStreamEvent): Promise<void> {
   if (event.type !== 'message') {
-    return;
+    return Promise.resolve();
   }
-  window.reduxActions?.conversations?.messagesAdded?.({
-    conversationId: event.message.conversationId,
-    isActive: document.visibilityState === 'visible',
-    isJustSent: event.message.direction === 'outgoing',
+  const message = event.message;
+  const desktopMessage = toDesktopMessage(message);
+  const isActive = document.visibilityState === 'visible';
+  const result = dispatchMessagesAdded({
+    conversationId: message.conversationId,
+    isActive,
+    isJustSent: message.direction === 'outgoing',
     isNewMessage: true,
-    messages: [toDesktopMessage(event.message)],
+    messages: [desktopMessage],
   });
-  registerMessageInCache(event.message);
+  registerMessageInCache(message);
+  return result;
 }
 
 const videoThumbnailTasks = new Set<string>();
@@ -1377,11 +1471,14 @@ function createConversationFromMessage(message: WebMessage): WebConversation {
 function ensureConversationForMessage(
   shell: ChatShellState,
   message: WebMessage,
-  ourConversationId?: string
+  ourConversationId?: string,
+  options: Readonly<{ isNewMessage?: boolean }> = {}
 ): ChatShellState {
   const existing = shell.conversationLookup[message.conversationId];
   const timestamp = message.receivedAt ?? message.timestamp;
+  const isNewMessage = options.isNewMessage !== false;
   const isUnreadIncoming =
+    isNewMessage &&
     message.direction === 'incoming' &&
     message.readStatus === ReadStatus.Unread;
   if (existing) {
@@ -1430,9 +1527,9 @@ function ensureConversationForMessage(
             }
           : null),
         snippet: getWebMessagePreviewText(message) || existing.snippet,
-        messageCount: (existing.messageCount ?? 0) + 1,
+        messageCount: (existing.messageCount ?? 0) + (isNewMessage ? 1 : 0),
         sentMessageCount:
-          message.direction === 'outgoing'
+          isNewMessage && message.direction === 'outgoing'
             ? (existing.sentMessageCount ?? 0) + 1
             : existing.sentMessageCount,
         messagesDeleted: undefined,
@@ -2185,7 +2282,7 @@ export function WebDesktopApp({
               };
               persistShell(next);
               registerMessageInCache(updated);
-              window.reduxActions?.conversations?.messageChanged?.(
+              dispatchMessageChanged(
                 updated.id,
                 updated.conversationId,
                 toDesktopMessage(updated)
@@ -2262,7 +2359,7 @@ export function WebDesktopApp({
         };
         persistShell(next);
         registerMessageInCache(updated);
-        window.reduxActions?.conversations?.messageChanged?.(
+        dispatchMessageChanged(
           updated.id,
           updated.conversationId,
           toDesktopMessage(updated)
@@ -2640,15 +2737,17 @@ export function WebDesktopApp({
           );
           persistShell(nextShell);
           dispatchConversation(linkedSession, conversationId, nextShell);
-          window.reduxActions?.conversations?.messagesAdded?.({
+          dispatchMessagesAddedSoon({
             conversationId,
             isActive: document.visibilityState === 'visible',
             isJustSent: true,
             isNewMessage: true,
             messages: [toDesktopMessage(message)],
           });
-          window.reduxActions?.toast?.showToast?.({
-            toastType: ToastType.LeftGroup,
+          deferWebRuntimeSideEffect(() => {
+            window.reduxActions?.toast?.showToast?.({
+              toastType: ToastType.LeftGroup,
+            });
           });
           return nextShell;
         });
@@ -2763,7 +2862,7 @@ export function WebDesktopApp({
             linkedSession?.credentials?.aci
           );
           registerMessageInCache(updated);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             updated.id,
             updated.conversationId,
             toDesktopMessage(updated)
@@ -2830,7 +2929,7 @@ export function WebDesktopApp({
           };
           persistShell(next);
           registerMessageInCache(updated);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             updated.id,
             updated.conversationId,
             toDesktopMessage(updated)
@@ -2894,7 +2993,7 @@ export function WebDesktopApp({
           };
           persistShell(next);
           registerMessageInCache(updated);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             updated.id,
             updated.conversationId,
             toDesktopMessage(updated)
@@ -3006,7 +3105,7 @@ export function WebDesktopApp({
             if (!changedIds.has(message.id)) {
               continue;
             }
-            window.reduxActions?.conversations?.messageChanged?.(
+            dispatchMessageChanged(
               message.id,
               message.conversationId,
               toDesktopMessage(message)
@@ -3126,7 +3225,7 @@ export function WebDesktopApp({
         });
 
         for (const message of outboundMessages) {
-          window.reduxActions?.conversations?.messagesAdded?.({
+          dispatchMessagesAddedSoon({
             conversationId: message.conversationId,
             isActive: document.visibilityState === 'visible',
             isJustSent: true,
@@ -3265,7 +3364,7 @@ export function WebDesktopApp({
             nextShell,
             linkedSession.credentials?.aci
           );
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             id,
             updatedMessage.conversationId,
             toDesktopMessage(updatedMessage)
@@ -3339,7 +3438,7 @@ export function WebDesktopApp({
                 nextShell,
                 linkedSession.credentials?.aci
               );
-              window.reduxActions?.conversations?.messageChanged?.(
+              dispatchMessageChanged(
                 id,
                 sentMessage.conversationId,
                 toDesktopMessage(sentMessage)
@@ -3368,7 +3467,7 @@ export function WebDesktopApp({
                 nextShell,
                 linkedSession.credentials?.aci
               );
-              window.reduxActions?.conversations?.messageChanged?.(
+              dispatchMessageChanged(
                 id,
                 previousMessage.conversationId,
                 toDesktopMessage(previousMessage)
@@ -3509,9 +3608,11 @@ export function WebDesktopApp({
             linkedSession
           );
           persistShell(updated);
-          window.reduxActions?.conversations?.conversationRemoved?.(
-            conversationId
-          );
+          deferWebRuntimeSideEffect(() => {
+            window.reduxActions?.conversations?.conversationRemoved?.(
+              conversationId
+            );
+          });
           return updated;
         }
 
@@ -3678,7 +3779,7 @@ export function WebDesktopApp({
     const showBackfillFailureModal = (kind: BackfillFailureModalKind): void => {
       window.reduxActions?.globalModals?.showBackfillFailureModal?.(kind);
     };
-    const handleEvent = (event: MessageStreamEvent) => {
+    const handleEvent = async (event: MessageStreamEvent) => {
       const currentLinkedSession = getCurrentLinkedSession();
       if (event.type === 'session') {
         runtimeSessionId = event.sessionId;
@@ -3716,11 +3817,14 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'protocol-state') {
-        void persistLinkedSessionRecordToIndexedDb({
-          ...currentLinkedSession,
+        const current = getCurrentLinkedSession();
+        const next: LinkedSessionRecord = {
+          ...current,
           lastUpdatedAt: Date.now(),
           protocol: event.protocol,
-        });
+        };
+        linkedSessionRef.current = next;
+        void persistLinkedSessionRecordToIndexedDb(next);
       } else if (event.type === 'transport-status') {
         if (isDeviceDelinkedError(event.error)) {
           abortController.abort();
@@ -3911,36 +4015,58 @@ export function WebDesktopApp({
               }
             : event.message;
         let shouldDispatchMessage = false;
-        setShell(current => {
-          const nextMessages = appendUniqueMessagesSorted(current.messages, [
-            message,
-          ]);
-          if (nextMessages === current.messages) {
-            return current;
-          }
-          shouldDispatchMessage = true;
-          const ourConversationId =
-            currentLinkedSession.credentials?.aci ??
-            currentLinkedSession.account.aci;
-          const withConversation = ensureConversationForMessage(
-            current,
-            message,
-            ourConversationId
-          );
-          const next = {
-            ...withConversation,
-            messages: nextMessages,
-          };
-          persistShell(next);
-          dispatchConversation(
+        let nextShellForSideEffects: ChatShellState | undefined;
+        await new Promise<void>(resolve => {
+          setShell(current => {
+            const nextMessages = appendUniqueMessagesSorted(current.messages, [
+              message,
+            ]);
+            const isNewMessage = nextMessages !== current.messages;
+            const ourConversationId =
+              currentLinkedSession.credentials?.aci ??
+              currentLinkedSession.account.aci;
+            const withConversation = ensureConversationForMessage(
+              current,
+              message,
+              ourConversationId,
+              { isNewMessage }
+            );
+            if (
+              nextMessages === current.messages &&
+              withConversation === current
+            ) {
+              resolve();
+              return current;
+            }
+            shouldDispatchMessage = isNewMessage;
+            const next = {
+              ...withConversation,
+              messages: nextMessages,
+            };
+            nextShellForSideEffects = next;
+            resolve();
+            return next;
+          });
+        });
+        if (nextShellForSideEffects) {
+          persistShell(nextShellForSideEffects);
+          await dispatchConversationNow(
             currentLinkedSession,
             message.conversationId,
-            next
+            nextShellForSideEffects
           );
-          return next;
-        });
+          if (
+            selectedConversationId === message.conversationId &&
+            !hasLoadedConversationMessages(message.conversationId)
+          ) {
+            await dispatchConversationMessagesNow(
+              message.conversationId,
+              nextShellForSideEffects
+            );
+          }
+        }
         if (shouldDispatchMessage) {
-          dispatchMessage({ ...event, message });
+          await dispatchMessage({ ...event, message });
         }
       } else if (event.type === 'pin-message') {
         void applyRemotePinnedMessage(event).then(applied => {
@@ -4047,7 +4173,7 @@ export function WebDesktopApp({
             };
             persistShell(next);
             registerMessageInCache(nextMessage);
-            window.reduxActions?.conversations?.messageChanged?.(
+            dispatchMessageChanged(
               nextMessage.id,
               nextMessage.conversationId,
               toDesktopMessage(nextMessage)
@@ -4176,7 +4302,7 @@ export function WebDesktopApp({
           };
           persistShell(next);
           registerMessageInCache(nextMessage);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             nextMessage.id,
             nextMessage.conversationId,
             toDesktopMessage(nextMessage)
@@ -4236,7 +4362,7 @@ export function WebDesktopApp({
             messages: result.messages,
           };
           persistShell(next);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             target.id,
             target.conversationId,
             toDesktopMessage(nextMessage)
@@ -4293,7 +4419,7 @@ export function WebDesktopApp({
             nextMessage.conversationId,
             next
           );
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             target.id,
             target.conversationId,
             toDesktopMessage(nextMessage)
@@ -4354,7 +4480,7 @@ export function WebDesktopApp({
             nextMessage.conversationId,
             next
           );
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             target.id,
             target.conversationId,
             toDesktopMessage(nextMessage)
@@ -4404,7 +4530,7 @@ export function WebDesktopApp({
           }
           persistShell(next);
           for (const message of changedMessages) {
-            window.reduxActions?.conversations?.messageChanged?.(
+            dispatchMessageChanged(
               message.id,
               message.conversationId,
               toDesktopMessage(message)
@@ -4467,7 +4593,7 @@ export function WebDesktopApp({
             messages: result.messages,
           };
           persistShell(next);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             target.id,
             target.conversationId,
             toDesktopMessage(nextMessage)
@@ -4516,7 +4642,7 @@ export function WebDesktopApp({
             messages: result.messages,
           };
           persistShell(next);
-          window.reduxActions?.conversations?.messageChanged?.(
+          dispatchMessageChanged(
             target.id,
             target.conversationId,
             toDesktopMessage(nextMessage)
