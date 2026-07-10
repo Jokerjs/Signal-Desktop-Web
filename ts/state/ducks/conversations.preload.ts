@@ -4689,19 +4689,31 @@ function addMembersToGroup(
 
     const idForLogging = conversation.idForLogging();
     try {
+      const webConversation = conversation as unknown as {
+        addMembersToGroup?: (contactIds: ReadonlyArray<string>) => Promise<void>;
+      };
+      if (webConversation.addMembersToGroup) {
+        onSuccess?.();
+        drop(
+          longRunningTaskWrapper({
+            name: 'addMembersToGroup',
+            idForLogging,
+            task: () => {
+              strictAssert(
+                webConversation.addMembersToGroup,
+                'addMembersToGroup: web addMembersToGroup disappeared'
+              );
+              return webConversation.addMembersToGroup(contactIds);
+            },
+          })
+        );
+        return;
+      }
+
       await longRunningTaskWrapper({
         name: 'addMembersToGroup',
         idForLogging,
         task: async () => {
-          const webConversation = conversation as unknown as {
-            addMembersToGroup?: (
-              contactIds: ReadonlyArray<string>
-            ) => Promise<void>;
-          };
-          if (webConversation.addMembersToGroup) {
-            await webConversation.addMembersToGroup(contactIds);
-            return;
-          }
           await modifyGroupV2({
             name: 'addMembersToGroup',
             conversation,
