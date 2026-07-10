@@ -572,14 +572,35 @@ export async function clearChatShellStateForSession(
 
 export async function clearWebPersistence(): Promise<void> {
   const activeUserId = getActiveLinkedSessionUserIdFromStorage();
-  if (activeUserId) {
-    try {
+  try {
+    if (activeUserId) {
       window.localStorage.removeItem(getScopedChatShellStorageKey(activeUserId));
+      window.localStorage.removeItem(
+        getUserScopedStorageKey(activeUserId, CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE)
+      );
       window.localStorage.removeItem(activeUserId);
+    }
+    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.localStorage.key(index);
+      if (
+        key?.startsWith('user:') &&
+        (key.endsWith(`:${CHAT_SHELL_STORAGE_KEY_BASE}`) ||
+          key.endsWith(`:${CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE}`))
+      ) {
+        window.localStorage.removeItem(key);
+      }
+    }
+    window.sessionStorage.clear();
+  } catch {
+  }
+  persistLinkedSessionToStorage(undefined);
+  if (window.caches) {
+    try {
+      const cacheNames = await window.caches.keys();
+      await Promise.all(cacheNames.map(cacheName => window.caches.delete(cacheName)));
     } catch {
     }
   }
-  persistLinkedSessionToStorage(undefined);
   const database = await openRenderPersistenceDatabase();
   if (!database) {
     return;

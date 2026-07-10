@@ -379,6 +379,10 @@ export function SmartPreferences({
   >([]);
 
   useEffect(() => {
+    if (isSignalWebRuntime) {
+      return undefined;
+    }
+
     let canceled = false;
     const loadDevices = async () => {
       const {
@@ -399,7 +403,7 @@ export function SmartPreferences({
     return () => {
       canceled = true;
     };
-  }, []);
+  }, [isSignalWebRuntime]);
 
   // Ephemeral settings, via async IPC, all can be modiified
 
@@ -517,6 +521,10 @@ export function SmartPreferences({
     drop(loadAutoLaunch());
 
     const loadMediaCameraPermissions = async () => {
+      if (isSignalWebRuntime) {
+        setMediaCameraPermissions(false);
+        return;
+      }
       const value = await window.Events.getMediaCameraPermissions();
       if (canceled) {
         return;
@@ -526,6 +534,10 @@ export function SmartPreferences({
     drop(loadMediaCameraPermissions());
 
     const loadMediaPermissions = async () => {
+      if (isSignalWebRuntime) {
+        setMediaPermissions(false);
+        return;
+      }
       const value = await window.Events.getMediaPermissions();
       if (canceled) {
         return;
@@ -555,7 +567,7 @@ export function SmartPreferences({
       canceled = true;
       window.Events.offZoomFactorChange(updateZoomFactorFromIpc);
     };
-  }, []);
+  }, [isSignalWebRuntime]);
 
   const onAutoLaunchChange = async (value: boolean) => {
     setAutoLaunch(value);

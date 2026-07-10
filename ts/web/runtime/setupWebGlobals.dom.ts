@@ -896,20 +896,6 @@ function searchWebMessages(options: {
     .slice(0, limit);
 }
 
-async function getWebMicrophonePermission(): Promise<boolean> {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    return false;
-  }
-
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach(track => track.stop());
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function getConversationMessagesPage(options: unknown): Array<MessageRecord> {
   if (!options || typeof options !== 'object') {
     return [];
@@ -3777,7 +3763,7 @@ export function setupWebGlobals({
     getContentProtection: async () => false,
     getLocaleOverride: async () => null,
     getMediaCameraPermissions: async () => false,
-    getMediaPermissions: getWebMicrophonePermission,
+    getMediaPermissions: async () => false,
     getSpellCheck: async () => true,
     getSystemTraySetting: async () => false,
     getThemeSetting: async () => loadWebSettings().theme,
@@ -3817,7 +3803,7 @@ export function setupWebGlobals({
     getAutoLaunch: async () => false,
     getMediaAccessStatus: async () => 'not-determined',
     getMediaCameraPermissions: async () => false,
-    getMediaPermissions: getWebMicrophonePermission,
+    getMediaPermissions: async () => false,
     openSystemMediaPermissions: async () => undefined,
     readyForUpdates: noop,
     removeSetupMenuItems: noop,

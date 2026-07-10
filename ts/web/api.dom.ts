@@ -176,7 +176,7 @@ export async function consumeMessageTransportStream({
   linkedSession: LinkedSessionRecord;
   includeProtocol?: boolean;
   signal: AbortSignal;
-  onEvent: (event: MessageStreamEvent) => void;
+  onEvent: (event: MessageStreamEvent) => void | Promise<void>;
 }>): Promise<void> {
   const response = await fetch(apiUrl('/messages/stream'), {
     method: 'POST',
@@ -201,8 +201,8 @@ export async function consumeMessageTransportStream({
   const decoder = new TextDecoder();
   let buffer = '';
   let runtimeSessionId: string | undefined;
-  const handleStreamEvent = (event: MessageStreamEvent) => {
-    onEvent(event);
+  const handleStreamEvent = async (event: MessageStreamEvent) => {
+    await onEvent(event);
     if (event.type === 'session') {
       runtimeSessionId = event.sessionId;
       currentMessageRuntimeSessionId = event.sessionId;
@@ -226,13 +226,13 @@ export async function consumeMessageTransportStream({
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed) {
-        handleStreamEvent(JSON.parse(trimmed) as MessageStreamEvent);
+        await handleStreamEvent(JSON.parse(trimmed) as MessageStreamEvent);
       }
     }
   }
   const remaining = buffer.trim();
   if (remaining) {
-    handleStreamEvent(JSON.parse(remaining) as MessageStreamEvent);
+    await handleStreamEvent(JSON.parse(remaining) as MessageStreamEvent);
   }
 }
 
