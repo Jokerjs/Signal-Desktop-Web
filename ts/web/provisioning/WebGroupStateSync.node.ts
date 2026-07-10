@@ -6,7 +6,13 @@ import { randomBytes } from 'node:crypto';
 import https from 'node:https';
 import { createRequire } from 'node:module';
 
-import { AuthCredentialWithPniResponse } from '@signalapp/libsignal-client/zkgroup.js';
+import { Aci } from '@signalapp/libsignal-client';
+import {
+  AuthCredentialWithPniResponse,
+  GroupSecretParams,
+  GroupSendEndorsementsResponse,
+  ServerPublicParams,
+} from '@signalapp/libsignal-client/zkgroup.js';
 import type { AuthenticatedChatConnection } from '@signalapp/libsignal-client/dist/net.js';
 
 import * as Bytes from '../../Bytes.std.ts';
@@ -38,7 +44,11 @@ import {
   getClientZkProfileOperations,
   handleProfileKeyCredential,
 } from '../../util/zkgroup.node.ts';
-import type { LinkedPayload, WebConversation } from '../types.std.ts';
+import type {
+  LinkedPayload,
+  WebConversation,
+  WebGroupSendEndorsements,
+} from '../types.std.ts';
 
 const require = createRequire(import.meta.url);
 const productionConfig = require('../../../config/production.json') as {
@@ -65,6 +75,65 @@ type GroupCredentials = Readonly<{
   groupPublicParamsHex: string;
   authCredentialPresentationHex: string;
 }>;
+
+function decodeWebGroupSendEndorsements({
+  groupSendEndorsementsResponse,
+  groupSecretParamsBase64,
+  groupMembersV2,
+  linkedPayload,
+}: Readonly<{
+  groupSendEndorsementsResponse: Uint8Array<ArrayBuffer>;
+  groupSecretParamsBase64: string;
+  groupMembersV2: ReadonlyArray<Readonly<{ aci: string }>>;
+  linkedPayload: LinkedPayload;
+}>): WebGroupSendEndorsements {
+  const localAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
+  if (!localAci) {
+    throw new Error('decodeWebGroupSendEndorsements: missing linked ACI');
+  }
+
+  const response = new GroupSendEndorsementsResponse(
+    groupSendEndorsementsResponse
+  );
+  const groupMembers = groupMembersV2.map(member =>
+    Aci.parseFromServiceIdString(member.aci)
+  );
+  const received = response.receiveWithServiceIds(
+    groupMembers,
+    Aci.parseFromServiceIdString(localAci),
+    new GroupSecretParams(Bytes.fromBase64(groupSecretParamsBase64)),
+    new ServerPublicParams(Bytes.fromBase64(productionConfig.serverPublicParams))
+  );
+  const expiration = response.getExpiration().getTime() / 1000;
+
+  if (received.endorsements.length !== groupMembersV2.length) {
+    throw new Error(
+      `decodeWebGroupSendEndorsements: endorsement count mismatch (${received.endorsements.length}/${groupMembersV2.length})`
+    );
+  }
+
+  return {
+    combinedEndorsement: {
+      expiration,
+      endorsementBase64: Bytes.toBase64(
+        received.combinedEndorsement.getContents()
+      ),
+    },
+    memberEndorsements: groupMembersV2.map((member, index) => {
+      const endorsement = received.endorsements[index];
+      if (!endorsement) {
+        throw new Error(
+          `decodeWebGroupSendEndorsements: missing endorsement at index ${index}`
+        );
+      }
+      return {
+        memberAci: member.aci,
+        expiration,
+        endorsementBase64: Bytes.toBase64(endorsement.getContents()),
+      };
+    }),
+  };
+}
 
 type ProfileCredentialResponse = Readonly<{
   credential?: string;
@@ -1295,16 +1364,27 @@ export async function createGroupConversation({
     storageUrl,
   });
   const response = Proto.GroupResponse.decode(bytes);
-  if (!response.groupSendEndorsementsResponse) {
-    throw new Error(
-      'createGroupConversation: missing groupSendEndorsementsResponse'
-    );
-  }
 
   const timestamp = Date.now();
   const localAvatarUrl = avatar
     ? `data:image/jpeg;base64,${avatar}`
     : undefined;
+  let groupSendEndorsements: WebGroupSendEndorsements | undefined;
+  if (response.groupSendEndorsementsResponse?.byteLength) {
+    try {
+      groupSendEndorsements = decodeWebGroupSendEndorsements({
+        groupSendEndorsementsResponse: response.groupSendEndorsementsResponse,
+        groupSecretParamsBase64: secretParams,
+        groupMembersV2: membersV2,
+        linkedPayload,
+      });
+    } catch (error) {
+      console.warn(
+        'createGroupConversation: failed to decode group send endorsements',
+        error
+      );
+    }
+  }
   return {
     id: groupId,
     type: 'group',
@@ -1314,6 +1394,7 @@ export async function createGroupConversation({
     activeAt: timestamp,
     avatarUrl: localAvatarUrl,
     groupId,
+    groupSendEndorsements,
     hasMessages: true,
     hasAvatar: Boolean(localAvatarUrl),
     isArchived: false,
@@ -1923,6 +2004,22 @@ export async function fetchLatestGroupStateConversation({
     response.group.membersBanned ?? [],
     conversation.secretParams
   );
+  let groupSendEndorsements = conversation.groupSendEndorsements;
+  if (response.groupSendEndorsementsResponse?.byteLength) {
+    try {
+      groupSendEndorsements = decodeWebGroupSendEndorsements({
+        groupSendEndorsementsResponse: response.groupSendEndorsementsResponse,
+        groupSecretParamsBase64: conversation.secretParams,
+        groupMembersV2: membersV2,
+        linkedPayload,
+      });
+    } catch (error) {
+      console.warn(
+        'fetchLatestGroupStateConversation: failed to decode group send endorsements',
+        error
+      );
+    }
+  }
   const ourAci = linkedPayload.credentials?.aci ?? linkedPayload.account.aci;
   const left = ourAci
     ? !membersV2.some(member => member.aci === ourAci)
@@ -1952,6 +2049,7 @@ export async function fetchLatestGroupStateConversation({
     avatarUrl,
     bannedMembersV2,
     hasAvatar: Boolean(avatarUrl || remoteAvatarUrl) || conversation.hasAvatar,
+    groupSendEndorsements,
     left,
     membersV2,
     pendingMembersV2,

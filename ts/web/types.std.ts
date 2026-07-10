@@ -82,6 +82,7 @@ export type ProtocolState = Readonly<{
   kyberPreKeys: ReadonlyArray<ProtocolKyberPreKeyRecord>;
   sessions: ReadonlyArray<ProtocolSessionRecord>;
   senderKeys: ReadonlyArray<ProtocolSenderKeyRecord>;
+  senderKeyInfos?: ReadonlyArray<ProtocolSenderKeyInfoRecord>;
 }>;
 
 export type IdentityKeyPair = Readonly<{
@@ -99,6 +100,18 @@ export type ProtocolSenderKeyRecord = Readonly<{
   namespace: string;
   senderKey: string;
   recordBase64: string;
+}>;
+
+export type ProtocolSenderKeyInfoRecord = Readonly<{
+  groupId: string;
+  distributionId: string;
+  createdAtDate: number;
+  memberDevices: ReadonlyArray<
+    Readonly<{
+      serviceId: string;
+      id: number;
+    }>
+  >;
 }>;
 
 export type ProtocolPreKeyRecord = Readonly<{
@@ -133,6 +146,20 @@ export type WebCredentials = Readonly<{
   aci: string;
   pni?: string;
   number: string;
+}>;
+
+export type WebGroupSendEndorsements = Readonly<{
+  combinedEndorsement: Readonly<{
+    expiration: number;
+    endorsementBase64: string;
+  }>;
+  memberEndorsements: ReadonlyArray<
+    Readonly<{
+      memberAci: string;
+      expiration: number;
+      endorsementBase64: string;
+    }>
+  >;
 }>;
 
 export type WebAttachment = Readonly<{
@@ -385,6 +412,7 @@ export type WebConversation = Readonly<{
   bannedMembersV2?: ReadonlyArray<GroupV2BannedMemberType>;
   membersV2?: ReadonlyArray<GroupV2MemberType>;
   pendingMembersV2?: ReadonlyArray<GroupV2PendingMemberType>;
+  groupSendEndorsements?: WebGroupSendEndorsements;
   description?: string;
   phoneNumber?: string;
   e164?: string;

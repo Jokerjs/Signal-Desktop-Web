@@ -219,27 +219,139 @@ const pendingAttachmentBackfillTimeouts = new Map<string, number>();
 let shellMessageIndexSource: ChatShellState['messages'] | undefined;
 let shellMessageIndexById = new Map<string, number>();
 let shellMessageIdSet = new Set<string>();
+let shellMessagesByConversationId = new Map<string, ReadonlyArray<WebMessage>>();
+let shellMessageMetricsByConversationId = new Map<
+  string,
+  ReturnType<typeof getDesktopMessageMetrics>
+>();
+
+function getWebMessageMetricPointer(
+  message: WebMessage
+): NonNullable<ReturnType<typeof getDesktopMessageMetrics>['newest']> {
+  return {
+    id: message.id,
+    received_at: message.receivedAt ?? message.timestamp,
+    sent_at: message.timestamp,
+  };
+}
+
+function addWebMessageToMetrics(
+  metrics: ReturnType<typeof getDesktopMessageMetrics> | undefined,
+  message: WebMessage
+): ReturnType<typeof getDesktopMessageMetrics> {
+  const pointer = getWebMessageMetricPointer(message);
+  const pointerSentAt = pointer.sent_at ?? 0;
+  let oldest = metrics?.oldest;
+  let newest = metrics?.newest;
+
+  if (
+    !oldest ||
+    pointer.received_at < oldest.received_at ||
+    (pointer.received_at === oldest.received_at &&
+      pointerSentAt < (oldest.sent_at ?? 0))
+  ) {
+    oldest = pointer;
+  }
+  if (
+    !newest ||
+    pointer.received_at > newest.received_at ||
+    (pointer.received_at === newest.received_at &&
+      pointerSentAt > (newest.sent_at ?? 0))
+  ) {
+    newest = pointer;
+  }
+
+  return {
+    newest,
+    oldest,
+    totalUnseen: 0,
+  };
+}
 
 function getShellMessageIndexes(
   messages: ChatShellState['messages']
 ): Readonly<{
   idSet: ReadonlySet<string>;
   indexById: ReadonlyMap<string, number>;
+  metricsByConversationId: ReadonlyMap<
+    string,
+    ReturnType<typeof getDesktopMessageMetrics>
+  >;
+  messagesByConversationId: ReadonlyMap<string, ReadonlyArray<WebMessage>>;
 }> {
   if (shellMessageIndexSource !== messages) {
     shellMessageIndexSource = messages;
     shellMessageIndexById = new Map<string, number>();
     shellMessageIdSet = new Set<string>();
+    const mutableMessagesByConversationId = new Map<string, Array<WebMessage>>();
+    const mutableMetricsByConversationId = new Map<
+      string,
+      ReturnType<typeof getDesktopMessageMetrics>
+    >();
     messages.forEach((message, index) => {
       shellMessageIndexById.set(message.id, index);
       shellMessageIdSet.add(message.id);
+      const conversationMessages =
+        mutableMessagesByConversationId.get(message.conversationId) ?? [];
+      conversationMessages.push(message);
+      mutableMessagesByConversationId.set(
+        message.conversationId,
+        conversationMessages
+      );
+      mutableMetricsByConversationId.set(
+        message.conversationId,
+        addWebMessageToMetrics(
+          mutableMetricsByConversationId.get(message.conversationId),
+          message
+        )
+      );
     });
+    shellMessagesByConversationId = new Map(mutableMessagesByConversationId);
+    shellMessageMetricsByConversationId = new Map(
+      mutableMetricsByConversationId
+    );
   }
 
   return {
     idSet: shellMessageIdSet,
     indexById: shellMessageIndexById,
+    metricsByConversationId: shellMessageMetricsByConversationId,
+    messagesByConversationId: shellMessagesByConversationId,
   };
+}
+
+function setShellMessageIndexes(
+  messages: ChatShellState['messages'],
+  idSet: Set<string>,
+  indexById: Map<string, number>,
+  metricsByConversationId: Map<
+    string,
+    ReturnType<typeof getDesktopMessageMetrics>
+  >,
+  messagesByConversationId: Map<string, ReadonlyArray<WebMessage>>
+): void {
+  shellMessageIndexSource = messages;
+  shellMessageIdSet = idSet;
+  shellMessageIndexById = indexById;
+  shellMessageMetricsByConversationId = metricsByConversationId;
+  shellMessagesByConversationId = messagesByConversationId;
+}
+
+function rebuildShellMessageIndexes(messages: ChatShellState['messages']): void {
+  shellMessageIndexSource = undefined;
+  getShellMessageIndexes(messages);
+}
+
+function groupMessagesByConversation(
+  messages: ReadonlyArray<WebMessage>
+): Map<string, Array<WebMessage>> {
+  const result = new Map<string, Array<WebMessage>>();
+  for (const message of messages) {
+    const conversationMessages = result.get(message.conversationId) ?? [];
+    conversationMessages.push(message);
+    result.set(message.conversationId, conversationMessages);
+  }
+  return result;
 }
 
 function appendUniqueMessagesSorted(
@@ -250,7 +362,8 @@ function appendUniqueMessagesSorted(
     return currentMessages;
   }
 
-  const { idSet } = getShellMessageIndexes(currentMessages);
+  const currentIndexes = getShellMessageIndexes(currentMessages);
+  const { idSet } = currentIndexes;
   const uniqueMessages = new Array<WebMessage>();
   const incomingIds = new Set<string>();
   for (const message of incomingMessages) {
@@ -275,7 +388,45 @@ function appendUniqueMessagesSorted(
     !lastCurrent ||
     compareWebMessages(lastCurrent, sortedIncoming[0] as WebMessage) <= 0
   ) {
-    return [...currentMessages, ...sortedIncoming];
+    const nextMessages = [...currentMessages, ...sortedIncoming];
+    const nextIdSet = new Set(idSet);
+    const nextIndexById = new Map(currentIndexes.indexById);
+    const nextMessagesByConversationId = new Map(
+      currentIndexes.messagesByConversationId
+    );
+    const nextMetricsByConversationId = new Map(
+      currentIndexes.metricsByConversationId
+    );
+    const incomingByConversation =
+      groupMessagesByConversation(sortedIncoming);
+    sortedIncoming.forEach((message, index) => {
+      nextIdSet.add(message.id);
+      nextIndexById.set(message.id, currentMessages.length + index);
+      nextMetricsByConversationId.set(
+        message.conversationId,
+        addWebMessageToMetrics(
+          nextMetricsByConversationId.get(message.conversationId),
+          message
+        )
+      );
+    });
+    for (const [
+      conversationId,
+      conversationMessages,
+    ] of incomingByConversation) {
+      nextMessagesByConversationId.set(conversationId, [
+        ...(nextMessagesByConversationId.get(conversationId) ?? []),
+        ...conversationMessages,
+      ]);
+    }
+    setShellMessageIndexes(
+      nextMessages,
+      nextIdSet,
+      nextIndexById,
+      nextMetricsByConversationId,
+      nextMessagesByConversationId
+    );
+    return nextMessages;
   }
 
   const firstCurrent = currentMessages[0];
@@ -286,7 +437,9 @@ function appendUniqueMessagesSorted(
       firstCurrent
     ) <= 0
   ) {
-    return [...sortedIncoming, ...currentMessages];
+    const nextMessages = [...sortedIncoming, ...currentMessages];
+    rebuildShellMessageIndexes(nextMessages);
+    return nextMessages;
   }
 
   const nextMessages = new Array<WebMessage>(
@@ -314,6 +467,7 @@ function appendUniqueMessagesSorted(
     writeIndex += 1;
   }
 
+  rebuildShellMessageIndexes(nextMessages);
   return nextMessages;
 }
 
@@ -368,6 +522,52 @@ function replaceMessageById(
 
   const nextMessages = [...currentMessages];
   nextMessages[index] = updated;
+  const nextIdSet = new Set(shellMessageIdSet);
+  const nextIndexById = new Map(shellMessageIndexById);
+  const nextMetricsByConversationId = new Map(
+    shellMessageMetricsByConversationId
+  );
+  const nextMessagesByConversationId = new Map(shellMessagesByConversationId);
+  const existingConversationMessages =
+    shellMessagesByConversationId.get(existing.conversationId);
+  if (existing.conversationId !== updated.conversationId) {
+    rebuildShellMessageIndexes(nextMessages);
+    return {
+      existing,
+      messages: nextMessages,
+      updated,
+    };
+  } else if (existingConversationMessages) {
+    const conversationIndex = existingConversationMessages.findIndex(
+      message => message.id === messageId
+    );
+    if (conversationIndex >= 0) {
+      const nextConversationMessages = existingConversationMessages.slice();
+      nextConversationMessages[conversationIndex] = updated;
+      nextMessagesByConversationId.set(
+        existing.conversationId,
+        nextConversationMessages
+      );
+      nextMetricsByConversationId.set(
+        existing.conversationId,
+        getDesktopMessageMetricsFromWebMessages(nextConversationMessages)
+      );
+    } else {
+      rebuildShellMessageIndexes(nextMessages);
+      return {
+        existing,
+        messages: nextMessages,
+        updated,
+      };
+    }
+  }
+  setShellMessageIndexes(
+    nextMessages,
+    nextIdSet,
+    nextIndexById,
+    nextMetricsByConversationId,
+    nextMessagesByConversationId
+  );
   return {
     existing,
     messages: nextMessages,
@@ -983,7 +1183,7 @@ function dispatchConversations(
 
 let conversationMessagesSource: ChatShellState['messages'] | undefined;
 let conversationMessagesSourceVersion = 0;
-const conversationMessagesById = new Map<string, Array<WebMessage>>();
+const conversationMessagesById = new Map<string, ReadonlyArray<WebMessage>>();
 const desktopMessagesByConversationId = new Map<
   string,
   Readonly<{
@@ -1000,23 +1200,30 @@ function getConversationMessagesFromShell(
   conversationId: string,
   shell: ChatShellState
 ): ReadonlyArray<WebMessage> {
+  const { messagesByConversationId } = getShellMessageIndexes(shell.messages);
   if (conversationMessagesSource !== shell.messages) {
     conversationMessagesSource = shell.messages;
     conversationMessagesSourceVersion += 1;
     conversationMessagesById.clear();
-    desktopMessagesByConversationId.clear();
+    for (const [
+      currentConversationId,
+      messages,
+    ] of messagesByConversationId) {
+      conversationMessagesById.set(currentConversationId, messages);
+    }
+    for (const [currentConversationId, cached] of [
+      ...desktopMessagesByConversationId,
+    ]) {
+      if (
+        cached.sourceMessages !==
+        messagesByConversationId.get(currentConversationId)
+      ) {
+        desktopMessagesByConversationId.delete(currentConversationId);
+      }
+    }
   }
 
-  const cached = conversationMessagesById.get(conversationId);
-  if (cached) {
-    return cached;
-  }
-
-  const messages = shell.messages
-    .filter(message => message.conversationId === conversationId)
-    .sort(compareWebMessages);
-  conversationMessagesById.set(conversationId, messages);
-  return messages;
+  return conversationMessagesById.get(conversationId) ?? [];
 }
 
 function getConversationDesktopMessages(
@@ -1026,6 +1233,7 @@ function getConversationDesktopMessages(
   desktopMessages: ReturnType<typeof toDesktopMessage>[];
   metrics: ReturnType<typeof getDesktopMessageMetrics>;
 }> {
+  const { metricsByConversationId } = getShellMessageIndexes(shell.messages);
   const sourceMessages = getConversationMessagesFromShell(
     conversationId,
     shell
@@ -1040,7 +1248,9 @@ function getConversationDesktopMessages(
   );
   pageMessages.forEach(registerMessageInCache);
   const desktopMessages = pageMessages.map(toDesktopMessage);
-  const metrics = getDesktopMessageMetricsFromWebMessages(sourceMessages);
+  const metrics =
+    metricsByConversationId.get(conversationId) ??
+    getDesktopMessageMetricsFromWebMessages(sourceMessages);
   const next = {
     desktopMessages,
     metrics,
@@ -3054,6 +3264,7 @@ export function WebDesktopApp({
                         revision: conversation.revision,
                       }
                     : undefined,
+                groupSendEndorsements: conversation.groupSendEndorsements,
                 recipients: conversation.membersV2?.map(member => member.aci),
                 timestamp,
               });
@@ -3164,6 +3375,7 @@ export function WebDesktopApp({
                               revision: conversation.revision,
                             }
                           : undefined,
+                      groupSendEndorsements: conversation.groupSendEndorsements,
                       recipients: conversation.membersV2?.map(
                         member => member.aci
                       ),
@@ -3393,6 +3605,7 @@ export function WebDesktopApp({
                         revision: conversation.revision,
                       }
                     : undefined,
+                groupSendEndorsements: conversation.groupSendEndorsements,
                 recipients: conversation.membersV2?.map(member => member.aci),
                 emoji: reaction.emoji,
                 remove: reaction.remove,

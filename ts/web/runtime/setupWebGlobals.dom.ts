@@ -3137,6 +3137,8 @@ class WebConversationModel {
                   revision: this.attributes.revision,
                 }
               : undefined,
+          groupSendEndorsements: this.attributes
+            .groupSendEndorsements as WebConversation['groupSendEndorsements'],
           recipients: groupV2Info?.members,
         })
       : await sendDirectTextMessage({

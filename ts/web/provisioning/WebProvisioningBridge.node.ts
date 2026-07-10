@@ -97,6 +97,7 @@ import {
   decryptIncomingSignalEnvelope,
   exportProtocolState,
   getLinkedPayloadProtocolKeyIds,
+  maybeUpdateWebPreKeys,
   sendAttachmentBackfillRequestSync,
   sendDecryptionErrorMessage,
   sendDirectEditMessage,
@@ -128,6 +129,7 @@ import type {
   WebAccount,
   WebConversation,
   WebDeleteForEveryone,
+  WebGroupSendEndorsements,
   WebMessage,
   WebPinMessage,
   WebUnpinMessage,
@@ -194,11 +196,17 @@ const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
 const PROTOCOL_STATE_EMIT_DEBOUNCE_MS = Number(
   process.env.SIGNAL_WEB_PROTOCOL_STATE_EMIT_DEBOUNCE_MS ?? 1000
 );
+const SIGNAL_ACK_WAIT_FOR_BROWSER_MS = Number(
+  process.env.SIGNAL_WEB_SIGNAL_ACK_WAIT_FOR_BROWSER_MS ?? 30_000
+);
 const PROFILE_FETCH_CONCURRENCY = Number(
   process.env.SIGNAL_WEB_PROFILE_FETCH_CONCURRENCY ?? 30
 );
 const SESSION_OPERATION_QUEUE_LIMIT = Number(
   process.env.SIGNAL_WEB_SESSION_OPERATION_QUEUE_LIMIT ?? 50
+);
+const SEND_RATE_LIMIT_DEFAULT_RETRY_AFTER_MS = Number(
+  process.env.SIGNAL_WEB_SEND_RATE_LIMIT_DEFAULT_RETRY_AFTER_MS ?? 60_000
 );
 const ATTACHMENT_UPLOAD_CONCURRENCY = Number(
   process.env.SIGNAL_WEB_ATTACHMENT_UPLOAD_CONCURRENCY ?? 4
@@ -298,6 +306,11 @@ type PersistedStreamEventEntry = {
   event: MessageStreamEvent;
 };
 
+type PendingSignalAck = {
+  complete: (statusCode: number) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
 type ProvisioningSessionEvent = {
   at: number;
   type: string;
@@ -313,6 +326,13 @@ type MessageStreamSession = {
   error?: string;
   lastReceiveError?: string;
   lastSendError?: string;
+  sendBlockedUntil?: number;
+  sendBlockedStatus?: number;
+  sendBlockedReason?: string;
+  sendChallenge?: {
+    token?: string;
+    options?: ReadonlyArray<string>;
+  };
   backupImportStatus:
     | 'idle'
     | 'waiting-for-archive'
@@ -339,6 +359,7 @@ type MessageStreamSession = {
   lastDecryptionErrorRetry?: unknown;
   lastDecryptionErrorRetryError?: string;
   receiveChain?: Promise<void>;
+  decryptionErrorRetryChain?: Promise<void>;
   queueEmptyCount: number;
   sendAttemptCount: number;
   lastSendAttemptAt?: number;
@@ -346,6 +367,7 @@ type MessageStreamSession = {
   linkedPayload?: LinkedPayloadWithProtocol;
   pendingProtocolState?: ProtocolState;
   protocolStateEmitTimer?: ReturnType<typeof setTimeout>;
+  pendingSignalAcks?: Map<string, PendingSignalAck>;
   cdsiAuth?: {
     timestamp: number;
     auth: ServiceAuth;
@@ -655,6 +677,160 @@ function acknowledgePersistedStreamEvent(
   persistedStreamEventsByAccount.set(accountKey, nextItems);
 }
 
+function completePendingSignalAck(
+  streamSession: MessageStreamSession,
+  eventId: string,
+  statusCode: number
+): boolean {
+  const pending = streamSession.pendingSignalAcks?.get(eventId);
+  if (!pending) {
+    return false;
+  }
+
+  clearTimeout(pending.timeout);
+  streamSession.pendingSignalAcks?.delete(eventId);
+  pending.complete(statusCode);
+  return true;
+}
+
+function registerPendingSignalAck({
+  eventId,
+  sendAck,
+  streamSession,
+}: Readonly<{
+  eventId: string;
+  sendAck: (statusCode: number) => void;
+  streamSession: MessageStreamSession;
+}>): void {
+  streamSession.pendingSignalAcks ??= new Map();
+  if (streamSession.pendingSignalAcks.has(eventId)) {
+    return;
+  }
+
+  const timeout = setTimeout(() => {
+    completePendingSignalAck(streamSession, eventId, 500);
+  }, SIGNAL_ACK_WAIT_FOR_BROWSER_MS);
+  streamSession.pendingSignalAcks.set(eventId, {
+    complete: sendAck,
+    timeout,
+  });
+}
+
+function flushPendingSignalAcks(
+  streamSession: MessageStreamSession,
+  statusCode: number
+): void {
+  const pendingIds = [...(streamSession.pendingSignalAcks?.keys() ?? [])];
+  for (const eventId of pendingIds) {
+    completePendingSignalAck(streamSession, eventId, statusCode);
+  }
+}
+
+function shouldRedeliverAfterDecryptionRetryError(error: unknown): boolean {
+  return (
+    LibSignalErrorBase.is(error, LibSignalErrorCode.ChatServiceInactive) ||
+    LibSignalErrorBase.is(error, LibSignalErrorCode.IoError) ||
+    LibSignalErrorBase.is(error, LibSignalErrorCode.Cancelled)
+  );
+}
+
+function queueDecryptionErrorRetry({
+  activeLinkedPayload,
+  connection,
+  envelope,
+  sendAck,
+  streamSession,
+  timestamp,
+  writeEvent,
+}: Readonly<{
+  activeLinkedPayload: LinkedPayloadWithProtocol;
+  connection: AuthenticatedChatConnection | undefined;
+  envelope: Uint8Array<ArrayBuffer>;
+  sendAck: (statusCode: number) => void;
+  streamSession: MessageStreamSession;
+  timestamp: number;
+  writeEvent: (event: unknown) => void;
+}>): void {
+  const previousRetry =
+    streamSession.decryptionErrorRetryChain ?? Promise.resolve();
+  const currentRetry = previousRetry
+    .catch(() => undefined)
+    .then(async () => {
+      if (!connection) {
+        writeEvent({
+          type: 'error',
+          error: streamSession.lastReceiveError,
+          timestamp,
+          envelopeSize: envelope.byteLength,
+          lastDecryptionErrorRetry: streamSession.lastDecryptionErrorRetry,
+          lastDecryptionErrorRetryError:
+            streamSession.lastDecryptionErrorRetryError,
+        });
+        sendAck(500);
+        return;
+      }
+
+      try {
+        const retryResult = await sendDecryptionErrorMessage({
+          chat: connection,
+          envelopeBytes: envelope,
+          linkedPayload: activeLinkedPayload,
+          receivedAt: timestamp,
+        });
+        streamSession.lastDecryptionErrorRetry = retryResult;
+        streamSession.lastDecryptionErrorRetryError = undefined;
+        streamSession.updatedAt = now();
+        if (retryResult.sent) {
+          emitProtocolState(streamSession);
+          streamSession.lastReceiveError = undefined;
+          streamSession.ignoredEnvelopeCount += 1;
+          streamSession.lastIgnoredEnvelopeReason =
+            'Sent decryption error retry request';
+          sendAck(200);
+          return;
+        }
+
+        writeEvent({
+          type: 'error',
+          error: streamSession.lastReceiveError,
+          timestamp,
+          envelopeSize: envelope.byteLength,
+          lastDecryptionErrorRetry: streamSession.lastDecryptionErrorRetry,
+          lastDecryptionErrorRetryError:
+            streamSession.lastDecryptionErrorRetryError,
+        });
+        sendAck(200);
+      } catch (retryError) {
+        streamSession.lastDecryptionErrorRetryError =
+          errorToLogString(retryError);
+        streamSession.updatedAt = now();
+        console.warn(
+          'message stream failed to send decryption error retry request',
+          retryError
+        );
+        writeEvent({
+          type: 'error',
+          error: streamSession.lastReceiveError,
+          timestamp,
+          envelopeSize: envelope.byteLength,
+          lastDecryptionErrorRetry: streamSession.lastDecryptionErrorRetry,
+          lastDecryptionErrorRetryError:
+            streamSession.lastDecryptionErrorRetryError,
+        });
+        sendAck(
+          shouldRedeliverAfterDecryptionRetryError(retryError) ? 500 : 200
+        );
+      }
+    });
+  const nextRetryChain = currentRetry.finally(() => {
+    if (streamSession.decryptionErrorRetryChain === nextRetryChain) {
+      streamSession.decryptionErrorRetryChain = undefined;
+    }
+  });
+  streamSession.decryptionErrorRetryChain = nextRetryChain;
+  void streamSession.decryptionErrorRetryChain;
+}
+
 async function kickOffProfileFetches({
   streamSession,
   syncResult,
@@ -847,11 +1023,13 @@ function sendJson(
   req: IncomingMessage,
   res: ServerResponse,
   statusCode: number,
-  body: unknown
+  body: unknown,
+  headers?: Record<string, string>
 ): void {
   sendCors(req, res);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
+    ...headers,
   });
   res.end(JSON.stringify(body));
 }
@@ -1364,6 +1542,159 @@ function errorToLogString(error: unknown): string {
     : (error.stack ?? error.message);
 }
 
+type WebHttpErrorInfo = Readonly<{
+  body: unknown;
+  headers?: Record<string, string>;
+  status: number;
+}>;
+
+function getNumericErrorProperty(error: Error, key: string): number | undefined {
+  const value = (error as Error & Record<string, unknown>)[key];
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function getSendErrorInfo(error: unknown): WebHttpErrorInfo | undefined {
+  let current: unknown = error;
+  for (let index = 0; index < 6; index += 1) {
+    if (!(current instanceof Error)) {
+      return undefined;
+    }
+
+    const status = getNumericErrorProperty(current, 'status');
+    const retryAfterMs = getNumericErrorProperty(current, 'retryAfterMs');
+    if (status) {
+      return {
+        body: {
+          error: current.message,
+          retryAfterMs,
+          status,
+        },
+        headers:
+          status === 429 && retryAfterMs
+            ? { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) }
+            : undefined,
+        status,
+      };
+    }
+
+    if (current instanceof LibSignalErrorBase) {
+      if (current.code === LibSignalErrorCode.RateLimitChallengeError) {
+        const challenge = current as LibSignalErrorBase & {
+          options?: ReadonlyArray<string>;
+          retryAfterSecs?: number;
+          token?: string;
+        };
+        const retryAfterMs =
+          typeof challenge.retryAfterSecs === 'number'
+            ? challenge.retryAfterSecs * 1000
+            : undefined;
+        return {
+          body: {
+            error: current.message,
+            options: Array.isArray(challenge.options)
+              ? [...challenge.options]
+              : undefined,
+            retryAfterMs,
+            status: 428,
+            token: challenge.token,
+          },
+          headers: retryAfterMs
+            ? { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) }
+            : undefined,
+          status: 428,
+        };
+      }
+      if (current.code === LibSignalErrorCode.RateLimitedError) {
+        const rateLimited = current as LibSignalErrorBase & {
+          retryAfterSecs?: number;
+        };
+        const retryAfterMs =
+          typeof rateLimited.retryAfterSecs === 'number'
+            ? rateLimited.retryAfterSecs * 1000
+            : SEND_RATE_LIMIT_DEFAULT_RETRY_AFTER_MS;
+        return {
+          body: {
+            error: current.message,
+            retryAfterMs,
+            status: 429,
+          },
+          headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+          status: 429,
+        };
+      }
+      if (current.code === LibSignalErrorCode.RequestUnauthorized) {
+        return {
+          body: {
+            error: current.message,
+            status: 401,
+          },
+          status: 401,
+        };
+      }
+    }
+
+    current = current.cause;
+  }
+
+  return undefined;
+}
+
+function rememberSendFailure(
+  streamSession: MessageStreamSession,
+  error: unknown
+): void {
+  const info = getSendErrorInfo(error);
+  if (!info || (info.status !== 428 && info.status !== 429)) {
+    return;
+  }
+  const body =
+    info.body && typeof info.body === 'object' && !Array.isArray(info.body)
+      ? (info.body as Record<string, unknown>)
+      : {};
+  const retryAfterMs =
+    typeof body.retryAfterMs === 'number'
+      ? body.retryAfterMs
+      : SEND_RATE_LIMIT_DEFAULT_RETRY_AFTER_MS;
+  streamSession.sendBlockedUntil = now() + retryAfterMs;
+  streamSession.sendBlockedStatus = info.status;
+  streamSession.sendBlockedReason =
+    typeof body.error === 'string' ? body.error : undefined;
+  if (info.status === 428) {
+    streamSession.sendChallenge = {
+      token: typeof body.token === 'string' ? body.token : undefined,
+      options: Array.isArray(body.options)
+        ? body.options.filter((item): item is string => typeof item === 'string')
+        : undefined,
+    };
+  }
+}
+
+function rememberSendSuccess(streamSession: MessageStreamSession): void {
+  streamSession.lastSendError = undefined;
+  streamSession.sendBlockedUntil = undefined;
+  streamSession.sendBlockedStatus = undefined;
+  streamSession.sendBlockedReason = undefined;
+  streamSession.sendChallenge = undefined;
+}
+
+function assertSendAllowed(streamSession: MessageStreamSession): void {
+  if (!streamSession.sendBlockedUntil || streamSession.sendBlockedUntil <= now()) {
+    streamSession.sendBlockedUntil = undefined;
+    streamSession.sendBlockedStatus = undefined;
+    streamSession.sendBlockedReason = undefined;
+    streamSession.sendChallenge = undefined;
+    return;
+  }
+
+  const retryAfterMs = streamSession.sendBlockedUntil - now();
+  throw Object.assign(new Error(streamSession.sendBlockedReason ?? 'Send is rate limited'), {
+    retryAfterMs,
+    status: streamSession.sendBlockedStatus ?? 429,
+  });
+}
+
 function getProtocolStateFromStreamBody(
   body: JsonRecord
 ): ProtocolState | undefined {
@@ -1471,6 +1802,36 @@ function createNet(Net: Awaited<ReturnType<typeof getSignalModules>>['Net']) {
     userAgent: `Signal-Desktop/${packageJson.version} Web`,
   });
   return libsignalNetInstance;
+}
+
+async function registerLinkedDeviceCapabilities(
+  connection: AuthenticatedChatConnection
+): Promise<void> {
+  const body = Buffer.from(
+    JSON.stringify({
+      attachmentBackfill: true,
+      spqr: true,
+      usernameChangeSyncMessage: true,
+    }),
+    'utf8'
+  );
+  const response = await connection.fetch({
+    verb: 'PUT',
+    path: '/v1/devices/capabilities',
+    headers: [['content-type', 'application/json']],
+    body,
+    timeoutMillis: 30_000,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    const responseBody = Buffer.from(
+      response.body ?? new Uint8Array()
+    ).toString('utf8');
+    throw new Error(
+      responseBody
+        ? `register capabilities failed with status ${response.status}: ${responseBody}`
+        : `register capabilities failed with status ${response.status}`
+    );
+  }
 }
 
 function buildLinkDeviceUrl({
@@ -3172,6 +3533,7 @@ async function handleMessageStream(
         heartbeat = undefined;
       }
       flushProtocolState(streamSession);
+      flushPendingSignalAcks(streamSession, 500);
       abortController.abort();
       void connection?.disconnect().catch(() => undefined);
       void streamSession.backupUnauthConnection
@@ -3277,10 +3639,30 @@ async function handleMessageStream(
             didAck = true;
             ack.send(statusCode);
           };
-          const previousReceive = streamSession.receiveChain ?? Promise.resolve();
+          const previousReceive =
+            streamSession.receiveChain ?? Promise.resolve();
           const currentReceive = previousReceive
             .catch(() => undefined)
             .then(async () => {
+          const signalAckState: { registeredEventId?: string } = {};
+          const writePersistedEnvelopeEvent = (event: MessageStreamEvent) => {
+            const persistedEvent = persistStreamEvent(
+              streamEventAccountKey,
+              event
+            );
+            writeEvent(persistedEvent);
+            if (
+              !signalAckState.registeredEventId &&
+              persistedEvent.streamEventId
+            ) {
+              signalAckState.registeredEventId = persistedEvent.streamEventId;
+              registerPendingSignalAck({
+                eventId: persistedEvent.streamEventId,
+                sendAck,
+                streamSession,
+              });
+            }
+          };
           const activeLinkedPayload = streamSession.linkedPayload;
           if (!activeLinkedPayload) {
             streamSession.lastReceiveError =
@@ -3363,27 +3745,30 @@ async function handleMessageStream(
                     sourceServiceId: outputMessage.sourceServiceId,
                   };
                   if (conversation) {
-                    writePersistedEvent({ type: 'conversation', conversation });
+                    writePersistedEnvelopeEvent({
+                      type: 'conversation',
+                      conversation,
+                    });
                   }
-                  writePersistedEvent({
+                  writePersistedEnvelopeEvent({
                     type: 'message',
                     message: outputMessage,
                   });
                 }
                 if (pinMessage) {
-                  writePersistedEvent(pinMessage);
+                  writePersistedEnvelopeEvent(pinMessage);
                 }
                 if (reaction) {
-                  writePersistedEvent(reaction);
+                  writePersistedEnvelopeEvent(reaction);
                 }
                 if (editMessage) {
-                  writePersistedEvent(editMessage);
+                  writePersistedEnvelopeEvent(editMessage);
                 }
                 if (deleteMessage) {
-                  writePersistedEvent(deleteMessage);
+                  writePersistedEnvelopeEvent(deleteMessage);
                 }
                 if (unpinMessage) {
-                  writePersistedEvent(unpinMessage);
+                  writePersistedEnvelopeEvent(unpinMessage);
                 }
                 if (attachmentBackfill) {
                   streamSession.attachmentBackfillEventCount =
@@ -3412,19 +3797,19 @@ async function handleMessageStream(
                     error: attachmentBackfill.error,
                     timestamp: attachmentBackfill.timestamp,
                   };
-                  writePersistedEvent(attachmentBackfill);
+                  writePersistedEnvelopeEvent(attachmentBackfill);
                 }
                 if (receipt) {
-                  writePersistedEvent(receipt);
+                  writePersistedEnvelopeEvent(receipt);
                 }
                 if (typing) {
-                  writePersistedEvent(typing);
+                  writePersistedEnvelopeEvent(typing);
                 }
                 if (pollVote) {
-                  writePersistedEvent(pollVote);
+                  writePersistedEnvelopeEvent(pollVote);
                 }
                 if (pollTerminate) {
-                  writePersistedEvent(pollTerminate);
+                  writePersistedEnvelopeEvent(pollTerminate);
                 }
                 if (storageManifestFetchLatest && connection) {
                   void syncStorageContacts({
@@ -3481,7 +3866,9 @@ async function handleMessageStream(
                   streamSession.decodedMessageCount +=
                     hasModifierEvent && !message ? 1 : 0;
                 }
-                sendAck(200);
+                if (!signalAckState.registeredEventId) {
+                  sendAck(200);
+                }
               }
             )
             .catch(async error => {
@@ -3500,46 +3887,15 @@ async function handleMessageStream(
               }
               streamSession.lastReceiveError = errorToLogString(error);
               streamSession.updatedAt = now();
-              try {
-                if (connection) {
-                  const retryResult = await sendDecryptionErrorMessage({
-                    chat: connection,
-                    envelopeBytes: envelope,
-                    linkedPayload: activeLinkedPayload,
-                    receivedAt: timestamp,
-                  });
-                  streamSession.lastDecryptionErrorRetry = retryResult;
-                  streamSession.lastDecryptionErrorRetryError = undefined;
-                  if (retryResult.sent) {
-                    emitProtocolState(streamSession);
-                    streamSession.lastReceiveError = undefined;
-                    streamSession.ignoredEnvelopeCount += 1;
-                    streamSession.lastIgnoredEnvelopeReason =
-                      'Sent decryption error retry request';
-                    streamSession.updatedAt = now();
-                    sendAck(200);
-                    return;
-                  }
-                }
-              } catch (retryError) {
-                streamSession.lastDecryptionErrorRetryError =
-                  errorToLogString(retryError);
-                console.warn(
-                  'message stream failed to send decryption error retry request',
-                  retryError
-                );
-              }
-              writeEvent({
-                type: 'error',
-                error: streamSession.lastReceiveError,
+              queueDecryptionErrorRetry({
+                activeLinkedPayload,
+                connection,
+                envelope,
+                sendAck,
+                streamSession,
                 timestamp,
-                envelopeSize: envelope.byteLength,
-                lastDecryptionErrorRetry:
-                  streamSession.lastDecryptionErrorRetry,
-                lastDecryptionErrorRetryError:
-                  streamSession.lastDecryptionErrorRetryError,
+                writeEvent,
               });
-              sendAck(500);
             });
             });
           const nextReceiveChain = currentReceive.finally(() => {
@@ -3575,6 +3931,29 @@ async function handleMessageStream(
     streamSession.status = 'open';
     streamSession.updatedAt = now();
     writeEvent({ type: 'transport-status', status: 'open' });
+    void registerLinkedDeviceCapabilities(connection).catch(error => {
+      console.warn(
+        'handleMessageStream: failed to register linked device capabilities',
+        errorToLogString(error)
+      );
+    });
+    if (linkedPayload) {
+      void maybeUpdateWebPreKeys({
+        chat: connection,
+        linkedPayload,
+      })
+        .then(updated => {
+          if (updated) {
+            emitProtocolState(streamSession);
+          }
+        })
+        .catch(error => {
+          console.warn(
+            'handleMessageStream: failed to update web prekeys',
+            errorToLogString(error)
+          );
+        });
+    }
     if (importBackup) {
       const readyConnection = connection;
       void limitBackupImport(() =>
@@ -3642,6 +4021,9 @@ async function handleMessageStreamAck(
   }
 
   acknowledgePersistedStreamEvent(accountKey, eventId);
+  if (streamSession) {
+    completePendingSignalAck(streamSession, eventId, 200);
+  }
   sendJson(req, res, 200, { ok: true });
 }
 
@@ -3698,6 +4080,7 @@ async function handleSendMessage(
 
   try {
     await runSessionOperation(streamSession, 'handleSendMessage', async () => {
+      assertSendAllowed(streamSession);
       const resolvedAttachments = await resolveInlineAttachments({
         attachments,
         streamSession,
@@ -3715,16 +4098,77 @@ async function handleSendMessage(
         timestamp,
         unpinMessage,
       });
-      streamSession.lastSendError = undefined;
+      rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       emitProtocolState(streamSession, { immediate: true });
       sendJson(req, res, 200, message);
     });
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
   }
+}
+
+async function handleSubmitMessageChallenge(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!isReadyMessageStreamSession(streamSession)) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
+
+  const type = typeof body.type === 'string' ? body.type : undefined;
+  const token = typeof body.token === 'string' ? body.token : undefined;
+  const captcha = typeof body.captcha === 'string' ? body.captcha : undefined;
+  if (type !== 'captcha') {
+    sendText(req, res, 400, 'Missing type');
+    return;
+  }
+  if (!token) {
+    sendText(req, res, 400, 'Missing token');
+    return;
+  }
+  if (!captcha) {
+    sendText(req, res, 400, 'Missing captcha');
+    return;
+  }
+
+  await runSessionOperation(
+    streamSession,
+    'handleSubmitMessageChallenge',
+    async () => {
+      const response = await streamSession.connection.fetch({
+        verb: 'PUT',
+        path: '/v1/challenge',
+        headers: [['content-type', 'application/json']],
+        body: Buffer.from(JSON.stringify({ type, token, captcha }), 'utf8'),
+        timeoutMillis: 30_000,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        const responseBody = Buffer.from(
+          response.body ?? new Uint8Array()
+        ).toString('utf8');
+        throw Object.assign(
+          new Error(
+            responseBody
+              ? `challenge failed with status ${response.status}: ${responseBody}`
+              : `challenge failed with status ${response.status}`
+          ),
+          { status: response.status }
+        );
+      }
+      rememberSendSuccess(streamSession);
+      streamSession.updatedAt = now();
+      sendJson(req, res, 200, { ok: true });
+    }
+  );
 }
 
 async function handleSendExpirationTimer(
@@ -3772,6 +4216,7 @@ async function handleSendExpirationTimer(
       streamSession,
       'handleSendExpirationTimer',
       async () => {
+        assertSendAllowed(streamSession);
         const message = await sendDirectExpirationTimerUpdate({
           chat: streamSession.connection,
           destinationServiceId,
@@ -3780,13 +4225,14 @@ async function handleSendExpirationTimer(
           linkedPayload: streamSession.linkedPayload,
           timestamp,
         });
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, message);
       }
     );
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4241,6 +4687,9 @@ async function handleSendReaction(
           revision: rawGroupV2.revision,
         }
       : undefined;
+  const groupSendEndorsements = parseWebGroupSendEndorsements(
+    body.groupSendEndorsements
+  );
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
         (recipient: unknown): recipient is string =>
@@ -4285,18 +4734,24 @@ async function handleSendReaction(
 
   try {
     await runSessionOperation(streamSession, 'handleSendReaction', async () => {
+      assertSendAllowed(streamSession);
       if (groupId && groupV2) {
+        const unauthChat = groupSendEndorsements
+          ? await getBackupUnauthConnection(streamSession)
+          : undefined;
         await sendGroupReaction({
           chat: streamSession.connection,
           emoji,
           groupId,
           groupV2,
+          groupSendEndorsements,
           linkedPayload: streamSession.linkedPayload,
           recipients,
           remove,
           targetAuthorAci,
           targetTimestamp,
           timestamp,
+          unauthChat,
         });
       } else if (destinationServiceId) {
         await sendDirectReaction({
@@ -4310,12 +4765,13 @@ async function handleSendReaction(
           timestamp,
         });
       }
-      streamSession.lastSendError = undefined;
+      rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       emitProtocolState(streamSession, { immediate: true });
       sendJson(req, res, 200, { ok: true, timestamp });
     });
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4533,6 +4989,7 @@ async function handleAttachmentBackfillRequest(
       streamSession,
       'handleAttachmentBackfillRequest',
       async () => {
+        assertSendAllowed(streamSession);
         const result = await sendAttachmentBackfillRequestSync({
           chat: streamSession.connection,
           conversationId,
@@ -4542,13 +4999,14 @@ async function handleAttachmentBackfillRequest(
           targetSentTimestamp,
           timestamp,
         });
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
       }
     );
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4595,6 +5053,7 @@ async function handleSendEdit(
 
   try {
     await runSessionOperation(streamSession, 'handleSendEdit', async () => {
+      assertSendAllowed(streamSession);
       const result = await sendDirectEditMessage({
         body: messageBody,
         chat: streamSession.connection,
@@ -4603,12 +5062,13 @@ async function handleSendEdit(
         targetTimestamp,
         timestamp,
       });
-      streamSession.lastSendError = undefined;
+      rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       emitProtocolState(streamSession, { immediate: true });
       sendJson(req, res, 200, result);
     });
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4649,6 +5109,9 @@ async function handleSendGroupMessage(
           revision: rawGroupV2.revision,
         }
       : undefined;
+  const groupSendEndorsements = parseWebGroupSendEndorsements(
+    body.groupSendEndorsements
+  );
   const recipients = Array.isArray(body.recipients)
     ? body.recipients.filter(
         (recipient: unknown): recipient is string =>
@@ -4688,10 +5151,14 @@ async function handleSendGroupMessage(
       streamSession,
       'handleSendGroupMessage',
       async () => {
+        assertSendAllowed(streamSession);
         const resolvedAttachments = await resolveInlineAttachments({
           attachments,
           streamSession,
         });
+        const unauthChat = groupSendEndorsements
+          ? await getBackupUnauthConnection(streamSession)
+          : undefined;
         const message = await sendGroupTextMessage({
           attachments: resolvedAttachments,
           body: messageBody ?? '',
@@ -4699,6 +5166,7 @@ async function handleSendGroupMessage(
           deleteForEveryone,
           groupId,
           groupV2,
+          groupSendEndorsements,
           isViewOnce,
           linkedPayload: streamSession.linkedPayload,
           pinMessage,
@@ -4706,14 +5174,16 @@ async function handleSendGroupMessage(
           recipients,
           timestamp,
           unpinMessage,
+          unauthChat,
         });
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, message);
       }
     );
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4778,6 +5248,70 @@ function parseWebConversation(value: unknown): WebConversation | undefined {
     return undefined;
   }
   return record as WebConversation;
+}
+
+function parseWebGroupSendEndorsements(
+  value: unknown
+): WebGroupSendEndorsements | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const combined =
+    record.combinedEndorsement &&
+    typeof record.combinedEndorsement === 'object' &&
+    !Array.isArray(record.combinedEndorsement)
+      ? (record.combinedEndorsement as Record<string, unknown>)
+      : undefined;
+  if (
+    !combined ||
+    typeof combined.expiration !== 'number' ||
+    typeof combined.endorsementBase64 !== 'string' ||
+    !Array.isArray(record.memberEndorsements)
+  ) {
+    return undefined;
+  }
+
+  const memberEndorsements = record.memberEndorsements
+    .map((item: unknown) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return undefined;
+      }
+      const endorsement = item as Record<string, unknown>;
+      if (
+        typeof endorsement.memberAci !== 'string' ||
+        typeof endorsement.expiration !== 'number' ||
+        typeof endorsement.endorsementBase64 !== 'string'
+      ) {
+        return undefined;
+      }
+      return {
+        memberAci: endorsement.memberAci,
+        expiration: endorsement.expiration,
+        endorsementBase64: endorsement.endorsementBase64,
+      };
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        endorsementBase64: string;
+        expiration: number;
+        memberAci: string;
+      } => item != null
+    );
+
+  if (memberEndorsements.length !== record.memberEndorsements.length) {
+    return undefined;
+  }
+
+  return {
+    combinedEndorsement: {
+      expiration: combined.expiration,
+      endorsementBase64: combined.endorsementBase64,
+    },
+    memberEndorsements,
+  };
 }
 
 function parseWebConversationRecord(
@@ -4850,6 +5384,7 @@ async function handleCreateGroup(
 
   try {
     await runSessionOperation(streamSession, 'handleCreateGroup', async () => {
+      assertSendAllowed(streamSession);
       const group = await createGroupConversation({
         allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
         avatar,
@@ -4869,8 +5404,12 @@ async function handleCreateGroup(
       );
       if (group.masterKey && recipients.length > 0) {
         try {
+          const unauthChat = group.groupSendEndorsements
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined;
           await sendGroupUpdateMessage({
             chat: streamSession.connection,
+            groupSendEndorsements: group.groupSendEndorsements,
             groupId: String(group.groupId ?? group.id),
             groupV2: {
               masterKey: group.masterKey,
@@ -4879,8 +5418,12 @@ async function handleCreateGroup(
             linkedPayload: streamSession.linkedPayload,
             recipients,
             timestamp: now(),
+            unauthChat,
           });
         } catch (error) {
+          if (getSendErrorInfo(error)) {
+            throw error;
+          }
           console.warn(
             'handleCreateGroup: group created, but failed to send group update message',
             errorToLogString(error)
@@ -4888,12 +5431,13 @@ async function handleCreateGroup(
         }
       }
 
-      streamSession.lastSendError = undefined;
+      rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       emitProtocolState(streamSession, { immediate: true });
       sendJson(req, res, 200, group);
     });
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -4964,6 +5508,7 @@ async function handleModifyGroupMember(
       streamSession,
       'handleModifyGroupMember',
       async () => {
+        assertSendAllowed(streamSession);
         const result = await modifyGroupMember({
           action,
           allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
@@ -4975,8 +5520,12 @@ async function handleModifyGroupMember(
           targetServiceId: targetServiceId as ServiceIdString,
         });
         try {
+          const unauthChat = conversation.groupSendEndorsements
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined;
           await sendGroupUpdateMessage({
             chat: streamSession.connection,
+            groupSendEndorsements: conversation.groupSendEndorsements,
             groupChangeBase64: result.groupChangeBase64,
             groupId: String(conversation.groupId ?? conversation.id),
             groupV2: {
@@ -4986,14 +5535,18 @@ async function handleModifyGroupMember(
             linkedPayload: streamSession.linkedPayload,
             recipients,
             timestamp: now(),
+            unauthChat,
           });
         } catch (error) {
+          if (getSendErrorInfo(error)) {
+            throw error;
+          }
           console.warn(
             'handleGroupMember: group state updated, but failed to send group update message',
             errorToLogString(error)
           );
         }
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
@@ -5005,7 +5558,7 @@ async function handleModifyGroupMember(
       error instanceof Error &&
       error.message.includes('adding member already in group')
     ) {
-      streamSession.lastSendError = undefined;
+      rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       sendJson(req, res, 200, {
         groupChangeBase64: '',
@@ -5013,6 +5566,7 @@ async function handleModifyGroupMember(
       });
       return;
     }
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -5081,6 +5635,7 @@ async function handleModifyGroupSettings(
       streamSession,
       'handleModifyGroupSettings',
       async () => {
+        assertSendAllowed(streamSession);
         const result = await modifyGroupSettings({
           action,
           allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
@@ -5091,8 +5646,12 @@ async function handleModifyGroupSettings(
           value,
         });
         try {
+          const unauthChat = conversation.groupSendEndorsements
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined;
           await sendGroupUpdateMessage({
             chat: streamSession.connection,
+            groupSendEndorsements: conversation.groupSendEndorsements,
             groupChangeBase64: result.groupChangeBase64,
             groupId: String(conversation.groupId ?? conversation.id),
             groupV2: {
@@ -5102,20 +5661,25 @@ async function handleModifyGroupSettings(
             linkedPayload: streamSession.linkedPayload,
             recipients,
             timestamp: now(),
+            unauthChat,
           });
         } catch (error) {
+          if (getSendErrorInfo(error)) {
+            throw error;
+          }
           console.warn(
             'handleGroupSettings: group state updated, but failed to send group update message',
             errorToLogString(error)
           );
         }
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
       }
     );
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     throw error;
@@ -5156,6 +5720,7 @@ async function handleMessageRequestResponse(
       streamSession,
       'handleMessageRequestResponse',
       async () => {
+        assertSendAllowed(streamSession);
         const storageResult = await updateStorageMessageRequestResponse({
           allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
           chat: streamSession.connection,
@@ -5176,7 +5741,7 @@ async function handleMessageRequestResponse(
           timestamp,
           type: responseType,
         });
-        streamSession.lastSendError = undefined;
+        rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, {
@@ -5186,6 +5751,7 @@ async function handleMessageRequestResponse(
       }
     );
   } catch (error) {
+    rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
     streamSession.updatedAt = now();
     console.warn(
@@ -6534,6 +7100,10 @@ async function handleRequest(
         error: session.error,
         lastReceiveError: session.lastReceiveError,
         lastSendError: session.lastSendError,
+        sendBlockedUntil: session.sendBlockedUntil,
+        sendBlockedStatus: session.sendBlockedStatus,
+        sendBlockedReason: session.sendBlockedReason,
+        sendChallenge: session.sendChallenge,
         backupImportStatus: session.backupImportStatus,
         backupImportError: session.backupImportError,
         backupImportStats: session.backupImportStats,
@@ -6572,6 +7142,11 @@ async function handleRequest(
 
   if (req.method === 'POST' && url.pathname === '/messages/send') {
     await handleSendMessage(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/messages/challenge') {
+    await handleSubmitMessageChallenge(req, res);
     return;
   }
 
@@ -6742,6 +7317,17 @@ const server = createServer((req, res) => {
     if (!res.headersSent) {
       if (error instanceof RequestBodyTooLargeError) {
         sendText(req, res, 413, error.message);
+        return;
+      }
+      const sendErrorInfo = getSendErrorInfo(error);
+      if (sendErrorInfo) {
+        sendJson(
+          req,
+          res,
+          sendErrorInfo.status,
+          sendErrorInfo.body,
+          sendErrorInfo.headers
+        );
         return;
       }
       sendText(

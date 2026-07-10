@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -11,6 +13,7 @@ import {
   type ChangeEvent,
   type Dispatch,
   type JSX,
+  type MutableRefObject,
   type SetStateAction,
 } from 'react';
 import { useSelector } from 'react-redux';
@@ -315,15 +318,25 @@ function WebRelinkDialog({
   );
 }
 
-function WebLeftPane({
-  forceRelinkDialog,
-  onRelinkDevice,
-  ...props
-}: NavTabPanelProps &
-  Readonly<{
-    forceRelinkDialog: boolean;
-    onRelinkDevice: () => void;
-  }>): JSX.Element {
+type WebLeftPaneRuntimeContextValue = Readonly<{
+  forceRelinkDialog: boolean;
+  onRelinkDevice: () => void;
+}>;
+
+const WebLeftPaneRuntimeContext =
+  createContext<WebLeftPaneRuntimeContextValue | undefined>(undefined);
+
+function useWebLeftPaneRuntimeContext(): WebLeftPaneRuntimeContextValue {
+  const context = useContext(WebLeftPaneRuntimeContext);
+  strictAssert(context != null, 'WebLeftPaneRuntimeContext must be provided');
+  return context;
+}
+
+const WebLeftPane = memo(function WebLeftPane(
+  props: NavTabPanelProps
+): JSX.Element {
+  const { forceRelinkDialog, onRelinkDevice } =
+    useWebLeftPaneRuntimeContext();
   const { conversations, pinnedConversations } = useSelector(getLeftPaneLists);
   const leftPaneLayoutKey = useMemo(
     () =>
@@ -336,47 +349,97 @@ function WebLeftPane({
       ].join('|'),
     [conversations, pinnedConversations]
   );
+  const renderRelinkDialogOverride = useCallback(
+    (dialogProps: Omit<WebRelinkDialogProps, 'onRelinkDevice'>) => (
+      <WebRelinkDialog
+        {...dialogProps}
+        onRelinkDevice={onRelinkDevice}
+      />
+    ),
+    [onRelinkDevice]
+  );
 
   return (
     <SmartLeftPane
       key={leftPaneLayoutKey}
       forceRelinkDialog={forceRelinkDialog}
-      renderRelinkDialogOverride={dialogProps => (
-        <WebRelinkDialog
-          {...dialogProps}
-          onRelinkDevice={onRelinkDevice}
-        />
-      )}
+      renderRelinkDialogOverride={renderRelinkDialogOverride}
       {...props}
     />
   );
-}
+});
 
-function renderLeftPane(
-  props: NavTabPanelProps,
-  options: Readonly<{
-    forceRelinkDialog: boolean;
-    onRelinkDevice: () => void;
-  }>
-): JSX.Element {
-  return <WebLeftPane {...props} {...options} />;
+function renderLeftPane(props: NavTabPanelProps): JSX.Element {
+  return <WebLeftPane {...props} />;
 }
 
 function renderMiniPlayer(): JSX.Element {
   return <></>;
 }
 
+function noopShowWhatsNewModal(): undefined {
+  return undefined;
+}
+
+type WebConversationRuntimeContextValue = Readonly<{
+  linkedSession: LinkedSessionRecord;
+  messageRuntimeSessionId?: string;
+  shellRef: MutableRefObject<ChatShellState>;
+  setShell: Dispatch<SetStateAction<ChatShellState>>;
+}>;
+
+const WebConversationRuntimeContext =
+  createContext<WebConversationRuntimeContextValue | undefined>(undefined);
+
+function useWebConversationRuntimeContext(): WebConversationRuntimeContextValue {
+  const context = useContext(WebConversationRuntimeContext);
+  strictAssert(
+    context != null,
+    'WebConversationRuntimeContext must be provided'
+  );
+  return context;
+}
+
+function isWebConversationRenderDebugEnabled(): boolean {
+  return Boolean(
+    (
+      window as typeof window & {
+        SignalWebConversationRenderDebug?: boolean;
+      }
+    ).SignalWebConversationRenderDebug
+  );
+}
+
+function useWebConversationRenderDebug(
+  id: string,
+  details: Readonly<Record<string, unknown>>
+): void {
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+
+  useEffect(() => {
+    if (!isWebConversationRenderDebugEnabled()) {
+      return;
+    }
+    console.log('[SignalWebConversationRender]', {
+      ...details,
+      id,
+      renderCount: renderCountRef.current,
+    });
+  });
+}
+
 function WebCompositionArea({
   conversationId,
   linkedSession,
   messageRuntimeSessionId,
-  shell,
+  shellRef,
   setShell,
 }: Readonly<{
   conversationId: string;
   linkedSession: LinkedSessionRecord;
   messageRuntimeSessionId?: string;
-  shell: ChatShellState;
+  shellRef: MutableRefObject<ChatShellState>;
   setShell: Dispatch<SetStateAction<ChatShellState>>;
 }>): JSX.Element {
   const i18n = useSelector(getIntl);
@@ -437,21 +500,6 @@ function WebCompositionArea({
 
   const draftEditMessage =
     (conversation.draftEditMessage as DraftEditMessageType | undefined) ?? null;
-  const shellConversation = shell.conversationLookup[conversationId];
-  const normalizedShellConversation = shellConversation
-    ? normalizeWebConversationForDesktopSemantics(
-        shellConversation,
-        linkedSession
-      )
-    : undefined;
-  const isSelectedGroupConversation = normalizedShellConversation
-    ? normalizedShellConversation.type === 'group' ||
-      normalizedShellConversation.conversationType === 'group'
-    : conversation.type === 'group';
-  const isLeftGroup =
-    normalizedShellConversation && isSelectedGroupConversation
-      ? normalizedShellConversation.left === true
-      : Boolean(conversation.left);
   const addedBy = useMemo(() => {
     if (conversation.type === 'group') {
       return getAddedByForGroup(conversation);
@@ -654,38 +702,44 @@ function WebCompositionArea({
         return false;
       }
 
-      const conversation = shell.conversationLookup[conversationId];
-      if (!conversation) {
+      const currentShell = shellRef.current;
+      const shellConversation = currentShell.conversationLookup[conversationId];
+      if (!shellConversation) {
         return false;
       }
+      const conversationForSend = normalizeWebConversationForDesktopSemantics(
+        shellConversation,
+        linkedSession
+      );
 
       setIsSending(true);
+      const isEditSubmission = draftEditMessage != null;
 
       void (async () => {
         try {
           if (draftEditMessage) {
             const updatedAt = Date.now();
-            const targetMessage = shell.messages.find(
+            const targetMessage = currentShell.messages.find(
               item => item.id === draftEditMessage.targetMessageId
             );
             if (!targetMessage) {
               throw new Error('Web edit failed: target message was not found');
             }
             if (
-              conversation.type === 'group' ||
-              conversation.conversationType === 'group'
+              conversationForSend.type === 'group' ||
+              conversationForSend.conversationType === 'group'
             ) {
               throw new Error(
                 'Web group message edit is not wired to the bridge yet'
               );
             }
-            await sendDirectEditMessage({
-              runtimeSessionId: messageRuntimeSessionId,
-              destinationServiceId: conversation.serviceId ?? conversation.id,
-              body,
-              targetTimestamp: targetMessage.timestamp,
-              timestamp: updatedAt,
-            });
+            discardEditMessage(conversationId);
+            inputApi.current?.reset();
+            setDraftText('');
+            setDirty(false);
+            setSendCounter(current => current + 1);
+            const targetTimestamp =
+              targetMessage.editMessageTimestamp ?? targetMessage.timestamp;
             setShell(current => {
               const existingMessage = current.messages.find(
                 item => item.id === draftEditMessage.targetMessageId
@@ -729,7 +783,8 @@ function WebCompositionArea({
                 timestamp: existingMessage.timestamp,
               };
               const currentConversation =
-                current.conversationLookup[conversationId] ?? conversation;
+                current.conversationLookup[conversationId] ??
+                conversationForSend;
               const isNewestInConversation = current.messages.every(item => {
                 return (
                   item.conversationId !== conversationId ||
@@ -788,25 +843,31 @@ function WebCompositionArea({
               }
               return nextShell;
             });
-            discardEditMessage(conversationId);
-            inputApi.current?.reset();
-            setDraftText('');
-            setDirty(false);
-            setSendCounter(current => current + 1);
+            await sendDirectEditMessage({
+              runtimeSessionId: messageRuntimeSessionId,
+              destinationServiceId:
+                conversationForSend.serviceId ?? conversationForSend.id,
+              body,
+              targetTimestamp,
+              timestamp: updatedAt,
+            });
             return;
           }
 
-          if (isLeftGroup) {
+          const isSendTargetGroupConversation =
+            conversationForSend.type === 'group' ||
+            conversationForSend.conversationType === 'group';
+          if (
+            isSendTargetGroupConversation &&
+            conversationForSend.left === true
+          ) {
             showToast({ toastType: ToastType.LeftGroup });
             return;
           }
-          const isSendTargetGroupConversation =
-            conversation.type === 'group' ||
-            conversation.conversationType === 'group';
           const destinationServiceId =
-            conversation.serviceId ?? conversation.id;
+            conversationForSend.serviceId ?? conversationForSend.id;
           const localMessageDestinationId = isSendTargetGroupConversation
-            ? (conversation.groupId ?? conversation.id)
+            ? (conversationForSend.groupId ?? conversationForSend.id)
             : destinationServiceId;
           const localMessageId = `sent:${localMessageDestinationId}:${timestamp}`;
           const quote = getWebQuoteForSend(quotedMessage);
@@ -829,7 +890,7 @@ function WebCompositionArea({
 
           setShell(current => {
             const currentConversation =
-              current.conversationLookup[conversationId] ?? conversation;
+              current.conversationLookup[conversationId] ?? conversationForSend;
             const lastMessage = getWebConversationLastMessage(
               optimisticMessage,
               credentials.aci
@@ -886,6 +947,9 @@ function WebCompositionArea({
           setDirty(false);
           setSendCounter(current => current + 1);
           setIsViewOnce(false);
+          if (quotedMessage) {
+            setQuoteByMessageId(conversationId, undefined);
+          }
           if (!attachmentOverride && submittedAttachmentIds.size > 0) {
             setPendingAttachments(current =>
               current.filter(
@@ -901,20 +965,24 @@ function WebCompositionArea({
                 return sendGroupTextMessage({
                   attachments: remoteAttachments,
                   runtimeSessionId: messageRuntimeSessionId,
-                  groupId: conversation.groupId ?? conversation.id,
+                  groupId: conversationForSend.groupId ?? conversationForSend.id,
                   body,
                   isViewOnce: isViewOnceActive,
                   quote,
                   timestamp,
                   groupV2:
-                    conversation.masterKey &&
-                    typeof conversation.revision === 'number'
+                    conversationForSend.masterKey &&
+                    typeof conversationForSend.revision === 'number'
                       ? {
-                          masterKey: conversation.masterKey,
-                          revision: conversation.revision,
+                          masterKey: conversationForSend.masterKey,
+                          revision: conversationForSend.revision,
                         }
                       : undefined,
-                  recipients: conversation.membersV2?.map(member => member.aci),
+                  groupSendEndorsements:
+                    conversationForSend.groupSendEndorsements,
+                  recipients: conversationForSend.membersV2?.map(
+                    member => member.aci
+                  ),
                 });
               })()
             : await sendDirectTextMessage({
@@ -941,7 +1009,7 @@ function WebCompositionArea({
           let didReplaceLocalMessage = false;
           setShell(current => {
             const currentConversation =
-              current.conversationLookup[conversationId] ?? conversation;
+              current.conversationLookup[conversationId] ?? conversationForSend;
             didReplaceLocalMessage = current.messages.some(
               item => item.id === normalized.id
             );
@@ -993,9 +1061,6 @@ function WebCompositionArea({
             return nextShell;
           });
           registerMessageInCache(normalized);
-          if (quotedMessage) {
-            setQuoteByMessageId(conversationId, undefined);
-          }
           if (didReplaceLocalMessage) {
             window.reduxActions?.conversations?.messageChanged?.(
               normalized.id,
@@ -1024,12 +1089,16 @@ function WebCompositionArea({
           setIsViewOnce(false);
           setDirty(false);
         } catch (error) {
+          if (isEditSubmission) {
+            console.error('Failed to send web edit message', error);
+            return;
+          }
           const isGroupConversation =
-            conversation.type === 'group' ||
-            conversation.conversationType === 'group';
+            conversationForSend.type === 'group' ||
+            conversationForSend.conversationType === 'group';
           const failedMessageDestinationId = isGroupConversation
-            ? (conversation.groupId ?? conversation.id)
-            : (conversation.serviceId ?? conversation.id);
+            ? (conversationForSend.groupId ?? conversationForSend.id)
+            : (conversationForSend.serviceId ?? conversationForSend.id);
           const failedMessageId = `sent:${failedMessageDestinationId}:${timestamp}`;
           const failedMessage: WebMessage = {
             id: failedMessageId,
@@ -1083,13 +1152,12 @@ function WebCompositionArea({
       conversation,
       discardEditMessage,
       draftEditMessage,
-      isLeftGroup,
       isSending,
       linkedSession,
       messageRuntimeSessionId,
       pendingAttachments,
       setShell,
-      shell,
+      shellRef,
       showToast,
       quotedMessage,
       revokePendingAttachmentUrls,
@@ -1735,18 +1803,50 @@ function WebCompositionArea({
   );
 }
 
-function WebConversation({
+function WebCompositionAreaFromContext({
+  conversationId,
+}: Readonly<{
+  conversationId: string;
+}>): JSX.Element {
+  const { linkedSession, messageRuntimeSessionId, shellRef, setShell } =
+    useWebConversationRuntimeContext();
+  useWebConversationRenderDebug('WebCompositionAreaFromContext', {
+    conversationId,
+    messageRuntimeSessionId,
+    shellMessages: shellRef.current.messages.length,
+  });
+
+  return (
+    <WebCompositionArea
+      conversationId={conversationId}
+      linkedSession={linkedSession}
+      messageRuntimeSessionId={messageRuntimeSessionId}
+      shellRef={shellRef}
+      setShell={setShell}
+    />
+  );
+}
+
+function renderWebCompositionArea(conversationId: string): JSX.Element {
+  return <WebCompositionAreaFromContext conversationId={conversationId} />;
+}
+
+function renderWebConversationHeader(conversationId: string): JSX.Element {
+  return <SmartConversationHeader id={conversationId} hideOutgoingCallButtons />;
+}
+
+function renderWebTimeline(conversationId: string): JSX.Element {
+  return <SmartTimeline key={conversationId} id={conversationId} />;
+}
+
+function renderWebPanel(conversationId: string): JSX.Element {
+  return <ConversationPanel conversationId={conversationId} />;
+}
+
+const WebConversation = memo(function WebConversation({
   selectedConversationId,
-  linkedSession,
-  messageRuntimeSessionId,
-  shell,
-  setShell,
 }: Readonly<{
   selectedConversationId: string;
-  linkedSession: LinkedSessionRecord;
-  messageRuntimeSessionId?: string;
-  shell: ChatShellState;
-  setShell: Dispatch<SetStateAction<ChatShellState>>;
 }>): JSX.Element {
   const selectedMessageIds = useSelector(getSelectedMessageIds);
   const isSelectMode = selectedMessageIds != null;
@@ -1756,6 +1856,15 @@ function WebConversation({
   const activePanel = useSelector(getActivePanel);
   const isPanelAnimating = useSelector(getIsPanelAnimating);
   const shouldHideConversationView = activePanel != null && !isPanelAnimating;
+  const onExitSelectMode = useCallback(() => {
+    toggleSelectMode(false);
+  }, [toggleSelectMode]);
+  useWebConversationRenderDebug('WebConversation', {
+    activePanel,
+    isPanelAnimating,
+    isSelectMode,
+    selectedConversationId,
+  });
 
   return (
     <ConversationView
@@ -1763,31 +1872,23 @@ function WebConversation({
       hasOpenModal={hasOpenModal}
       hasOpenPanel={activePanel != null}
       isSelectMode={isSelectMode}
-      onExitSelectMode={() => {
-        toggleSelectMode(false);
-      }}
+      onExitSelectMode={onExitSelectMode}
       processAttachments={processAttachments}
-      renderCompositionArea={conversationId => (
-        <WebCompositionArea
-          conversationId={conversationId}
-          linkedSession={linkedSession}
-          messageRuntimeSessionId={messageRuntimeSessionId}
-          shell={shell}
-          setShell={setShell}
-        />
-      )}
-      renderConversationHeader={conversationId => (
-        <SmartConversationHeader id={conversationId} hideOutgoingCallButtons />
-      )}
-      renderTimeline={conversationId => <SmartTimeline id={conversationId} />}
-      renderPanel={conversationId =>
-        activePanel ? (
-          <ConversationPanel conversationId={conversationId} />
-        ) : undefined
-      }
+      renderCompositionArea={renderWebCompositionArea}
+      renderConversationHeader={renderWebConversationHeader}
+      renderTimeline={renderWebTimeline}
+      renderPanel={renderWebPanel}
       shouldHideConversationView={shouldHideConversationView}
     />
   );
+});
+
+function renderWebConversationView({
+  selectedConversationId,
+}: Readonly<{
+  selectedConversationId: string;
+}>): JSX.Element {
+  return <WebConversation selectedConversationId={selectedConversationId} />;
 }
 
 export const WebChatsTab = memo(function WebChatsTab({
@@ -1815,6 +1916,8 @@ export const WebChatsTab = memo(function WebChatsTab({
   const { onConversationClosed, onConversationOpened, scrollToMessage } =
     useConversationsActions();
   const lastOpenedConversationId = useRef<string | undefined>(undefined);
+  const shellRef = useRef(shell);
+  shellRef.current = shell;
 
   useEffect(() => {
     if (selectedConversationId !== lastOpenedConversationId.current) {
@@ -1847,34 +1950,45 @@ export const WebChatsTab = memo(function WebChatsTab({
     targetedMessageId,
     targetedMessageSource,
   ]);
+  const contextValue = useMemo(
+    () => ({
+      linkedSession,
+      messageRuntimeSessionId,
+      shellRef,
+      setShell,
+    }),
+    [linkedSession, messageRuntimeSessionId, setShell]
+  );
+  const leftPaneContextValue = useMemo(
+    () => ({
+      forceRelinkDialog: isRelinkRequired,
+      onRelinkDevice,
+    }),
+    [isRelinkRequired, onRelinkDevice]
+  );
+  useWebConversationRenderDebug('WebChatsTab', {
+    selectedConversationId,
+    shellMessages: shell.messages.length,
+  });
 
   return (
-    <ChatsTab
-      otherTabsUnreadStats={otherTabsUnreadStats}
-      i18n={i18n}
-      isStaging={false}
-      hasFailedStorySends={false}
-      hasPendingUpdate={false}
-      navTabsCollapsed={navTabsCollapsed}
-      onToggleNavTabsCollapse={toggleNavTabsCollapse}
-      renderConversationView={({ selectedConversationId: id }) => (
-        <WebConversation
-          selectedConversationId={id}
-          linkedSession={linkedSession}
-          messageRuntimeSessionId={messageRuntimeSessionId}
-          shell={shell}
-          setShell={setShell}
+    <WebConversationRuntimeContext.Provider value={contextValue}>
+      <WebLeftPaneRuntimeContext.Provider value={leftPaneContextValue}>
+        <ChatsTab
+          otherTabsUnreadStats={otherTabsUnreadStats}
+          i18n={i18n}
+          isStaging={false}
+          hasFailedStorySends={false}
+          hasPendingUpdate={false}
+          navTabsCollapsed={navTabsCollapsed}
+          onToggleNavTabsCollapse={toggleNavTabsCollapse}
+          renderConversationView={renderWebConversationView}
+          renderLeftPane={renderLeftPane}
+          renderMiniPlayer={renderMiniPlayer}
+          selectedConversationId={selectedConversationId}
+          showWhatsNewModal={noopShowWhatsNewModal}
         />
-      )}
-      renderLeftPane={props =>
-        renderLeftPane(props, {
-          forceRelinkDialog: isRelinkRequired,
-          onRelinkDevice,
-        })
-      }
-      renderMiniPlayer={renderMiniPlayer}
-      selectedConversationId={selectedConversationId}
-      showWhatsNewModal={() => undefined}
-    />
+      </WebLeftPaneRuntimeContext.Provider>
+    </WebConversationRuntimeContext.Provider>
   );
 });

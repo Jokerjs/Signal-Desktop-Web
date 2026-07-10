@@ -1,7 +1,7 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
   CiphertextMessageType,
   ContentHint,
@@ -21,6 +21,7 @@ import {
   PrivateKey,
   ProtocolAddress,
   PublicKey,
+  SenderCertificate,
   SenderKeyDistributionMessage,
   SenderKeyRecord,
   SenderKeyStore,
@@ -31,19 +32,31 @@ import {
   SignedPreKeyRecord,
   SignedPreKeyStore,
   groupDecrypt,
+  groupEncrypt,
   PlaintextContent,
   processSenderKeyDistributionMessage,
   processPreKeyBundle,
   sealedSenderDecryptToUsmc,
+  sealedSenderMultiRecipientEncrypt,
   signalDecrypt,
   signalDecryptPreKey,
   signalEncrypt,
+  UnidentifiedSenderMessageContent,
 } from '@signalapp/libsignal-client';
 import type { CiphertextMessage, Uuid } from '@signalapp/libsignal-client';
-import type { AuthenticatedChatConnection } from '@signalapp/libsignal-client/dist/net.js';
+import {
+  GroupSecretParams,
+  GroupSendEndorsement,
+  GroupSendFullToken,
+} from '@signalapp/libsignal-client/zkgroup.js';
+import type {
+  AuthenticatedChatConnection,
+  UnauthenticatedChatConnection,
+} from '@signalapp/libsignal-client/dist/net.js';
 import type { SingleOutboundUnsealedMessage } from '@signalapp/libsignal-client/dist/net/chat/SingleOutboundMessage.js';
 
 import * as Bytes from '../../Bytes.std.ts';
+import * as Curve from '../../Curve.node.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import {
   fromAciUuidBytes,
@@ -79,8 +92,10 @@ import type {
   WebPinMessageEvent,
   WebPollTerminateEvent,
   WebPollVoteEvent,
+  WebGroupSendEndorsements,
   ProtocolKyberPreKeyRecord,
   ProtocolPreKeyRecord,
+  ProtocolSenderKeyInfoRecord,
   ProtocolSenderKeyRecord,
   ProtocolSessionRecord,
   ProtocolState,
@@ -164,9 +179,11 @@ type GroupTextSendOptions = Readonly<{
     masterKey: string;
     revision: number;
   }>;
+  groupSendEndorsements?: WebGroupSendEndorsements;
   linkedPayload: WebSendLinkedPayload;
   recipients: ReadonlyArray<string>;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
   attachments?: ReadonlyArray<WebAttachment>;
   deleteForEveryone?: WebDeleteForEveryone;
   isViewOnce?: boolean;
@@ -177,12 +194,14 @@ type GroupTextSendOptions = Readonly<{
 
 type GroupUpdateSendOptions = Readonly<{
   chat: AuthenticatedChatConnection;
+  groupSendEndorsements?: WebGroupSendEndorsements;
   groupChangeBase64?: string;
   groupId: string;
   groupV2: GroupTextSendOptions['groupV2'];
   linkedPayload: WebSendLinkedPayload;
   recipients: ReadonlyArray<string>;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>;
 
 type DirectReactionSendOptions = Readonly<{
@@ -211,12 +230,38 @@ type GroupReactionSendOptions = Readonly<{
   emoji?: string;
   groupId: string;
   groupV2: GroupTextSendOptions['groupV2'];
+  groupSendEndorsements?: WebGroupSendEndorsements;
   linkedPayload: WebSendLinkedPayload;
   recipients: ReadonlyArray<string>;
   remove: boolean;
   targetAuthorAci: string;
   targetTimestamp: number;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
+}>;
+
+type WebSenderKeyDevice = Readonly<{
+  serviceId: string;
+  id: number;
+}>;
+
+type WebSenderKeyInfo = Readonly<{
+  createdAtDate: number;
+  distributionId: string;
+  memberDevices: ReadonlyArray<WebSenderKeyDevice>;
+}>;
+
+type SenderKeyGroupSendOptions = Readonly<{
+  chat: AuthenticatedChatConnection;
+  contentHint: ContentHint;
+  groupId: string;
+  groupSendToken?: GroupSendFullToken;
+  linkedPayload: WebSendLinkedPayload;
+  plaintext: Uint8Array<ArrayBuffer>;
+  recipientServiceIds: ReadonlyArray<string>;
+  timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
+  urgent: boolean;
 }>;
 
 type DirectEditSendOptions = Readonly<{
@@ -298,6 +343,35 @@ function isProtocolSenderKeyRecord(
     typeof (value as ProtocolSenderKeyRecord).namespace === 'string' &&
     typeof (value as ProtocolSenderKeyRecord).senderKey === 'string' &&
     typeof (value as ProtocolSenderKeyRecord).recordBase64 === 'string'
+  );
+}
+
+function isWebSenderKeyDevice(value: unknown): value is WebSenderKeyDevice {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as WebSenderKeyDevice).serviceId === 'string' &&
+      typeof (value as WebSenderKeyDevice).id === 'number'
+  );
+}
+
+function isProtocolSenderKeyInfoRecord(
+  value: unknown
+): value is ProtocolSenderKeyInfoRecord {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as ProtocolSenderKeyInfoRecord).groupId === 'string' &&
+      typeof (value as ProtocolSenderKeyInfoRecord).distributionId ===
+        'string' &&
+      typeof (value as ProtocolSenderKeyInfoRecord).createdAtDate ===
+        'number' &&
+      Array.isArray(
+        (value as ProtocolSenderKeyInfoRecord).memberDevices
+      ) &&
+      (value as ProtocolSenderKeyInfoRecord).memberDevices.every(
+        isWebSenderKeyDevice
+      )
   );
 }
 
@@ -754,16 +828,39 @@ type WebProtocolStoreEntry = Readonly<{
 }>;
 
 const protocolStores = new Map<string, WebProtocolStoreEntry>();
+const senderKeyInfoStores = new Map<string, Map<string, WebSenderKeyInfo>>();
+const senderKeyInfoStoreSignatures = new Map<string, string | undefined>();
+const senderCertificateByAci = new Map<
+  string,
+  Readonly<{ certificate: SenderCertificate; expiresAt: number }>
+>();
 const serverKeyFetchRetryAfterByKey = new Map<string, number>();
 const serverKeyFetchesByKey = new Map<string, Promise<ServerKeys>>();
 const DEFAULT_SERVER_KEY_FETCH_RETRY_AFTER_MS = 10 * 60 * 1000;
 const DECRYPTION_ERROR_RETRY_LIMIT = 5;
+const WEB_PRE_KEY_CHECK_INTERVAL_MS = Number(
+  process.env.SIGNAL_WEB_PRE_KEY_CHECK_INTERVAL_MS ?? 6 * 60 * 60 * 1000
+);
+const WEB_PRE_KEY_GEN_BATCH_SIZE = Number(
+  process.env.SIGNAL_WEB_PRE_KEY_GEN_BATCH_SIZE ?? 100
+);
+const WEB_PRE_KEY_MINIMUM = Number(
+  process.env.SIGNAL_WEB_PRE_KEY_MINIMUM ?? 10
+);
+const WEB_PRE_KEY_MAX_COUNT = Number(
+  process.env.SIGNAL_WEB_PRE_KEY_MAX_COUNT ?? 100
+);
 const decryptionErrorRetryCounts = new Map<string, number>();
 const sentProtoRecords = new Map<string, WebSentProtoRecord>();
 const sentProtoRecordOrder = new Array<string>();
+const preKeyMaintenanceLastCheckedAt = new Map<string, number>();
+const preKeyMaintenanceInFlight = new Map<string, Promise<boolean>>();
+const preKeyMaintenanceRetryAfterByKey = new Map<string, number>();
 
 const MAX_SENT_PROTO_RECORDS = 500;
 const SENT_PROTO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SENDER_CERTIFICATE_REFRESH_BUFFER_MS = 60 * 60 * 1000;
+const SENDER_KEY_INFO_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 
 function getSentProtoKey(
   recipientServiceId: string,
@@ -1104,6 +1201,58 @@ function getProtocolStore(
   );
 }
 
+function getSenderKeyInfoStore(
+  linkedPayload: WebSendLinkedPayload
+): Map<string, WebSenderKeyInfo> {
+  const aci = getLinkedAci(linkedPayload);
+  const externalSignature = JSON.stringify(
+    (linkedPayload.protocol?.senderKeyInfos ?? [])
+      .filter(isProtocolSenderKeyInfoRecord)
+      .map(record => [
+        record.groupId,
+        record.distributionId,
+        record.createdAtDate,
+        record.memberDevices.map(device => [device.serviceId, device.id]),
+      ])
+      .sort(([left], [right]) => String(left).localeCompare(String(right)))
+  );
+  const existing = senderKeyInfoStores.get(aci);
+  if (
+    existing &&
+    senderKeyInfoStoreSignatures.get(aci) === externalSignature
+  ) {
+    return existing;
+  }
+
+  const store = new Map<string, WebSenderKeyInfo>();
+  for (const record of (linkedPayload.protocol?.senderKeyInfos ?? []).filter(
+    isProtocolSenderKeyInfoRecord
+  )) {
+    store.set(record.groupId, {
+      createdAtDate: record.createdAtDate,
+      distributionId: record.distributionId,
+      memberDevices: [...record.memberDevices],
+    });
+  }
+  senderKeyInfoStores.set(aci, store);
+  senderKeyInfoStoreSignatures.set(aci, externalSignature);
+  return store;
+}
+
+function exportSenderKeyInfoRecords(
+  linkedPayload: WebSendLinkedPayload
+): Array<ProtocolSenderKeyInfoRecord> {
+  return [...getSenderKeyInfoStore(linkedPayload)].map(([groupId, info]) => ({
+    groupId,
+    distributionId: info.distributionId,
+    createdAtDate: info.createdAtDate,
+    memberDevices: info.memberDevices.map(device => ({
+      serviceId: device.serviceId,
+      id: device.id,
+    })),
+  }));
+}
+
 export function exportProtocolState(
   linkedPayload: WebSendLinkedPayload
 ): ProtocolState {
@@ -1143,7 +1292,327 @@ export function exportProtocolState(
     ),
     sessions: stores.flatMap(store => store.sessionStore.exportRecords()),
     senderKeys: stores.flatMap(store => store.senderKeyStore.exportRecords()),
+    senderKeyInfos: exportSenderKeyInfoRecords(linkedPayload),
   };
+}
+
+type WebPreKeyIdentity = 'aci' | 'pni';
+
+type WebPreKeyCounts = Readonly<{
+  count: number;
+  pqCount: number;
+}>;
+
+function getWebPreKeyMaintenanceKey(
+  linkedPayload: WebSendLinkedPayload,
+  identity: WebPreKeyIdentity
+): string {
+  return `${getLinkedAci(linkedPayload)}:${identity}`;
+}
+
+function getWebPreKeyIdentityServiceId(
+  linkedPayload: WebSendLinkedPayload,
+  identity: WebPreKeyIdentity
+): string | undefined {
+  return identity === 'pni'
+    ? getLinkedPni(linkedPayload)
+    : getLinkedAci(linkedPayload);
+}
+
+function hasWebPreKeyIdentityMaterial(
+  linkedPayload: WebSendLinkedPayload,
+  identity: WebPreKeyIdentity
+): boolean {
+  if (identity === 'aci') {
+    return Boolean(
+      linkedPayload.aciIdentityKeyPublic &&
+        linkedPayload.aciIdentityKeyPrivate &&
+        linkedPayload.aciRegistrationId &&
+        linkedPayload.aciSignedPreKeyRecordBase64 &&
+        linkedPayload.aciPqLastResortPreKeyRecordBase64
+    );
+  }
+
+  return Boolean(
+    getLinkedPni(linkedPayload) &&
+      linkedPayload.pniIdentityKeyPublic &&
+      linkedPayload.pniIdentityKeyPrivate &&
+      linkedPayload.pniRegistrationId &&
+      linkedPayload.pniSignedPreKeyRecordBase64 &&
+      linkedPayload.pniPqLastResortPreKeyRecordBase64
+  );
+}
+
+function getRandomWebPreKeyStartId(): number {
+  return Math.max(1, randomBytes(4).readUint32LE(0) & 0xffffff);
+}
+
+function getNextWebPreKeyId(startId: number, offset: number): number {
+  return Math.max(1, (startId + offset) & 0xffffff);
+}
+
+async function fetchWebPreKeyCounts(
+  chat: AuthenticatedChatConnection,
+  identity: WebPreKeyIdentity,
+  maintenanceKey: string
+): Promise<WebPreKeyCounts> {
+  const retryAfterUntil = preKeyMaintenanceRetryAfterByKey.get(maintenanceKey);
+  if (retryAfterUntil && retryAfterUntil > Date.now()) {
+    throw createChatResponseError({
+      message: `getMyKeyCounts rate limited locally; retry after ${Math.ceil(
+        (retryAfterUntil - Date.now()) / 1000
+      )}s`,
+      retryAfterMs: retryAfterUntil - Date.now(),
+      status: 429,
+    });
+  }
+
+  const response = await chat.fetch({
+    verb: 'GET',
+    path: `/v2/keys?identity=${identity}`,
+    headers: [],
+    timeoutMillis: 30_000,
+  });
+  const responseBody = Buffer.from(
+    response.body ?? new Uint8Array()
+  ).toString('utf8');
+  if (response.status !== 200) {
+    const retryAfterMs =
+      response.status === 429 ? getRetryAfterMs(response.headers) : undefined;
+    if (retryAfterMs != null) {
+      preKeyMaintenanceRetryAfterByKey.set(
+        maintenanceKey,
+        Date.now() + retryAfterMs
+      );
+    }
+    throw createChatResponseError({
+      message: responseBody
+        ? `getMyKeyCounts failed with status ${response.status}: ${responseBody}`
+        : `getMyKeyCounts failed with status ${response.status}`,
+      responseBody,
+      retryAfterMs,
+      status: response.status,
+    });
+  }
+
+  preKeyMaintenanceRetryAfterByKey.delete(maintenanceKey);
+  const parsed = JSON.parse(responseBody) as Partial<WebPreKeyCounts>;
+  if (
+    typeof parsed.count !== 'number' ||
+    typeof parsed.pqCount !== 'number'
+  ) {
+    throw new Error('getMyKeyCounts response missing count or pqCount');
+  }
+  return {
+    count: parsed.count,
+    pqCount: parsed.pqCount,
+  };
+}
+
+async function uploadWebPreKeys({
+  chat,
+  identity,
+  maintenanceKey,
+  pqPreKeys,
+  preKeys,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  identity: WebPreKeyIdentity;
+  maintenanceKey: string;
+  pqPreKeys?: ReadonlyArray<
+    Readonly<{
+      keyId: number;
+      publicKey: KEMPublicKey;
+      signature: Uint8Array<ArrayBuffer>;
+    }>
+  >;
+  preKeys?: ReadonlyArray<Readonly<{ keyId: number; publicKey: PublicKey }>>;
+}>): Promise<void> {
+  const body = {
+    preKeys: preKeys?.map(key => ({
+      keyId: key.keyId,
+      publicKey: Bytes.toBase64(key.publicKey.serialize()),
+    })),
+    pqPreKeys: pqPreKeys?.map(key => ({
+      keyId: key.keyId,
+      publicKey: Bytes.toBase64(key.publicKey.serialize()),
+      signature: Bytes.toBase64(key.signature),
+    })),
+  };
+
+  const response = await chat.fetch({
+    verb: 'PUT',
+    path: `/v2/keys?identity=${identity}`,
+    headers: [['content-type', 'application/json']],
+    body: Buffer.from(JSON.stringify(body), 'utf8'),
+    timeoutMillis: 30_000,
+  });
+  if (response.status >= 200 && response.status < 300) {
+    preKeyMaintenanceRetryAfterByKey.delete(maintenanceKey);
+    return;
+  }
+
+  const responseBody = Buffer.from(
+    response.body ?? new Uint8Array()
+  ).toString('utf8');
+  const retryAfterMs =
+    response.status === 429 ? getRetryAfterMs(response.headers) : undefined;
+  if (retryAfterMs != null) {
+    preKeyMaintenanceRetryAfterByKey.set(
+      maintenanceKey,
+      Date.now() + retryAfterMs
+    );
+  }
+  throw createChatResponseError({
+    message: responseBody
+      ? `setMyKeys failed with status ${response.status}: ${responseBody}`
+      : `setMyKeys failed with status ${response.status}`,
+    responseBody,
+    retryAfterMs,
+    status: response.status,
+  });
+}
+
+async function maybeUpdateWebPreKeysForIdentity({
+  chat,
+  force,
+  identity,
+  linkedPayload,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  force: boolean;
+  identity: WebPreKeyIdentity;
+  linkedPayload: WebSendLinkedPayload;
+}>): Promise<boolean> {
+  if (!hasWebPreKeyIdentityMaterial(linkedPayload, identity)) {
+    return false;
+  }
+
+  const maintenanceKey = getWebPreKeyMaintenanceKey(linkedPayload, identity);
+  const inFlight = preKeyMaintenanceInFlight.get(maintenanceKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async () => {
+    const lastCheckedAt = preKeyMaintenanceLastCheckedAt.get(maintenanceKey);
+    if (
+      !force &&
+      lastCheckedAt &&
+      Date.now() - lastCheckedAt < WEB_PRE_KEY_CHECK_INTERVAL_MS
+    ) {
+      return false;
+    }
+
+    const counts = await fetchWebPreKeyCounts(
+      chat,
+      identity,
+      maintenanceKey
+    );
+    const shouldUpdatePreKeys =
+      counts.count < WEB_PRE_KEY_MINIMUM ||
+      counts.count > WEB_PRE_KEY_MAX_COUNT ||
+      force;
+    const shouldUpdatePqPreKeys =
+      counts.pqCount < WEB_PRE_KEY_MINIMUM ||
+      counts.pqCount > WEB_PRE_KEY_MAX_COUNT ||
+      force;
+    if (!shouldUpdatePreKeys && !shouldUpdatePqPreKeys) {
+      preKeyMaintenanceLastCheckedAt.set(maintenanceKey, Date.now());
+      return false;
+    }
+
+    const serviceId = getWebPreKeyIdentityServiceId(linkedPayload, identity);
+    if (!serviceId) {
+      return false;
+    }
+    const store = getProtocolStoreForServiceId(linkedPayload, serviceId);
+    const identityKeyPair = await store.identityStore.getIdentityKeyPair();
+    const preKeyStartId = getRandomWebPreKeyStartId();
+    const pqPreKeyStartId = getRandomWebPreKeyStartId();
+
+    const preKeyRecords = shouldUpdatePreKeys
+      ? Array.from({ length: WEB_PRE_KEY_GEN_BATCH_SIZE }, (_, index) => {
+          const keyId = getNextWebPreKeyId(preKeyStartId, index);
+          const preKey = Curve.generatePreKey(keyId);
+          return {
+            keyId,
+            publicKey: preKey.keyPair.publicKey,
+            record: PreKeyRecord.new(
+              keyId,
+              preKey.keyPair.publicKey,
+              preKey.keyPair.privateKey
+            ),
+          };
+        })
+      : undefined;
+    const pqPreKeyRecords = shouldUpdatePqPreKeys
+      ? Array.from({ length: WEB_PRE_KEY_GEN_BATCH_SIZE }, (_, index) => {
+          const keyId = getNextWebPreKeyId(pqPreKeyStartId, index);
+          const record = Curve.generateKyberPreKey(identityKeyPair, keyId);
+          return {
+            keyId,
+            publicKey: record.publicKey(),
+            record,
+            signature: record.signature(),
+          };
+        })
+      : undefined;
+
+    await uploadWebPreKeys({
+      chat,
+      identity,
+      maintenanceKey,
+      pqPreKeys: pqPreKeyRecords,
+      preKeys: preKeyRecords,
+    });
+
+    await Promise.all([
+      ...(preKeyRecords ?? []).map(item =>
+        store.preKeyStore.savePreKey(item.keyId, item.record)
+      ),
+      ...(pqPreKeyRecords ?? []).map(item =>
+        store.kyberPreKeyStore.saveKyberPreKey(item.keyId, item.record)
+      ),
+    ]);
+    preKeyMaintenanceLastCheckedAt.set(maintenanceKey, Date.now());
+    return true;
+  })();
+
+  preKeyMaintenanceInFlight.set(maintenanceKey, request);
+  try {
+    return await request;
+  } finally {
+    if (preKeyMaintenanceInFlight.get(maintenanceKey) === request) {
+      preKeyMaintenanceInFlight.delete(maintenanceKey);
+    }
+  }
+}
+
+export async function maybeUpdateWebPreKeys({
+  chat,
+  force = false,
+  linkedPayload,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  force?: boolean;
+  linkedPayload: WebSendLinkedPayload;
+}>): Promise<boolean> {
+  const updated = await Promise.all([
+    maybeUpdateWebPreKeysForIdentity({
+      chat,
+      force,
+      identity: 'aci',
+      linkedPayload,
+    }),
+    maybeUpdateWebPreKeysForIdentity({
+      chat,
+      force,
+      identity: 'pni',
+      linkedPayload,
+    }),
+  ]);
+  return updated.some(Boolean);
 }
 
 function createAttachmentPointer(
@@ -1430,6 +1899,18 @@ function createTextContent(
       },
       pniSignatureMessage: null,
       senderKeyDistributionMessage: null,
+    })
+  );
+}
+
+function createSenderKeyDistributionContent(
+  distributionMessage: SenderKeyDistributionMessage
+): Uint8Array<ArrayBuffer> {
+  return padMessage(
+    Proto.Content.encode({
+      content: null,
+      pniSignatureMessage: null,
+      senderKeyDistributionMessage: distributionMessage.serialize(),
     })
   );
 }
@@ -4131,6 +4612,112 @@ async function fetchServerKeys(
   }
 }
 
+function getGroupSendEndorsementToken({
+  groupSendEndorsements,
+  groupV2,
+  linkedPayload,
+  recipientServiceIds,
+}: Readonly<{
+  groupSendEndorsements?: WebGroupSendEndorsements;
+  groupV2?: Readonly<{ masterKey: string }>;
+  linkedPayload: WebSendLinkedPayload;
+  recipientServiceIds: ReadonlyArray<string>;
+}>): GroupSendFullToken | undefined {
+  if (!groupSendEndorsements || !groupV2) {
+    return undefined;
+  }
+  const nowSeconds = Date.now() / 1000;
+  const expiration = groupSendEndorsements.combinedEndorsement.expiration;
+  if (!Number.isFinite(expiration) || expiration <= nowSeconds) {
+    return undefined;
+  }
+
+  const uniqueRecipients = new Set(recipientServiceIds);
+  const memberEndorsements = new Map(
+    groupSendEndorsements.memberEndorsements.map(endorsement => [
+      endorsement.memberAci,
+      endorsement,
+    ])
+  );
+  const selectedEndorsements = new Array<GroupSendEndorsement>();
+  for (const recipientServiceId of uniqueRecipients) {
+    const endorsement = memberEndorsements.get(recipientServiceId);
+    if (!endorsement || endorsement.expiration !== expiration) {
+      return undefined;
+    }
+    selectedEndorsements.push(
+      new GroupSendEndorsement(Bytes.fromBase64(endorsement.endorsementBase64))
+    );
+  }
+  if (selectedEndorsements.length === 0) {
+    return undefined;
+  }
+
+  const ourAci = getLinkedAci(linkedPayload);
+  const allMemberAcis = new Set(memberEndorsements.keys());
+  const sendsToEveryOtherMember = [...allMemberAcis].every(
+    memberAci => memberAci === ourAci || uniqueRecipients.has(memberAci)
+  );
+  const endorsement = sendsToEveryOtherMember
+    ? new GroupSendEndorsement(
+        Bytes.fromBase64(
+          groupSendEndorsements.combinedEndorsement.endorsementBase64
+        )
+      )
+    : GroupSendEndorsement.combine(selectedEndorsements);
+
+  return endorsement.toFullToken(
+    new GroupSecretParams(
+      deriveGroupSecretParams(Bytes.fromBase64(groupV2.masterKey))
+    ),
+    new Date(expiration * 1000)
+  );
+}
+
+async function createSessionsFromUnauthServerKeys({
+  destinationServiceId,
+  groupSendToken,
+  linkedPayload,
+  unauthChat,
+}: Readonly<{
+  destinationServiceId: string;
+  groupSendToken: GroupSendFullToken;
+  linkedPayload: WebSendLinkedPayload;
+  unauthChat: UnauthenticatedChatConnection;
+}>): Promise<void> {
+  const aci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  if (typeof ourDeviceId !== 'number') {
+    throw new Error(
+      'createSessionsFromUnauthServerKeys: missing linked device id'
+    );
+  }
+
+  const { identityStore, sessionStore } = getProtocolStore(linkedPayload);
+  const localAddress = ProtocolAddress.new(aci, ourDeviceId);
+  const response = await unauthChat.getPreKeys({
+    target: ServiceId.parseFromServiceIdString(destinationServiceId),
+    device: 'all',
+    auth: groupSendToken,
+  });
+
+  for (const preKeyBundle of response.preKeyBundles) {
+    if (
+      destinationServiceId === aci &&
+      preKeyBundle.deviceId() === ourDeviceId
+    ) {
+      continue;
+    }
+    await processPreKeyBundle(
+      preKeyBundle,
+      ProtocolAddress.new(destinationServiceId, preKeyBundle.deviceId()),
+      localAddress,
+      sessionStore,
+      identityStore
+    );
+  }
+}
+
 async function createSessionsFromServerKeys({
   chat,
   destinationServiceId,
@@ -4214,13 +4801,17 @@ async function createSessionsFromServerKeys({
 async function encryptForDestination({
   chat,
   destinationServiceId,
+  groupSendToken,
   linkedPayload,
   plaintext,
+  unauthChat,
 }: Readonly<{
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
+  groupSendToken?: GroupSendFullToken;
   linkedPayload: WebSendLinkedPayload;
   plaintext: Uint8Array<ArrayBuffer>;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<ReadonlyArray<SingleOutboundUnsealedMessage>> {
   const aci = getLinkedAci(linkedPayload);
   const ourDeviceId = linkedPayload.credentials?.deviceId;
@@ -4235,12 +4826,21 @@ async function encryptForDestination({
     destinationServiceId === aci ? ourDeviceId : -1
   );
   if (knownSessions.length === 0) {
-    await createSessionsFromServerKeys({
-      chat,
-      destinationServiceId,
-      deviceIds: null,
-      linkedPayload,
-    });
+    if (groupSendToken && unauthChat) {
+      await createSessionsFromUnauthServerKeys({
+        destinationServiceId,
+        groupSendToken,
+        linkedPayload,
+        unauthChat,
+      });
+    } else {
+      await createSessionsFromServerKeys({
+        chat,
+        destinationServiceId,
+        deviceIds: null,
+        linkedPayload,
+      });
+    }
     knownSessions = sessionStore.getKnownSessionsForServiceId(
       destinationServiceId,
       destinationServiceId === aci ? ourDeviceId : -1
@@ -4313,6 +4913,382 @@ async function createPlaintextContentMessages({
     throw new Error('createPlaintextContentMessages: no destination devices');
   }
   return messages;
+}
+
+function getSenderKeyDeviceKey(device: WebSenderKeyDevice): string {
+  return `${device.serviceId}.${device.id}`;
+}
+
+function sortSenderKeyDevices(
+  devices: ReadonlyArray<WebSenderKeyDevice>
+): Array<WebSenderKeyDevice> {
+  return [...devices].sort(
+    (left, right) =>
+      left.serviceId.localeCompare(right.serviceId) || left.id - right.id
+  );
+}
+
+function getMissingSenderKeyDevices(
+  knownDevices: ReadonlyArray<WebSenderKeyDevice>,
+  currentDevices: ReadonlyArray<WebSenderKeyDevice>
+): Array<WebSenderKeyDevice> {
+  const known = new Set(knownDevices.map(getSenderKeyDeviceKey));
+  return currentDevices.filter(device => !known.has(getSenderKeyDeviceKey(device)));
+}
+
+function hasRemovedSenderKeyDevices(
+  knownDevices: ReadonlyArray<WebSenderKeyDevice>,
+  currentDevices: ReadonlyArray<WebSenderKeyDevice>
+): boolean {
+  const current = new Set(currentDevices.map(getSenderKeyDeviceKey));
+  return knownDevices.some(device => !current.has(getSenderKeyDeviceKey(device)));
+}
+
+async function fetchSenderCertificate({
+  chat,
+  linkedPayload,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  linkedPayload: WebSendLinkedPayload;
+}>): Promise<SenderCertificate | undefined> {
+  const aci = getLinkedAci(linkedPayload);
+  const cached = senderCertificateByAci.get(aci);
+  if (cached && cached.expiresAt > Date.now() + SENDER_CERTIFICATE_REFRESH_BUFFER_MS) {
+    return cached.certificate;
+  }
+
+  const response = await chat.fetch({
+    verb: 'GET',
+    path: '/v1/certificate/delivery?includeE164=false',
+    headers: [],
+    timeoutMillis: 30_000,
+  });
+  const responseBody = Buffer.from(
+    response.body ?? new Uint8Array()
+  ).toString('utf8');
+  if (response.status === 429) {
+    throw createChatResponseError({
+      message: responseBody
+        ? `getSenderCertificate failed with status 429: ${responseBody}`
+        : 'getSenderCertificate failed with status 429',
+      responseBody,
+      retryAfterMs: getRetryAfterMs(response.headers),
+      status: 429,
+    });
+  }
+  if (response.status !== 200) {
+    return undefined;
+  }
+
+  const parsed = JSON.parse(responseBody) as { certificate?: unknown };
+  if (typeof parsed.certificate !== 'string') {
+    return undefined;
+  }
+
+  const certificate = SenderCertificate.deserialize(
+    Bytes.fromBase64(parsed.certificate)
+  );
+  const expiresAt = certificate.expiration();
+  if (expiresAt <= Date.now() + SENDER_CERTIFICATE_REFRESH_BUFFER_MS) {
+    return undefined;
+  }
+
+  senderCertificateByAci.set(aci, { certificate, expiresAt });
+  return certificate;
+}
+
+async function getSenderKeyRecipientDevices({
+  groupSendToken,
+  linkedPayload,
+  recipientServiceIds,
+  unauthChat,
+}: Readonly<{
+  groupSendToken: GroupSendFullToken;
+  linkedPayload: WebSendLinkedPayload;
+  recipientServiceIds: ReadonlyArray<string>;
+  unauthChat: UnauthenticatedChatConnection;
+}>): Promise<Array<WebSenderKeyDevice>> {
+  const ourAci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  if (typeof ourDeviceId !== 'number') {
+    throw new Error('getSenderKeyRecipientDevices: missing linked device id');
+  }
+
+  const { sessionStore } = getProtocolStore(linkedPayload);
+  const devices = new Array<WebSenderKeyDevice>();
+  for (const serviceId of recipientServiceIds) {
+    let knownSessions = sessionStore.getKnownSessionsForServiceId(
+      serviceId,
+      serviceId === ourAci ? ourDeviceId : -1
+    );
+    if (knownSessions.length === 0) {
+      await createSessionsFromUnauthServerKeys({
+        destinationServiceId: serviceId,
+        groupSendToken,
+        linkedPayload,
+        unauthChat,
+      });
+      knownSessions = sessionStore.getKnownSessionsForServiceId(
+        serviceId,
+        serviceId === ourAci ? ourDeviceId : -1
+      );
+    }
+
+    for (const { address } of knownSessions) {
+      devices.push({
+        serviceId,
+        id: address.deviceId(),
+      });
+    }
+  }
+
+  if (devices.length === 0) {
+    throw new Error('getSenderKeyRecipientDevices: no destination devices');
+  }
+  return sortSenderKeyDevices(devices);
+}
+
+async function sendSenderKeyDistributionMessages({
+  chat,
+  distributionMessage,
+  groupSendToken,
+  linkedPayload,
+  recipientServiceIds,
+  timestamp,
+  unauthChat,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  distributionMessage: SenderKeyDistributionMessage;
+  groupSendToken: GroupSendFullToken;
+  linkedPayload: WebSendLinkedPayload;
+  recipientServiceIds: ReadonlyArray<string>;
+  timestamp: number;
+  unauthChat: UnauthenticatedChatConnection;
+}>): Promise<void> {
+  const plaintext = createSenderKeyDistributionContent(distributionMessage);
+  for (const destinationServiceId of recipientServiceIds) {
+    let messages = await encryptForDestination({
+      chat,
+      destinationServiceId,
+      groupSendToken,
+      linkedPayload,
+      plaintext,
+      unauthChat,
+    });
+
+    try {
+      await chat.sendMessage({
+        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+        contents: messages,
+        timestamp,
+        onlineOnly: false,
+        urgent: false,
+      });
+    } catch (error) {
+      const mismatchedEntries = getMismatchedDevicesEntries(
+        error,
+        destinationServiceId
+      );
+      if (!mismatchedEntries) {
+        throw error;
+      }
+      await handleWebMismatchedDevices({
+        chat,
+        entries: mismatchedEntries,
+        groupSendToken,
+        linkedPayload,
+        unauthChat,
+      });
+      messages = await encryptForDestination({
+        chat,
+        destinationServiceId,
+        groupSendToken,
+        linkedPayload,
+        plaintext,
+        unauthChat,
+      });
+      await chat.sendMessage({
+        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+        contents: messages,
+        timestamp,
+        onlineOnly: false,
+        urgent: false,
+      });
+    }
+  }
+}
+
+async function trySendGroupWithSenderKey({
+  chat,
+  contentHint,
+  groupId,
+  groupSendToken,
+  linkedPayload,
+  plaintext,
+  recipientServiceIds,
+  timestamp,
+  unauthChat,
+  urgent,
+}: SenderKeyGroupSendOptions): Promise<boolean> {
+  if (!groupSendToken || !unauthChat || recipientServiceIds.length === 0) {
+    return false;
+  }
+
+  const senderCertificate = await fetchSenderCertificate({
+    chat,
+    linkedPayload,
+  });
+  if (!senderCertificate) {
+    return false;
+  }
+
+  const ourAci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId;
+  if (typeof ourDeviceId !== 'number') {
+    throw new Error('trySendGroupWithSenderKey: missing linked device id');
+  }
+
+  const protocolStore = getProtocolStore(linkedPayload);
+  let currentDevices = await getSenderKeyRecipientDevices({
+    groupSendToken,
+    linkedPayload,
+    recipientServiceIds,
+    unauthChat,
+  });
+  const senderKeyInfoStore = getSenderKeyInfoStore(linkedPayload);
+  let senderKeyInfo = senderKeyInfoStore.get(groupId);
+  if (
+    !senderKeyInfo ||
+    !Number.isFinite(senderKeyInfo.createdAtDate) ||
+    Date.now() - senderKeyInfo.createdAtDate > SENDER_KEY_INFO_MAX_AGE_MS ||
+    hasRemovedSenderKeyDevices(senderKeyInfo.memberDevices, currentDevices)
+  ) {
+    senderKeyInfo = {
+      createdAtDate: Date.now(),
+      distributionId: randomUUID(),
+      memberDevices: [],
+    };
+  }
+
+  const newDevices = getMissingSenderKeyDevices(
+    senderKeyInfo.memberDevices,
+    currentDevices
+  );
+  const senderAddress = ProtocolAddress.new(ourAci, ourDeviceId);
+  if (newDevices.length > 0) {
+    const distributionMessage = await SenderKeyDistributionMessage.create(
+      senderAddress,
+      senderKeyInfo.distributionId,
+      protocolStore.senderKeyStore
+    );
+    const serviceIds = [
+      ...new Set(newDevices.map(device => device.serviceId)),
+    ];
+    await sendSenderKeyDistributionMessages({
+      chat,
+      distributionMessage,
+      groupSendToken,
+      linkedPayload,
+      recipientServiceIds: serviceIds,
+      timestamp,
+      unauthChat,
+    });
+    currentDevices = await getSenderKeyRecipientDevices({
+      groupSendToken,
+      linkedPayload,
+      recipientServiceIds,
+      unauthChat,
+    });
+    senderKeyInfo = {
+      ...senderKeyInfo,
+      memberDevices: currentDevices,
+    };
+    senderKeyInfoStore.set(groupId, senderKeyInfo);
+  }
+
+  const ciphertextMessage = await groupEncrypt(
+    senderAddress,
+    senderKeyInfo.distributionId,
+    protocolStore.senderKeyStore,
+    plaintext
+  );
+  const unidentifiedSenderContent = UnidentifiedSenderMessageContent.new(
+    ciphertextMessage,
+    senderCertificate,
+    contentHint,
+    Bytes.fromBase64(groupId)
+  );
+  const recipients = currentDevices.map(device =>
+    ProtocolAddress.new(device.serviceId, device.id)
+  );
+  let payload: Uint8Array<ArrayBuffer>;
+  try {
+    payload = await sealedSenderMultiRecipientEncrypt(
+      unidentifiedSenderContent,
+      recipients,
+      protocolStore.identityStore,
+      protocolStore.sessionStore
+    );
+  } catch (error) {
+    senderKeyInfoStore.delete(groupId);
+    console.warn(
+      'trySendGroupWithSenderKey: failed to encrypt multi-recipient payload, falling back to per-recipient group send',
+      JSON.stringify({
+        groupId,
+        cause: getErrorSummary(error),
+      })
+    );
+    return false;
+  }
+
+  try {
+    const response = await unauthChat.sendMultiRecipientMessage({
+      payload,
+      timestamp,
+      auth: groupSendToken,
+      onlineOnly: false,
+      urgent,
+    });
+    const unregistered = new Set(
+      response.unregisteredIds.map(serviceId => fromServiceIdObject(serviceId))
+    );
+    const recipientDeviceIdsByServiceId = currentDevices.reduce<
+      Record<string, Array<number>>
+    >((result, device) => {
+      if (unregistered.has(device.serviceId as ServiceIdString)) {
+        return result;
+      }
+      result[device.serviceId] ??= [];
+      const devices = result[device.serviceId];
+      if (devices) {
+        devices.push(device.id);
+      }
+      return result;
+    }, {});
+    saveSentProtoRecord({
+      contentHint,
+      groupId,
+      plaintext,
+      recipientDeviceIdsByServiceId,
+      timestamp,
+      urgent,
+    });
+    return true;
+  } catch (error) {
+    const mismatchedEntries = getMismatchedDevicesEntries(error, groupId);
+    if (!mismatchedEntries) {
+      throw error;
+    }
+    await handleWebMismatchedDevices({
+      chat,
+      entries: mismatchedEntries,
+      groupSendToken,
+      linkedPayload,
+      unauthChat,
+    });
+    senderKeyInfoStore.delete(groupId);
+    return false;
+  }
 }
 
 type WebMismatchedDevicesEntry = Readonly<{
@@ -4392,11 +5368,15 @@ function getMismatchedDevicesEntries(
 async function handleWebMismatchedDevices({
   chat,
   entries,
+  groupSendToken,
   linkedPayload,
+  unauthChat,
 }: Readonly<{
   chat: AuthenticatedChatConnection;
   entries: ReadonlyArray<WebMismatchedDevicesEntry>;
+  groupSendToken?: GroupSendFullToken;
   linkedPayload: WebSendLinkedPayload;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<void> {
   const ourDeviceId = linkedPayload.credentials?.deviceId;
   if (typeof ourDeviceId !== 'number') {
@@ -4432,6 +5412,24 @@ async function handleWebMismatchedDevices({
       );
     }
 
+    const shouldFetchSessions =
+      shouldFetchAll ||
+      entry.missingDevices.length > 0 ||
+      entry.staleDevices.length > 0;
+    if (!shouldFetchSessions) {
+      continue;
+    }
+
+    if (groupSendToken && unauthChat) {
+      await createSessionsFromUnauthServerKeys({
+        destinationServiceId: entry.serviceId,
+        groupSendToken,
+        linkedPayload,
+        unauthChat,
+      });
+      continue;
+    }
+
     if (shouldFetchAll) {
       await createSessionsFromServerKeys({
         chat,
@@ -4439,20 +5437,15 @@ async function handleWebMismatchedDevices({
         deviceIds: null,
         linkedPayload,
       });
-    }
-    if (entry.missingDevices.length > 0) {
+    } else {
+      const deviceIds = [
+        ...entry.missingDevices,
+        ...entry.staleDevices,
+      ].filter((deviceId, index, all) => all.indexOf(deviceId) === index);
       await createSessionsFromServerKeys({
         chat,
         destinationServiceId: entry.serviceId,
-        deviceIds: entry.missingDevices,
-        linkedPayload,
-      });
-    }
-    if (entry.staleDevices.length > 0) {
-      await createSessionsFromServerKeys({
-        chat,
-        destinationServiceId: entry.serviceId,
-        deviceIds: entry.staleDevices,
+        deviceIds,
         linkedPayload,
       });
     }
@@ -4874,12 +5867,14 @@ function createGroupUpdateContextV2(
 
 export async function sendGroupUpdateMessage({
   chat,
+  groupSendEndorsements,
   groupChangeBase64,
   groupId,
   groupV2,
   linkedPayload,
   recipients,
   timestamp,
+  unauthChat,
 }: GroupUpdateSendOptions): Promise<void> {
   const ourAci = getLinkedAci(linkedPayload);
   const groupContext = groupChangeBase64
@@ -4899,69 +5894,95 @@ export async function sendGroupUpdateMessage({
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
   );
+  const groupSendToken = getGroupSendEndorsementToken({
+    groupSendEndorsements,
+    groupV2,
+    linkedPayload,
+    recipientServiceIds,
+  });
+  const sentWithSenderKey = await trySendGroupWithSenderKey({
+    chat,
+    contentHint: ContentHint.Resendable,
+    groupId,
+    groupSendToken,
+    linkedPayload,
+    plaintext,
+    recipientServiceIds,
+    timestamp,
+    unauthChat,
+    urgent: true,
+  });
 
-  for (const destinationServiceId of recipientServiceIds) {
-    let messages = await encryptForDestination({
-      chat,
-      destinationServiceId,
-      linkedPayload,
-      plaintext,
-    });
-
-    try {
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
-        timestamp,
-        onlineOnly: false,
-        urgent: true,
-      });
-    } catch (error) {
-      const mismatchedEntries = getMismatchedDevicesEntries(
-        error,
-        destinationServiceId
-      );
-      if (!mismatchedEntries) {
-        throw new Error(
-          `sendGroupUpdateMessage delivery failed: ${JSON.stringify({
-            groupId,
-            destinationServiceId,
-            cause: getErrorSummary(error),
-          })}`,
-          { cause: error }
-        );
-      }
-
-      await handleWebMismatchedDevices({
-        chat,
-        entries: mismatchedEntries,
-        linkedPayload,
-      });
-      messages = await encryptForDestination({
+  if (!sentWithSenderKey) {
+    for (const destinationServiceId of recipientServiceIds) {
+      let messages = await encryptForDestination({
         chat,
         destinationServiceId,
+        groupSendToken,
         linkedPayload,
         plaintext,
+        unauthChat,
       });
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
+
+      try {
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      } catch (error) {
+        const mismatchedEntries = getMismatchedDevicesEntries(
+          error,
+          destinationServiceId
+        );
+        if (!mismatchedEntries) {
+          throw new Error(
+            `sendGroupUpdateMessage delivery failed: ${JSON.stringify({
+              groupId,
+              destinationServiceId,
+              cause: getErrorSummary(error),
+            })}`,
+            { cause: error }
+          );
+        }
+
+        await handleWebMismatchedDevices({
+          chat,
+          entries: mismatchedEntries,
+          groupSendToken,
+          linkedPayload,
+          unauthChat,
+        });
+        messages = await encryptForDestination({
+          chat,
+          destinationServiceId,
+          groupSendToken,
+          linkedPayload,
+          plaintext,
+          unauthChat,
+        });
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      }
+
+      saveSentProtoRecord({
+        contentHint: ContentHint.Resendable,
+        groupId,
+        plaintext,
+        recipientDeviceIdsByServiceId: {
+          [destinationServiceId]: messages.map(message => message.deviceId),
+        },
         timestamp,
-        onlineOnly: false,
         urgent: true,
       });
     }
-
-    saveSentProtoRecord({
-      contentHint: ContentHint.Resendable,
-      groupId,
-      plaintext,
-      recipientDeviceIdsByServiceId: {
-        [destinationServiceId]: messages.map(message => message.deviceId),
-      },
-      timestamp,
-      urgent: true,
-    });
   }
 
   try {
@@ -4998,6 +6019,7 @@ export async function sendGroupTextMessage({
   deleteForEveryone,
   groupId,
   groupV2,
+  groupSendEndorsements,
   isViewOnce,
   linkedPayload,
   pinMessage,
@@ -5005,6 +6027,7 @@ export async function sendGroupTextMessage({
   recipients,
   timestamp,
   unpinMessage,
+  unauthChat,
 }: GroupTextSendOptions): Promise<
   WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
 > {
@@ -5024,76 +6047,102 @@ export async function sendGroupTextMessage({
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
   );
+  const groupSendToken = getGroupSendEndorsementToken({
+    groupSendEndorsements,
+    groupV2,
+    linkedPayload,
+    recipientServiceIds,
+  });
+  const sentWithSenderKey = await trySendGroupWithSenderKey({
+    chat,
+    contentHint: ContentHint.Resendable,
+    groupId,
+    groupSendToken,
+    linkedPayload,
+    plaintext,
+    recipientServiceIds,
+    timestamp,
+    unauthChat,
+    urgent: true,
+  });
 
-  for (const destinationServiceId of recipientServiceIds) {
-    let messages = await encryptForDestination({
-      chat,
-      destinationServiceId,
-      linkedPayload,
-      plaintext,
-    });
-
-    try {
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
-        timestamp,
-        onlineOnly: false,
-        urgent: true,
-      });
-    } catch (error) {
-      const mismatchedEntries = getMismatchedDevicesEntries(
-        error,
-        destinationServiceId
-      );
-      if (!mismatchedEntries) {
-        const sendSummary = {
-          destinationServiceId,
-          groupId,
-          devices: messages.map(message => ({
-            deviceId: message.deviceId,
-            registrationId: message.registrationId,
-            type: message.contents.type(),
-            contentLength: message.contents.serialize().byteLength,
-          })),
-          cause: getErrorSummary(error),
-        };
-        throw new Error(
-          `sendGroupTextMessage delivery failed: ${JSON.stringify(sendSummary)}`,
-          { cause: error }
-        );
-      }
-
-      await handleWebMismatchedDevices({
-        chat,
-        entries: mismatchedEntries,
-        linkedPayload,
-      });
-      messages = await encryptForDestination({
+  if (!sentWithSenderKey) {
+    for (const destinationServiceId of recipientServiceIds) {
+      let messages = await encryptForDestination({
         chat,
         destinationServiceId,
+        groupSendToken,
         linkedPayload,
         plaintext,
+        unauthChat,
       });
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
+
+      try {
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      } catch (error) {
+        const mismatchedEntries = getMismatchedDevicesEntries(
+          error,
+          destinationServiceId
+        );
+        if (!mismatchedEntries) {
+          const sendSummary = {
+            destinationServiceId,
+            groupId,
+            devices: messages.map(message => ({
+              deviceId: message.deviceId,
+              registrationId: message.registrationId,
+              type: message.contents.type(),
+              contentLength: message.contents.serialize().byteLength,
+            })),
+            cause: getErrorSummary(error),
+          };
+          throw new Error(
+            `sendGroupTextMessage delivery failed: ${JSON.stringify(sendSummary)}`,
+            { cause: error }
+          );
+        }
+
+        await handleWebMismatchedDevices({
+          chat,
+          entries: mismatchedEntries,
+          groupSendToken,
+          linkedPayload,
+          unauthChat,
+        });
+        messages = await encryptForDestination({
+          chat,
+          destinationServiceId,
+          groupSendToken,
+          linkedPayload,
+          plaintext,
+          unauthChat,
+        });
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      }
+
+      saveSentProtoRecord({
+        contentHint: ContentHint.Resendable,
+        groupId,
+        plaintext,
+        recipientDeviceIdsByServiceId: {
+          [destinationServiceId]: messages.map(message => message.deviceId),
+        },
         timestamp,
-        onlineOnly: false,
         urgent: true,
       });
     }
-
-    saveSentProtoRecord({
-      contentHint: ContentHint.Resendable,
-      groupId,
-      plaintext,
-      recipientDeviceIdsByServiceId: {
-        [destinationServiceId]: messages.map(message => message.deviceId),
-      },
-      timestamp,
-      urgent: true,
-    });
   }
 
   try {
@@ -5233,12 +6282,14 @@ export async function sendGroupReaction({
   emoji,
   groupId,
   groupV2,
+  groupSendEndorsements,
   linkedPayload,
   recipients,
   remove,
   targetAuthorAci,
   targetTimestamp,
   timestamp,
+  unauthChat,
 }: GroupReactionSendOptions): Promise<void> {
   const ourAci = getLinkedAci(linkedPayload);
   const groupContext = createGroupContextV2(groupV2);
@@ -5253,60 +6304,86 @@ export async function sendGroupReaction({
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
   );
+  const groupSendToken = getGroupSendEndorsementToken({
+    groupSendEndorsements,
+    groupV2,
+    linkedPayload,
+    recipientServiceIds,
+  });
+  const sentWithSenderKey = await trySendGroupWithSenderKey({
+    chat,
+    contentHint: ContentHint.Resendable,
+    groupId,
+    groupSendToken,
+    linkedPayload,
+    plaintext,
+    recipientServiceIds,
+    timestamp,
+    unauthChat,
+    urgent: true,
+  });
 
-  for (const destinationServiceId of recipientServiceIds) {
-    let messages = await encryptForDestination({
-      chat,
-      destinationServiceId,
-      linkedPayload,
-      plaintext,
-    });
-
-    try {
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
-        timestamp,
-        onlineOnly: false,
-        urgent: true,
-      });
-    } catch (error) {
-      const mismatchedEntries = getMismatchedDevicesEntries(
-        error,
-        destinationServiceId
-      );
-      if (!mismatchedEntries) {
-        const sendSummary = {
-          destinationServiceId,
-          groupId,
-          targetAuthorAci,
-          targetTimestamp,
-          cause: getErrorSummary(error),
-        };
-        throw new Error(
-          `sendGroupReaction delivery failed: ${JSON.stringify(sendSummary)}`,
-          { cause: error }
-        );
-      }
-
-      await handleWebMismatchedDevices({
-        chat,
-        entries: mismatchedEntries,
-        linkedPayload,
-      });
-      messages = await encryptForDestination({
+  if (!sentWithSenderKey) {
+    for (const destinationServiceId of recipientServiceIds) {
+      let messages = await encryptForDestination({
         chat,
         destinationServiceId,
+        groupSendToken,
         linkedPayload,
         plaintext,
+        unauthChat,
       });
-      await chat.sendMessage({
-        destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-        contents: messages,
-        timestamp,
-        onlineOnly: false,
-        urgent: true,
-      });
+
+      try {
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      } catch (error) {
+        const mismatchedEntries = getMismatchedDevicesEntries(
+          error,
+          destinationServiceId
+        );
+        if (!mismatchedEntries) {
+          const sendSummary = {
+            destinationServiceId,
+            groupId,
+            targetAuthorAci,
+            targetTimestamp,
+            cause: getErrorSummary(error),
+          };
+          throw new Error(
+            `sendGroupReaction delivery failed: ${JSON.stringify(sendSummary)}`,
+            { cause: error }
+          );
+        }
+
+        await handleWebMismatchedDevices({
+          chat,
+          entries: mismatchedEntries,
+          groupSendToken,
+          linkedPayload,
+          unauthChat,
+        });
+        messages = await encryptForDestination({
+          chat,
+          destinationServiceId,
+          groupSendToken,
+          linkedPayload,
+          plaintext,
+          unauthChat,
+        });
+        await chat.sendMessage({
+          destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+          contents: messages,
+          timestamp,
+          onlineOnly: false,
+          urgent: true,
+        });
+      }
     }
   }
 

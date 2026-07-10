@@ -10,6 +10,7 @@ import type {
   ProvisioningSession,
   WebAttachment,
   WebDeleteForEveryone,
+  WebGroupSendEndorsements,
   WebPinMessage,
   WebUnpinMessage,
   WebMessage,
@@ -45,10 +46,15 @@ function getLinkedSessionRequestBody(
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const details = await response.text();
-    throw new Error(
+    throw new HTTPError(
       details
         ? `Request failed with status ${response.status}: ${details}`
-        : `Request failed with status ${response.status}`
+        : `Request failed with status ${response.status}`,
+      {
+        code: response.status,
+        headers: Object.fromEntries(response.headers),
+        response,
+      }
     );
   }
   return response.json() as Promise<T>;
@@ -294,6 +300,30 @@ export async function sendDirectTextMessage({
       pinMessage,
       unpinMessage,
       quote,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+export async function submitMessageChallenge({
+  runtimeSessionId,
+  token,
+  captcha,
+}: Readonly<{
+  runtimeSessionId?: string;
+  token: string;
+  captcha: string;
+}>): Promise<{ ok: true }> {
+  const response = await fetch(apiUrl('/messages/challenge'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: runtimeSessionId,
+      type: 'captcha',
+      token,
+      captcha,
     }),
   });
   return parseJsonResponse(response);
@@ -797,6 +827,7 @@ export async function sendGroupReaction({
   emoji,
   groupId,
   groupV2,
+  groupSendEndorsements,
   recipients,
   remove,
   targetAuthorAci,
@@ -810,6 +841,7 @@ export async function sendGroupReaction({
     masterKey: string;
     revision: number;
   }>;
+  groupSendEndorsements?: WebGroupSendEndorsements;
   recipients?: ReadonlyArray<string>;
   remove: boolean;
   targetAuthorAci: string;
@@ -826,6 +858,7 @@ export async function sendGroupReaction({
       emoji,
       groupId,
       groupV2,
+      groupSendEndorsements,
       recipients,
       remove,
       targetAuthorAci,
@@ -873,6 +906,7 @@ export async function sendGroupTextMessage({
   attachments,
   deleteForEveryone,
   groupV2,
+  groupSendEndorsements,
   isViewOnce,
   pinMessage,
   quote,
@@ -889,6 +923,7 @@ export async function sendGroupTextMessage({
     masterKey: string;
     revision: number;
   }>;
+  groupSendEndorsements?: WebGroupSendEndorsements;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   quote?: WebMessage['quote'];
@@ -908,6 +943,7 @@ export async function sendGroupTextMessage({
       attachments,
       deleteForEveryone,
       groupV2,
+      groupSendEndorsements,
       isViewOnce,
       pinMessage,
       quote,
