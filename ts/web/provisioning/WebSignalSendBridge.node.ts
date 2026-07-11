@@ -5001,16 +5001,60 @@ function getGroupSendEndorsementToken({
 
   const ourAci = getLinkedAci(linkedPayload);
   const allMemberAcis = new Set(memberEndorsements.keys());
-  const sendsToEveryOtherMember = [...allMemberAcis].every(
-    memberAci => memberAci === ourAci || uniqueRecipients.has(memberAci)
-  );
-  const endorsement = sendsToEveryOtherMember
-    ? new GroupSendEndorsement(
-        Bytes.fromBase64(
-          groupSendEndorsements.combinedEndorsement.endorsementBase64
-        )
+  let endorsement: GroupSendEndorsement;
+  if (uniqueRecipients.size === 1) {
+    const selectedEndorsement = selectedEndorsements.at(0);
+    if (!selectedEndorsement) {
+      return undefined;
+    }
+    endorsement = selectedEndorsement;
+  } else {
+    const difference = new Set(
+      [...allMemberAcis].filter(memberAci => !uniqueRecipients.has(memberAci))
+    );
+    const otherMembers = new Set(difference);
+    const includesOurs = !otherMembers.delete(ourAci);
+    const combinedEndorsement = new GroupSendEndorsement(
+      Bytes.fromBase64(
+        groupSendEndorsements.combinedEndorsement.endorsementBase64
       )
-    : GroupSendEndorsement.combine(selectedEndorsements);
+    );
+    let combinedWithOurs = combinedEndorsement;
+    if (includesOurs) {
+      const ourMemberEndorsement = memberEndorsements.get(ourAci);
+      if (!ourMemberEndorsement) {
+        return undefined;
+      }
+      combinedWithOurs = GroupSendEndorsement.combine([
+        combinedEndorsement,
+        new GroupSendEndorsement(
+          Bytes.fromBase64(ourMemberEndorsement.endorsementBase64)
+        ),
+      ]);
+    }
+
+    if (otherMembers.size === 0) {
+      endorsement = combinedWithOurs;
+    } else if (otherMembers.size < memberEndorsements.size / 2) {
+      const endorsementsToRemove = new Array<GroupSendEndorsement>();
+      for (const memberAci of otherMembers) {
+        const memberEndorsement = memberEndorsements.get(memberAci);
+        if (!memberEndorsement) {
+          return undefined;
+        }
+        endorsementsToRemove.push(
+          new GroupSendEndorsement(
+            Bytes.fromBase64(memberEndorsement.endorsementBase64)
+          )
+        );
+      }
+      endorsement = combinedWithOurs.byRemoving(
+        GroupSendEndorsement.combine(endorsementsToRemove)
+      );
+    } else {
+      endorsement = GroupSendEndorsement.combine(selectedEndorsements);
+    }
+  }
 
   const fullToken = endorsement.toFullToken(
     new GroupSecretParams(

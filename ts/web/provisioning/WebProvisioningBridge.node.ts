@@ -2236,6 +2236,30 @@ function getSendErrorInfo(error: unknown): WebHttpErrorInfo | undefined {
   return undefined;
 }
 
+function isSendAuthorizationError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let index = 0; index < 6; index += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+
+    const status = getNumericErrorProperty(current, 'status');
+    if (status === 401 || status === 403) {
+      return true;
+    }
+
+    if (
+      current instanceof LibSignalErrorBase &&
+      current.code === LibSignalErrorCode.RequestUnauthorized
+    ) {
+      return true;
+    }
+
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 function rememberSendFailure(
   streamSession: MessageStreamSession,
   error: unknown
@@ -4117,6 +4141,34 @@ async function enrichConversationForGroupMessage({
   });
 }
 
+async function refreshGroupConversationForSend({
+  groupId,
+  streamSession,
+}: Readonly<{
+  groupId: string;
+  streamSession: ReadyMessageStreamSession;
+}>): Promise<WebConversation | undefined> {
+  const conversation = streamSession.conversationLookup?.[groupId];
+  if (!conversation) {
+    return undefined;
+  }
+
+  const refreshed = await fetchLatestGroupStateConversation({
+    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+    cdnUrl: getDefaultCdnUrl(),
+    chat: streamSession.connection,
+    conversation,
+    linkedPayload: streamSession.linkedPayload,
+    storageUrl: productionConfig.storageUrl,
+  });
+  const merged = mergeStreamConversation(streamSession, refreshed);
+  streamSession.writeEvent?.({
+    type: 'conversation',
+    conversation: merged,
+  });
+  return merged;
+}
+
 function maybeConvertInitialGroupMessageToChange({
   conversation,
   linkedPayload,
@@ -5989,26 +6041,51 @@ async function handleSendGroupMessage(
           attachments,
           streamSession,
         });
-        const unauthChat = groupSendEndorsements
-          ? await getBackupUnauthConnection(streamSession)
-          : undefined;
-        const message = await sendGroupTextMessage({
-          attachments: resolvedAttachments,
-          body: messageBody ?? '',
-          chat: streamSession.connection,
-          deleteForEveryone,
-          groupId,
-          groupV2,
-          groupSendEndorsements,
-          isViewOnce,
-          linkedPayload: streamSession.linkedPayload,
-          pinMessage,
-          quote,
-          recipients,
-          timestamp,
-          unpinMessage,
-          unauthChat,
-        });
+        const sendWithEndorsements = async (
+          activeGroupSendEndorsements: WebGroupSendEndorsements | undefined
+        ) => {
+          const unauthChat = activeGroupSendEndorsements
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined;
+          return sendGroupTextMessage({
+            attachments: resolvedAttachments,
+            body: messageBody ?? '',
+            chat: streamSession.connection,
+            deleteForEveryone,
+            groupId,
+            groupV2,
+            groupSendEndorsements: activeGroupSendEndorsements,
+            isViewOnce,
+            linkedPayload: streamSession.linkedPayload,
+            pinMessage,
+            quote,
+            recipients,
+            timestamp,
+            unpinMessage,
+            unauthChat,
+          });
+        };
+
+        let message: Awaited<ReturnType<typeof sendGroupTextMessage>>;
+        try {
+          message = await sendWithEndorsements(groupSendEndorsements);
+        } catch (error) {
+          if (!groupSendEndorsements || !isSendAuthorizationError(error)) {
+            throw error;
+          }
+
+          const refreshedConversation = await refreshGroupConversationForSend({
+            groupId,
+            streamSession,
+          });
+          if (!refreshedConversation?.groupSendEndorsements) {
+            throw error;
+          }
+
+          message = await sendWithEndorsements(
+            refreshedConversation.groupSendEndorsements
+          );
+        }
         rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
