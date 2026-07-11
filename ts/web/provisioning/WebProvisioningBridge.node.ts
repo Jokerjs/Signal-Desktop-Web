@@ -3153,6 +3153,7 @@ async function fetchSignalJson<T>({
   authenticatedCredentials,
   body,
   chat,
+  clientUserAgent,
   headers,
   method = 'GET',
   path,
@@ -3160,6 +3161,7 @@ async function fetchSignalJson<T>({
   authenticatedCredentials?: LinkedPayload['credentials'];
   body?: unknown;
   chat?: ChatConnection;
+  clientUserAgent?: string;
   headers?: Record<string, string>;
   method?: 'DELETE' | 'GET' | 'PUT';
   path: string;
@@ -3196,7 +3198,9 @@ async function fetchSignalJson<T>({
   const url = new URL(path, productionConfig.serverUrl);
   const response = await nodeFetch(url, {
     headers: {
-      'User-Agent': getUserAgent(packageJson.version),
+      'User-Agent':
+        normalizeClientUserAgent(clientUserAgent) ??
+        getUserAgent(packageJson.version),
       'X-Signal-Agent': 'OWD',
       ...requestHeaders,
       ...(authenticatedCredentials
@@ -3387,7 +3391,8 @@ function isProfileAvatarUploadHeaders(
 
 async function uploadProfileAvatar(
   uploadHeaders: ProfileAvatarUploadHeaders,
-  encryptedAvatarData: Uint8Array<ArrayBuffer>
+  encryptedAvatarData: Uint8Array<ArrayBuffer>,
+  clientUserAgent?: string
 ): Promise<string> {
   const { body, contentType } = getProfileAvatarUploadBody(
     uploadHeaders,
@@ -3399,7 +3404,9 @@ async function uploadProfileAvatar(
     headers: {
       'Content-Length': body.byteLength.toString(),
       'Content-Type': contentType,
-      'User-Agent': getUserAgent(packageJson.version),
+      'User-Agent':
+        normalizeClientUserAgent(clientUserAgent) ??
+        getUserAgent(packageJson.version),
     },
     method: 'POST',
   });
@@ -3874,12 +3881,14 @@ async function getFallbackBackupCdnNumber(
 async function fetchBackupMediaStream({
   backupDir,
   cdnNumber,
+  clientUserAgent,
   headers,
   mediaDir,
   mediaId,
 }: Readonly<{
   backupDir: string;
   cdnNumber: number;
+  clientUserAgent?: string;
   headers: Record<string, string>;
   mediaDir: string;
   mediaId: string;
@@ -3896,7 +3905,12 @@ async function fetchBackupMediaStream({
     baseUrl
   );
   const response = await nodeFetch(url, {
-    headers,
+    headers: {
+      'User-Agent':
+        normalizeClientUserAgent(clientUserAgent) ??
+        getUserAgent(packageJson.version),
+      ...headers,
+    },
     method: 'GET',
   });
   if (!response.ok) {
@@ -6675,7 +6689,8 @@ async function handleWriteProfile(
         }
         avatarUrlPath = await uploadProfileAvatar(
           avatarUploadHeaders,
-          encryptedAvatarData
+          encryptedAvatarData,
+          streamSession.clientUserAgent
         );
       }
 
@@ -7703,6 +7718,7 @@ async function handleAttachment(
     const backupMediaStream = await fetchBackupMediaStream({
       backupDir: resolvedLocation.backupDir,
       cdnNumber: resolvedLocation.cdnNumber,
+      clientUserAgent: streamSession.clientUserAgent,
       headers: backupReadHeaders,
       mediaDir: resolvedLocation.mediaDir,
       mediaId: mediaId.string,
