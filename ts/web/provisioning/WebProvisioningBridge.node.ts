@@ -2150,6 +2150,21 @@ function getNumericErrorProperty(
     : undefined;
 }
 
+function getStringErrorProperty(error: Error, key: string): string | undefined {
+  const value = (error as Error & Record<string, unknown>)[key];
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+function getStringArrayErrorProperty(
+  error: Error,
+  key: string
+): Array<string> | undefined {
+  const value = (error as Error & Record<string, unknown>)[key];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : undefined;
+}
+
 function getSendErrorInfo(error: unknown): WebHttpErrorInfo | undefined {
   let current: unknown = error;
   for (let index = 0; index < 6; index += 1) {
@@ -2159,12 +2174,16 @@ function getSendErrorInfo(error: unknown): WebHttpErrorInfo | undefined {
 
     const status = getNumericErrorProperty(current, 'status');
     const retryAfterMs = getNumericErrorProperty(current, 'retryAfterMs');
+    const token = getStringErrorProperty(current, 'token');
+    const options = getStringArrayErrorProperty(current, 'options');
     if (status) {
       return {
         body: {
           error: current.message,
+          options,
           retryAfterMs,
           status,
+          token,
         },
         headers:
           status === 429 && retryAfterMs
@@ -2316,8 +2335,10 @@ function assertSendAllowed(streamSession: MessageStreamSession): void {
   throw Object.assign(
     new Error(streamSession.sendBlockedReason ?? 'Send is rate limited'),
     {
+      options: streamSession.sendChallenge?.options,
       retryAfterMs,
       status: streamSession.sendBlockedStatus ?? 429,
+      token: streamSession.sendChallenge?.token,
     }
   );
 }
