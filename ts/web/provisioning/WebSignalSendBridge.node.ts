@@ -875,7 +875,7 @@ type WebProtocolStoreEntry = Readonly<{
 const protocolStores = new Map<string, WebProtocolStoreEntry>();
 const senderKeyInfoStores = new Map<string, Map<string, WebSenderKeyInfo>>();
 const senderKeyInfoStoreSignatures = new Map<string, string | undefined>();
-const senderCertificateByAci = new Map<
+const senderCertificateByLocalDevice = new Map<
   string,
   Readonly<{ certificate: SenderCertificate; expiresAt: number }>
 >();
@@ -984,22 +984,25 @@ export function cleanupWebSignalSendRuntimeState({
     }
   }
 
-  for (const aci of senderKeyInfoStores.keys()) {
-    if (!isActiveAciKey(activeAcis, aci)) {
-      senderKeyInfoStores.delete(aci);
-      senderKeyInfoStoreSignatures.delete(aci);
+  for (const localDeviceKey of senderKeyInfoStores.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromDottedLocalKey(localDeviceKey))) {
+      senderKeyInfoStores.delete(localDeviceKey);
+      senderKeyInfoStoreSignatures.delete(localDeviceKey);
       result.senderKeyInfoStoreCountRemoved += 1;
     }
   }
-  for (const aci of senderKeyInfoStoreSignatures.keys()) {
-    if (!isActiveAciKey(activeAcis, aci)) {
-      senderKeyInfoStoreSignatures.delete(aci);
+  for (const localDeviceKey of senderKeyInfoStoreSignatures.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromDottedLocalKey(localDeviceKey))) {
+      senderKeyInfoStoreSignatures.delete(localDeviceKey);
     }
   }
 
-  for (const [aci, value] of senderCertificateByAci) {
-    if (value.expiresAt <= nowMs || !isActiveAciKey(activeAcis, aci)) {
-      senderCertificateByAci.delete(aci);
+  for (const [localDeviceKey, value] of senderCertificateByLocalDevice) {
+    if (
+      value.expiresAt <= nowMs ||
+      !isActiveAciKey(activeAcis, getAciFromDottedLocalKey(localDeviceKey))
+    ) {
+      senderCertificateByLocalDevice.delete(localDeviceKey);
       result.senderCertificateCountRemoved += 1;
     }
   }
@@ -1216,6 +1219,12 @@ function getLinkedAci(linkedPayload: WebSendLinkedPayload): string {
     throw new Error('sendDirectTextMessage: missing linked ACI');
   }
   return aci;
+}
+
+function getLinkedLocalDeviceKey(linkedPayload: WebSendLinkedPayload): string {
+  const aci = getLinkedAci(linkedPayload);
+  const deviceId = linkedPayload.credentials?.deviceId;
+  return Number.isInteger(deviceId) ? `${aci}.${deviceId}` : aci;
 }
 
 function getLinkedPni(linkedPayload: WebSendLinkedPayload): string | undefined {
@@ -1507,7 +1516,7 @@ function getProtocolStore(
 function getSenderKeyInfoStore(
   linkedPayload: WebSendLinkedPayload
 ): Map<string, WebSenderKeyInfo> {
-  const aci = getLinkedAci(linkedPayload);
+  const localDeviceKey = getLinkedLocalDeviceKey(linkedPayload);
   const externalSignature = JSON.stringify(
     (linkedPayload.protocol?.senderKeyInfos ?? [])
       .filter(isProtocolSenderKeyInfoRecord)
@@ -1519,8 +1528,11 @@ function getSenderKeyInfoStore(
       ])
       .sort(([left], [right]) => String(left).localeCompare(String(right)))
   );
-  const existing = senderKeyInfoStores.get(aci);
-  if (existing && senderKeyInfoStoreSignatures.get(aci) === externalSignature) {
+  const existing = senderKeyInfoStores.get(localDeviceKey);
+  if (
+    existing &&
+    senderKeyInfoStoreSignatures.get(localDeviceKey) === externalSignature
+  ) {
     return existing;
   }
 
@@ -1534,8 +1546,8 @@ function getSenderKeyInfoStore(
       memberDevices: [...record.memberDevices],
     });
   }
-  senderKeyInfoStores.set(aci, store);
-  senderKeyInfoStoreSignatures.set(aci, externalSignature);
+  senderKeyInfoStores.set(localDeviceKey, store);
+  senderKeyInfoStoreSignatures.set(localDeviceKey, externalSignature);
   return store;
 }
 
@@ -1607,7 +1619,7 @@ function getWebPreKeyMaintenanceKey(
   linkedPayload: WebSendLinkedPayload,
   identity: WebPreKeyIdentity
 ): string {
-  return `${getLinkedAci(linkedPayload)}:${identity}`;
+  return `${getLinkedLocalDeviceKey(linkedPayload)}:${identity}`;
 }
 
 function getWebPreKeyIdentityServiceId(
@@ -5085,6 +5097,20 @@ function isUint8ArrayDowncastError(error: unknown): boolean {
   return false;
 }
 
+function isMissingSenderKeyStateError(error: unknown): boolean {
+  let current = error;
+  for (let index = 0; index < 4; index += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+    if (current.message.includes('missing sender key state')) {
+      return true;
+    }
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 async function createSessionsFromGroupSendServerKeys({
   chat,
   destinationServiceId,
@@ -5470,8 +5496,8 @@ async function fetchSenderCertificate({
   chat: AuthenticatedChatConnection;
   linkedPayload: WebSendLinkedPayload;
 }>): Promise<SenderCertificate | undefined> {
-  const aci = getLinkedAci(linkedPayload);
-  const cached = senderCertificateByAci.get(aci);
+  const localDeviceKey = getLinkedLocalDeviceKey(linkedPayload);
+  const cached = senderCertificateByLocalDevice.get(localDeviceKey);
   if (
     cached &&
     cached.expiresAt > Date.now() + SENDER_CERTIFICATE_REFRESH_BUFFER_MS
@@ -5515,7 +5541,10 @@ async function fetchSenderCertificate({
     return undefined;
   }
 
-  senderCertificateByAci.set(aci, { certificate, expiresAt });
+  senderCertificateByLocalDevice.set(localDeviceKey, {
+    certificate,
+    expiresAt,
+  });
   return certificate;
 }
 
@@ -5731,12 +5760,29 @@ async function trySendGroupWithSenderKey({
     senderKeyInfoStore.set(groupId, senderKeyInfo);
   }
 
-  const ciphertextMessage = await groupEncrypt(
-    senderAddress,
-    senderKeyInfo.distributionId,
-    protocolStore.senderKeyStore,
-    plaintext
-  );
+  let ciphertextMessage: CiphertextMessage;
+  try {
+    ciphertextMessage = await groupEncrypt(
+      senderAddress,
+      senderKeyInfo.distributionId,
+      protocolStore.senderKeyStore,
+      plaintext
+    );
+  } catch (error) {
+    if (!isMissingSenderKeyStateError(error)) {
+      throw error;
+    }
+    senderKeyInfoStore.delete(groupId);
+    console.warn(
+      'trySendGroupWithSenderKey: missing local sender key state, falling back to per-recipient group send',
+      JSON.stringify({
+        distributionId: senderKeyInfo.distributionId,
+        groupId,
+        cause: getErrorSummary(error),
+      })
+    );
+    return false;
+  }
   const unidentifiedSenderContent = UnidentifiedSenderMessageContent.new(
     ciphertextMessage,
     senderCertificate,

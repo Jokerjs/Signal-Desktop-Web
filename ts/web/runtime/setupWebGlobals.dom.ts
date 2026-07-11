@@ -3887,6 +3887,20 @@ function removeWebSettingsStorageItem(key: keyof StorageAccessType): void {
 
 function noop(): void {}
 
+async function requestWebMicrophoneAccess(): Promise<boolean> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return false;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(track => track.stop());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function setupWebGlobals({
   i18n,
   linkedSession,
@@ -3921,7 +3935,7 @@ export function setupWebGlobals({
     getContentProtection: async () => false,
     getLocaleOverride: async () => null,
     getMediaCameraPermissions: async () => false,
-    getMediaPermissions: async () => false,
+    getMediaPermissions: async () => true,
     getSpellCheck: async () => loadWebSettings().spellCheck,
     getSystemTraySetting: async () => false,
     getThemeSetting: async () => loadWebSettings().theme,
@@ -3965,7 +3979,7 @@ export function setupWebGlobals({
     getAutoLaunch: async () => false,
     getMediaAccessStatus: async () => 'not-determined',
     getMediaCameraPermissions: async () => false,
-    getMediaPermissions: async () => false,
+    getMediaPermissions: async () => true,
     openSystemMediaPermissions: async () => undefined,
     readyForUpdates: noop,
     removeSetupMenuItems: noop,
@@ -3976,7 +3990,11 @@ export function setupWebGlobals({
     setMenuBarVisibility: noop,
     showCallDiagnostic: noop,
     showDebugLog: noop,
-    showPermissionsPopup: async () => undefined,
+    showPermissionsPopup: async (_forCalling: boolean, forCamera: boolean) => {
+      if (!forCamera) {
+        await requestWebMicrophoneAccess();
+      }
+    },
     showWindow: noop,
     shutdown: noop,
     sqlCall: async (name: string, args?: ReadonlyArray<unknown>) => {
