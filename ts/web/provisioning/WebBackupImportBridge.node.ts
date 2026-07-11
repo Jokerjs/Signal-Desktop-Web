@@ -13,6 +13,7 @@ import { MessageBackupKey } from '@signalapp/libsignal-client/dist/MessageBackup
 import { Backups, SignalService } from '../../protobuf/index.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
 import { constantTimeEqual } from '../../Crypto.node.ts';
+import { SEALED_SENDER } from '../../types/SealedSender.std.ts';
 import { toAciObject, fromAciUuidBytes, fromPniUuidBytesOrUntaggedString } from '../../util/ServiceId.node.ts';
 import { normalizeAci } from '../../util/normalizeAci.std.ts';
 import { strictAssert } from '../../util/assert.std.ts';
@@ -28,6 +29,7 @@ import {
   deriveGroupID,
   deriveGroupPublicParams,
   deriveGroupSecretParams,
+  deriveAccessKeyFromProfileKey,
 } from '../../util/zkgroup.node.ts';
 import type {
   ChatShellState,
@@ -234,9 +236,16 @@ function createConversationFromContact(
   const id = aci ?? pni ?? phoneNumber ?? fallbackId;
   const title = getContactTitle(contact, phoneNumber ?? id);
   const removalStage = getRemovalStageFromContact(contact);
+  const profileKey = contact.profileKey?.byteLength
+    ? Bytes.toBase64(contact.profileKey)
+    : undefined;
+  const accessKey = profileKey
+    ? Bytes.toBase64(deriveAccessKeyFromProfileKey(Bytes.fromBase64(profileKey)))
+    : undefined;
 
   return {
     acceptedMessageRequest: removalStage == null,
+    accessKey,
     id,
     type: 'direct',
     conversationType: 'direct',
@@ -245,9 +254,7 @@ function createConversationFromContact(
     phoneNumber: phoneNumber ?? undefined,
     e164: phoneNumber ?? undefined,
     username: contact.username ?? undefined,
-    profileKey: contact.profileKey?.byteLength
-      ? Bytes.toBase64(contact.profileKey)
-      : undefined,
+    profileKey,
     nicknameFamilyName: contact.nickname?.family ?? undefined,
     nicknameGivenName: contact.nickname?.given ?? undefined,
     profileName: contact.profileGivenName ?? undefined,
@@ -261,6 +268,7 @@ function createConversationFromContact(
     title,
     titleNoDefault: title,
     searchableTitle: title,
+    sealedSender: SEALED_SENDER.UNKNOWN,
     hasMessages: false,
   };
 }

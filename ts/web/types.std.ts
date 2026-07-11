@@ -428,7 +428,9 @@ export type WebConversation = Readonly<{
   systemGivenName?: string;
   systemFamilyName?: string;
   systemNickname?: string;
+  accessKey?: string;
   profileKey?: string;
+  sealedSender?: ConversationAttributesType['sealedSender'];
   username?: string;
   avatarUrl?: string;
   avatarUrlPath?: string;
@@ -559,7 +561,12 @@ type MessageStreamEventPayload =
     }>
   | Readonly<{ type: 'contacts'; contacts: ContactsBootstrap }>
   | Readonly<{ type: 'linked-session-updated'; linkedPayload: LinkedPayload }>
-  | Readonly<{ type: 'protocol-state'; protocol: ProtocolState }>
+  | Readonly<{
+      type: 'protocol-state';
+      protocol: ProtocolState;
+      protocolRevision: number;
+      sessionId: string;
+    }>
   | Readonly<{ type: 'contacts-bootstrap'; data: ContactsBootstrap }>
   | Readonly<{ type: 'chat-shell'; state: ChatShellState }>
   | Readonly<{ type: 'conversation'; conversation: WebConversation }>

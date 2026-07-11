@@ -36,6 +36,7 @@ import {
   PlaintextContent,
   processSenderKeyDistributionMessage,
   processPreKeyBundle,
+  LibSignalErrorBase,
   sealedSenderDecryptToUsmc,
   sealedSenderMultiRecipientEncrypt,
   signalDecrypt,
@@ -79,6 +80,11 @@ import {
 } from '../../util/zkgroup.node.ts';
 import { bytesToUuid, uuidToBytes } from '../../util/uuidToBytes.std.ts';
 import { DurationInSeconds } from '../../util/durations/duration-in-seconds.std.ts';
+import { ZERO_ACCESS_KEY } from '../../types/SealedSender.std.ts';
+import {
+  toGroupSendToken,
+  type GroupSendToken,
+} from '../../types/GroupSendEndorsements.std.ts';
 import type { AciString } from '../../types/ServiceId.std.ts';
 import type {
   WebAttachment,
@@ -155,11 +161,13 @@ type ServerKeys = Readonly<{
 }>;
 
 type DirectTextSendOptions = Readonly<{
+  accessKey?: string;
   body: string;
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
   linkedPayload: WebSendLinkedPayload;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
   attachments?: ReadonlyArray<WebAttachment>;
   deleteForEveryone?: WebDeleteForEveryone;
   expireTimer?: number;
@@ -205,6 +213,7 @@ type GroupUpdateSendOptions = Readonly<{
 }>;
 
 type DirectReactionSendOptions = Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
   emoji?: string;
@@ -213,6 +222,7 @@ type DirectReactionSendOptions = Readonly<{
   targetAuthorAci: string;
   targetTimestamp: number;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>;
 
 type AttachmentBackfillRequestOptions = Readonly<{
@@ -255,7 +265,7 @@ type SenderKeyGroupSendOptions = Readonly<{
   chat: AuthenticatedChatConnection;
   contentHint: ContentHint;
   groupId: string;
-  groupSendToken?: GroupSendFullToken;
+  groupSendToken?: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   plaintext: Uint8Array<ArrayBuffer>;
   recipientServiceIds: ReadonlyArray<string>;
@@ -264,13 +274,28 @@ type SenderKeyGroupSendOptions = Readonly<{
   urgent: boolean;
 }>;
 
+type WebUnauthPreKeyAuth =
+  | Readonly<{ accessKey: Uint8Array<ArrayBuffer> }>
+  | GroupSendFullToken
+  | 'unrestricted';
+
+type DirectSendAuthResolver = (serviceId: string) => Promise<
+  | Readonly<{
+      accessKey?: string;
+      unauthChat?: UnauthenticatedChatConnection;
+    }>
+  | undefined
+>;
+
 type DirectEditSendOptions = Readonly<{
+  accessKey?: string;
   body: string;
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
   linkedPayload: WebSendLinkedPayload;
   targetTimestamp: number;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>;
 
 type MessageRequestResponseSyncOptions = Readonly<{
@@ -302,11 +327,35 @@ export type WebRetryRequestResult = Readonly<{
 export type WebDecryptionErrorRetryResult = Readonly<{
   envelopeType: number;
   reason?: string;
+  retryAfterMs?: number;
   retryCount?: number;
   sent: boolean;
   sourceDevice?: number;
   sourceServiceId?: string;
   timestamp?: number;
+}>;
+
+export type WebSignalSendDiagnostics = Readonly<{
+  decryptionErrorRetry: {
+    dedupeWindowMs: number;
+    exactRetryKeyCount: number;
+    recentSourceKeyCount: number;
+    lastDeduped?: unknown;
+  };
+  serverKeyFetch: {
+    activeFetchCount: number;
+    retryAfterKeyCount: number;
+    entries: ReadonlyArray<unknown>;
+  };
+}>;
+
+export type WebSignalSendRuntimeCleanupResult = Readonly<{
+  decryptionErrorRetryCountRemoved: number;
+  preKeyMaintenanceCountRemoved: number;
+  protocolStoreCountRemoved: number;
+  senderCertificateCountRemoved: number;
+  senderKeyInfoStoreCountRemoved: number;
+  serverKeyFetchCountRemoved: number;
 }>;
 
 type WebSentProtoRecord = Readonly<{
@@ -349,9 +398,9 @@ function isProtocolSenderKeyRecord(
 function isWebSenderKeyDevice(value: unknown): value is WebSenderKeyDevice {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      typeof (value as WebSenderKeyDevice).serviceId === 'string' &&
-      typeof (value as WebSenderKeyDevice).id === 'number'
+    typeof value === 'object' &&
+    typeof (value as WebSenderKeyDevice).serviceId === 'string' &&
+    typeof (value as WebSenderKeyDevice).id === 'number'
   );
 }
 
@@ -360,18 +409,14 @@ function isProtocolSenderKeyInfoRecord(
 ): value is ProtocolSenderKeyInfoRecord {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      typeof (value as ProtocolSenderKeyInfoRecord).groupId === 'string' &&
-      typeof (value as ProtocolSenderKeyInfoRecord).distributionId ===
-        'string' &&
-      typeof (value as ProtocolSenderKeyInfoRecord).createdAtDate ===
-        'number' &&
-      Array.isArray(
-        (value as ProtocolSenderKeyInfoRecord).memberDevices
-      ) &&
-      (value as ProtocolSenderKeyInfoRecord).memberDevices.every(
-        isWebSenderKeyDevice
-      )
+    typeof value === 'object' &&
+    typeof (value as ProtocolSenderKeyInfoRecord).groupId === 'string' &&
+    typeof (value as ProtocolSenderKeyInfoRecord).distributionId === 'string' &&
+    typeof (value as ProtocolSenderKeyInfoRecord).createdAtDate === 'number' &&
+    Array.isArray((value as ProtocolSenderKeyInfoRecord).memberDevices) &&
+    (value as ProtocolSenderKeyInfoRecord).memberDevices.every(
+      isWebSenderKeyDevice
+    )
   );
 }
 
@@ -836,8 +881,33 @@ const senderCertificateByAci = new Map<
 >();
 const serverKeyFetchRetryAfterByKey = new Map<string, number>();
 const serverKeyFetchesByKey = new Map<string, Promise<ServerKeys>>();
+const serverKeyFetchDiagnosticsByKey = new Map<
+  string,
+  {
+    destinationServiceId: string;
+    failureCount: number;
+    inFlightReuseCount: number;
+    lastAttemptAt?: number;
+    lastFailureAt?: number;
+    lastRetryAfterMs?: number;
+    lastStatus?: number;
+    lastSuccessAt?: number;
+    localRateLimitedCount: number;
+    rateLimitKey: string;
+    remoteRateLimitedCount: number;
+    successCount: number;
+    targetDeviceId: number | null;
+    totalAttemptCount: number;
+  }
+>();
 const DEFAULT_SERVER_KEY_FETCH_RETRY_AFTER_MS = 10 * 60 * 1000;
 const DECRYPTION_ERROR_RETRY_LIMIT = 5;
+const DECRYPTION_ERROR_RETRY_DEDUPE_MS = Number(
+  process.env.SIGNAL_WEB_DECRYPTION_ERROR_RETRY_DEDUPE_MS ?? 30_000
+);
+const SERVER_KEY_FETCH_DIAGNOSTIC_LIMIT = Number(
+  process.env.SIGNAL_WEB_SERVER_KEY_FETCH_DIAGNOSTIC_LIMIT ?? 200
+);
 const WEB_PRE_KEY_CHECK_INTERVAL_MS = Number(
   process.env.SIGNAL_WEB_PRE_KEY_CHECK_INTERVAL_MS ?? 6 * 60 * 60 * 1000
 );
@@ -851,6 +921,11 @@ const WEB_PRE_KEY_MAX_COUNT = Number(
   process.env.SIGNAL_WEB_PRE_KEY_MAX_COUNT ?? 100
 );
 const decryptionErrorRetryCounts = new Map<string, number>();
+const decryptionErrorRetryRecentlySentUntilBySourceKey = new Map<
+  string,
+  number
+>();
+let lastDedupedDecryptionErrorRetry: unknown;
 const sentProtoRecords = new Map<string, WebSentProtoRecord>();
 const sentProtoRecordOrder = new Array<string>();
 const preKeyMaintenanceLastCheckedAt = new Map<string, number>();
@@ -861,6 +936,197 @@ const MAX_SENT_PROTO_RECORDS = 500;
 const SENT_PROTO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SENDER_CERTIFICATE_REFRESH_BUFFER_MS = 60 * 60 * 1000;
 const SENDER_KEY_INFO_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+function isActiveAciKey(
+  activeAcis: ReadonlySet<string>,
+  aci: string | undefined
+): boolean {
+  return Boolean(aci && activeAcis.has(aci));
+}
+
+function getAciFromColonKey(key: string): string | undefined {
+  const index = key.indexOf(':');
+  return index > 0 ? key.slice(0, index) : undefined;
+}
+
+function getAciFromDottedLocalKey(key: string): string | undefined {
+  const index = key.indexOf('.');
+  return index > 0 ? key.slice(0, index) : undefined;
+}
+
+function getAciFromServerKeyFetchKey(key: string): string | undefined {
+  return getAciFromDottedLocalKey(key.split(':')[0] ?? '');
+}
+
+export function cleanupWebSignalSendRuntimeState({
+  activeAcis,
+  nowMs = Date.now(),
+}: Readonly<{
+  activeAcis: ReadonlySet<string>;
+  nowMs?: number;
+}>): WebSignalSendRuntimeCleanupResult {
+  pruneSentProtoRecords(nowMs);
+  pruneDecryptionErrorRetrySourceKeys();
+
+  const result = {
+    decryptionErrorRetryCountRemoved: 0,
+    preKeyMaintenanceCountRemoved: 0,
+    protocolStoreCountRemoved: 0,
+    senderCertificateCountRemoved: 0,
+    senderKeyInfoStoreCountRemoved: 0,
+    serverKeyFetchCountRemoved: 0,
+  };
+
+  for (const key of protocolStores.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromColonKey(key))) {
+      protocolStores.delete(key);
+      result.protocolStoreCountRemoved += 1;
+    }
+  }
+
+  for (const aci of senderKeyInfoStores.keys()) {
+    if (!isActiveAciKey(activeAcis, aci)) {
+      senderKeyInfoStores.delete(aci);
+      senderKeyInfoStoreSignatures.delete(aci);
+      result.senderKeyInfoStoreCountRemoved += 1;
+    }
+  }
+  for (const aci of senderKeyInfoStoreSignatures.keys()) {
+    if (!isActiveAciKey(activeAcis, aci)) {
+      senderKeyInfoStoreSignatures.delete(aci);
+    }
+  }
+
+  for (const [aci, value] of senderCertificateByAci) {
+    if (value.expiresAt <= nowMs || !isActiveAciKey(activeAcis, aci)) {
+      senderCertificateByAci.delete(aci);
+      result.senderCertificateCountRemoved += 1;
+    }
+  }
+
+  for (const key of decryptionErrorRetryCounts.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromDottedLocalKey(key))) {
+      decryptionErrorRetryCounts.delete(key);
+      result.decryptionErrorRetryCountRemoved += 1;
+    }
+  }
+  for (const key of decryptionErrorRetryRecentlySentUntilBySourceKey.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromDottedLocalKey(key))) {
+      decryptionErrorRetryRecentlySentUntilBySourceKey.delete(key);
+      result.decryptionErrorRetryCountRemoved += 1;
+    }
+  }
+
+  for (const key of preKeyMaintenanceLastCheckedAt.keys()) {
+    if (!isActiveAciKey(activeAcis, getAciFromColonKey(key))) {
+      preKeyMaintenanceLastCheckedAt.delete(key);
+      result.preKeyMaintenanceCountRemoved += 1;
+    }
+  }
+  for (const [key, retryAfterUntil] of preKeyMaintenanceRetryAfterByKey) {
+    if (
+      retryAfterUntil <= nowMs ||
+      !isActiveAciKey(activeAcis, getAciFromColonKey(key))
+    ) {
+      preKeyMaintenanceRetryAfterByKey.delete(key);
+      result.preKeyMaintenanceCountRemoved += 1;
+    }
+  }
+
+  for (const [key, retryAfterUntil] of serverKeyFetchRetryAfterByKey) {
+    if (
+      retryAfterUntil <= nowMs ||
+      !isActiveAciKey(activeAcis, getAciFromServerKeyFetchKey(key))
+    ) {
+      serverKeyFetchRetryAfterByKey.delete(key);
+      result.serverKeyFetchCountRemoved += 1;
+    }
+  }
+  for (const [key, diagnostic] of serverKeyFetchDiagnosticsByKey) {
+    const aci =
+      getAciFromServerKeyFetchKey(diagnostic.rateLimitKey) ??
+      getAciFromServerKeyFetchKey(key);
+    if (!isActiveAciKey(activeAcis, aci)) {
+      serverKeyFetchDiagnosticsByKey.delete(key);
+      result.serverKeyFetchCountRemoved += 1;
+    }
+  }
+
+  return result;
+}
+
+function getServerKeyFetchDiagnosticEntry({
+  destinationServiceId,
+  rateLimitKey,
+  targetDeviceId,
+}: Readonly<{
+  destinationServiceId: string;
+  rateLimitKey: string;
+  targetDeviceId: number | null;
+}>): NonNullable<ReturnType<typeof serverKeyFetchDiagnosticsByKey.get>> {
+  const existing = serverKeyFetchDiagnosticsByKey.get(rateLimitKey);
+  if (existing) {
+    return existing;
+  }
+
+  const next = {
+    destinationServiceId,
+    failureCount: 0,
+    inFlightReuseCount: 0,
+    localRateLimitedCount: 0,
+    rateLimitKey,
+    remoteRateLimitedCount: 0,
+    successCount: 0,
+    targetDeviceId,
+    totalAttemptCount: 0,
+  };
+  serverKeyFetchDiagnosticsByKey.set(rateLimitKey, next);
+
+  if (serverKeyFetchDiagnosticsByKey.size > SERVER_KEY_FETCH_DIAGNOSTIC_LIMIT) {
+    const oldestKey = [...serverKeyFetchDiagnosticsByKey.entries()].sort(
+      (left, right) =>
+        (left[1].lastAttemptAt ?? 0) - (right[1].lastAttemptAt ?? 0)
+    )[0]?.[0];
+    if (oldestKey) {
+      serverKeyFetchDiagnosticsByKey.delete(oldestKey);
+    }
+  }
+
+  return next;
+}
+
+function pruneDecryptionErrorRetrySourceKeys(): void {
+  const timestamp = Date.now();
+  for (const [key, until] of decryptionErrorRetryRecentlySentUntilBySourceKey) {
+    if (until <= timestamp) {
+      decryptionErrorRetryRecentlySentUntilBySourceKey.delete(key);
+    }
+  }
+}
+
+export function getWebSignalSendDiagnostics(): WebSignalSendDiagnostics {
+  pruneDecryptionErrorRetrySourceKeys();
+
+  return {
+    decryptionErrorRetry: {
+      dedupeWindowMs: DECRYPTION_ERROR_RETRY_DEDUPE_MS,
+      exactRetryKeyCount: decryptionErrorRetryCounts.size,
+      recentSourceKeyCount:
+        decryptionErrorRetryRecentlySentUntilBySourceKey.size,
+      lastDeduped: lastDedupedDecryptionErrorRetry,
+    },
+    serverKeyFetch: {
+      activeFetchCount: serverKeyFetchesByKey.size,
+      retryAfterKeyCount: serverKeyFetchRetryAfterByKey.size,
+      entries: [...serverKeyFetchDiagnosticsByKey.values()]
+        .sort(
+          (left, right) =>
+            (right.lastAttemptAt ?? 0) - (left.lastAttemptAt ?? 0)
+        )
+        .slice(0, SERVER_KEY_FETCH_DIAGNOSTIC_LIMIT),
+    },
+  };
+}
 
 function getSentProtoKey(
   recipientServiceId: string,
@@ -1017,6 +1283,43 @@ function createChatResponseError({
     retryAfterMs,
     status,
   });
+}
+
+function isUnauthorizedKeyFetchError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let index = 0; index < 4; index += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+    const extra = current as Error & {
+      code?: unknown;
+      status?: unknown;
+      cause?: unknown;
+    };
+    if (extra.status === 401 || extra.status === 403) {
+      return true;
+    }
+    if (
+      extra.code === ErrorCode.RequestUnauthorized ||
+      LibSignalErrorBase.is(current, ErrorCode.RequestUnauthorized)
+    ) {
+      return true;
+    }
+    current = extra.cause;
+  }
+  return false;
+}
+
+function getAccessKeyPreKeyAuth(
+  accessKey: string | undefined
+): WebUnauthPreKeyAuth | undefined {
+  if (!accessKey) {
+    return undefined;
+  }
+  if (accessKey === ZERO_ACCESS_KEY) {
+    return 'unrestricted';
+  }
+  return { accessKey: Bytes.fromBase64(accessKey) };
 }
 
 function deserializeSignedPreKeyRecord(base64: string): SignedPreKeyRecord {
@@ -1217,10 +1520,7 @@ function getSenderKeyInfoStore(
       .sort(([left], [right]) => String(left).localeCompare(String(right)))
   );
   const existing = senderKeyInfoStores.get(aci);
-  if (
-    existing &&
-    senderKeyInfoStoreSignatures.get(aci) === externalSignature
-  ) {
+  if (existing && senderKeyInfoStoreSignatures.get(aci) === externalSignature) {
     return existing;
   }
 
@@ -1326,20 +1626,20 @@ function hasWebPreKeyIdentityMaterial(
   if (identity === 'aci') {
     return Boolean(
       linkedPayload.aciIdentityKeyPublic &&
-        linkedPayload.aciIdentityKeyPrivate &&
-        linkedPayload.aciRegistrationId &&
-        linkedPayload.aciSignedPreKeyRecordBase64 &&
-        linkedPayload.aciPqLastResortPreKeyRecordBase64
+      linkedPayload.aciIdentityKeyPrivate &&
+      linkedPayload.aciRegistrationId &&
+      linkedPayload.aciSignedPreKeyRecordBase64 &&
+      linkedPayload.aciPqLastResortPreKeyRecordBase64
     );
   }
 
   return Boolean(
     getLinkedPni(linkedPayload) &&
-      linkedPayload.pniIdentityKeyPublic &&
-      linkedPayload.pniIdentityKeyPrivate &&
-      linkedPayload.pniRegistrationId &&
-      linkedPayload.pniSignedPreKeyRecordBase64 &&
-      linkedPayload.pniPqLastResortPreKeyRecordBase64
+    linkedPayload.pniIdentityKeyPublic &&
+    linkedPayload.pniIdentityKeyPrivate &&
+    linkedPayload.pniRegistrationId &&
+    linkedPayload.pniSignedPreKeyRecordBase64 &&
+    linkedPayload.pniPqLastResortPreKeyRecordBase64
   );
 }
 
@@ -1373,9 +1673,9 @@ async function fetchWebPreKeyCounts(
     headers: [],
     timeoutMillis: 30_000,
   });
-  const responseBody = Buffer.from(
-    response.body ?? new Uint8Array()
-  ).toString('utf8');
+  const responseBody = Buffer.from(response.body ?? new Uint8Array()).toString(
+    'utf8'
+  );
   if (response.status !== 200) {
     const retryAfterMs =
       response.status === 429 ? getRetryAfterMs(response.headers) : undefined;
@@ -1397,10 +1697,7 @@ async function fetchWebPreKeyCounts(
 
   preKeyMaintenanceRetryAfterByKey.delete(maintenanceKey);
   const parsed = JSON.parse(responseBody) as Partial<WebPreKeyCounts>;
-  if (
-    typeof parsed.count !== 'number' ||
-    typeof parsed.pqCount !== 'number'
-  ) {
+  if (typeof parsed.count !== 'number' || typeof parsed.pqCount !== 'number') {
     throw new Error('getMyKeyCounts response missing count or pqCount');
   }
   return {
@@ -1452,9 +1749,9 @@ async function uploadWebPreKeys({
     return;
   }
 
-  const responseBody = Buffer.from(
-    response.body ?? new Uint8Array()
-  ).toString('utf8');
+  const responseBody = Buffer.from(response.body ?? new Uint8Array()).toString(
+    'utf8'
+  );
   const retryAfterMs =
     response.status === 429 ? getRetryAfterMs(response.headers) : undefined;
   if (retryAfterMs != null) {
@@ -1504,11 +1801,7 @@ async function maybeUpdateWebPreKeysForIdentity({
       return false;
     }
 
-    const counts = await fetchWebPreKeyCounts(
-      chat,
-      identity,
-      maintenanceKey
-    );
+    const counts = await fetchWebPreKeyCounts(chat, identity, maintenanceKey);
     const shouldUpdatePreKeys =
       counts.count < WEB_PRE_KEY_MINIMUM ||
       counts.count > WEB_PRE_KEY_MAX_COUNT ||
@@ -4207,22 +4500,28 @@ function createNullMessageContent(): Uint8Array<ArrayBuffer> {
 }
 
 async function sendNullMessageToRequester({
+  accessKey,
   chat,
   linkedPayload,
   requesterAci,
   timestamp,
+  unauthChat,
 }: Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   linkedPayload: WebSendLinkedPayload;
   requesterAci: string;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<void> {
   const plaintext = createNullMessageContent();
   let messages = await encryptForDestination({
+    accessKey,
     chat,
     destinationServiceId: requesterAci,
     linkedPayload,
     plaintext,
+    unauthChat,
   });
 
   try {
@@ -4239,15 +4538,19 @@ async function sendNullMessageToRequester({
       throw error;
     }
     await handleWebMismatchedDevices({
+      accessKey,
       chat,
       entries: mismatchedEntries,
       linkedPayload,
+      unauthChat,
     });
     messages = await encryptForDestination({
+      accessKey,
       chat,
       destinationServiceId: requesterAci,
       linkedPayload,
       plaintext,
+      unauthChat,
     });
     await chat.sendMessage({
       destination: ServiceId.parseFromServiceIdString(requesterAci),
@@ -4260,23 +4563,29 @@ async function sendNullMessageToRequester({
 }
 
 async function resendSentProtoToRequester({
+  accessKey,
   chat,
   linkedPayload,
   requesterAci,
   sentProto,
+  unauthChat,
 }: Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   linkedPayload: WebSendLinkedPayload;
   requesterAci: string;
   sentProto: WebSentProtoRecord;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<void> {
   const proto = Proto.Content.decode(Bytes.fromBase64(sentProto.protoBase64));
   const plaintext = padMessage(Proto.Content.encode(proto));
   let messages = await encryptForDestination({
+    accessKey,
     chat,
     destinationServiceId: requesterAci,
     linkedPayload,
     plaintext,
+    unauthChat,
   });
 
   try {
@@ -4293,15 +4602,19 @@ async function resendSentProtoToRequester({
       throw error;
     }
     await handleWebMismatchedDevices({
+      accessKey,
       chat,
       entries: mismatchedEntries,
       linkedPayload,
+      unauthChat,
     });
     messages = await encryptForDestination({
+      accessKey,
       chat,
       destinationServiceId: requesterAci,
       linkedPayload,
       plaintext,
+      unauthChat,
     });
     await chat.sendMessage({
       destination: ServiceId.parseFromServiceIdString(requesterAci),
@@ -4316,12 +4629,14 @@ async function resendSentProtoToRequester({
 async function handleRetryRequestMessage({
   chat,
   content,
+  getDirectSendAuth,
   linkedPayload,
   sourceDevice,
   sourceServiceId,
 }: Readonly<{
   chat?: AuthenticatedChatConnection;
   content: Proto.Content;
+  getDirectSendAuth?: DirectSendAuthResolver;
   linkedPayload: WebSendLinkedPayload;
   sourceDevice: number;
   sourceServiceId: string;
@@ -4363,13 +4678,17 @@ async function handleRetryRequestMessage({
     };
   }
 
+  const directSendAuth = await getDirectSendAuth?.(requesterAci);
+
   if (!sentProto) {
     try {
       await sendNullMessageToRequester({
+        accessKey: directSendAuth?.accessKey,
         chat,
         linkedPayload,
         requesterAci,
         timestamp: Date.now(),
+        unauthChat: directSendAuth?.unauthChat,
       });
       return {
         ...resultBase,
@@ -4388,10 +4707,12 @@ async function handleRetryRequestMessage({
 
   try {
     await resendSentProtoToRequester({
+      accessKey: directSendAuth?.accessKey,
       chat,
       linkedPayload,
       requesterAci,
       sentProto,
+      unauthChat: directSendAuth?.unauthChat,
     });
   } catch (error) {
     return {
@@ -4410,10 +4731,12 @@ async function handleRetryRequestMessage({
 export async function decryptIncomingSignalEnvelope({
   chat,
   envelopeBytes,
+  getDirectSendAuth,
   linkedPayload,
 }: Readonly<{
   chat?: AuthenticatedChatConnection;
   envelopeBytes: Uint8Array<ArrayBuffer>;
+  getDirectSendAuth?: DirectSendAuthResolver;
   linkedPayload: WebSendLinkedPayload;
 }>): Promise<{
   contentSummary: string;
@@ -4470,6 +4793,7 @@ export async function decryptIncomingSignalEnvelope({
     ? await handleRetryRequestMessage({
         chat,
         content: decrypted.content,
+        getDirectSendAuth,
         linkedPayload,
         sourceDevice: decrypted.sourceDevice,
         sourceServiceId: decrypted.sourceServiceId,
@@ -4553,9 +4877,18 @@ async function fetchServerKeys(
   targetDeviceId: number | null,
   rateLimitKey: string
 ): Promise<ServerKeys> {
+  const diagnostic = getServerKeyFetchDiagnosticEntry({
+    destinationServiceId,
+    rateLimitKey,
+    targetDeviceId,
+  });
   const retryAfterUntil = serverKeyFetchRetryAfterByKey.get(rateLimitKey);
   if (retryAfterUntil && retryAfterUntil > Date.now()) {
     const retryAfterMs = retryAfterUntil - Date.now();
+    diagnostic.localRateLimitedCount += 1;
+    diagnostic.lastAttemptAt = Date.now();
+    diagnostic.lastRetryAfterMs = retryAfterMs;
+    diagnostic.lastStatus = 429;
     throw createChatResponseError({
       message: `getKeysForServiceId rate limited locally; retry after ${Math.ceil(
         retryAfterMs / 1000
@@ -4567,10 +4900,13 @@ async function fetchServerKeys(
 
   const inFlight = serverKeyFetchesByKey.get(rateLimitKey);
   if (inFlight) {
+    diagnostic.inFlightReuseCount += 1;
     return inFlight;
   }
 
   const request = (async () => {
+    diagnostic.totalAttemptCount += 1;
+    diagnostic.lastAttemptAt = Date.now();
     const response = await chat.fetch({
       verb: 'GET',
       path: `/v2/keys/${destinationServiceId}/${targetDeviceId ?? '*'}`,
@@ -4589,6 +4925,13 @@ async function fetchServerKeys(
           Date.now() + retryAfterMs
         );
       }
+      diagnostic.failureCount += 1;
+      diagnostic.lastFailureAt = Date.now();
+      diagnostic.lastRetryAfterMs = retryAfterMs;
+      diagnostic.lastStatus = response.status;
+      if (response.status === 429) {
+        diagnostic.remoteRateLimitedCount += 1;
+      }
       throw createChatResponseError({
         message: responseBody
           ? `getKeysForServiceId failed with status ${response.status}: ${responseBody}`
@@ -4599,6 +4942,9 @@ async function fetchServerKeys(
       });
     }
     serverKeyFetchRetryAfterByKey.delete(rateLimitKey);
+    diagnostic.successCount += 1;
+    diagnostic.lastStatus = response.status;
+    diagnostic.lastSuccessAt = Date.now();
     return JSON.parse(responseBody) as ServerKeys;
   })();
 
@@ -4622,7 +4968,7 @@ function getGroupSendEndorsementToken({
   groupV2?: Readonly<{ masterKey: string }>;
   linkedPayload: WebSendLinkedPayload;
   recipientServiceIds: ReadonlyArray<string>;
-}>): GroupSendFullToken | undefined {
+}>): GroupSendToken | undefined {
   if (!groupSendEndorsements || !groupV2) {
     return undefined;
   }
@@ -4666,22 +5012,84 @@ function getGroupSendEndorsementToken({
       )
     : GroupSendEndorsement.combine(selectedEndorsements);
 
-  return endorsement.toFullToken(
+  const fullToken = endorsement.toFullToken(
     new GroupSecretParams(
       deriveGroupSecretParams(Bytes.fromBase64(groupV2.masterKey))
     ),
     new Date(expiration * 1000)
   );
+  return toGroupSendToken(fullToken.serialize());
 }
 
-async function createSessionsFromUnauthServerKeys({
+function getGroupSendFullToken(
+  groupSendToken: GroupSendToken
+): GroupSendFullToken {
+  return new GroupSendFullToken(groupSendToken);
+}
+
+function isUint8ArrayDowncastError(error: unknown): boolean {
+  let current = error;
+  for (let index = 0; index < 4; index += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+    if (current.message.includes('failed to downcast any to Uint8Array')) {
+      return true;
+    }
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+async function createSessionsFromGroupSendServerKeys({
+  chat,
   destinationServiceId,
   groupSendToken,
   linkedPayload,
   unauthChat,
 }: Readonly<{
+  chat: AuthenticatedChatConnection;
   destinationServiceId: string;
-  groupSendToken: GroupSendFullToken;
+  groupSendToken: GroupSendToken;
+  linkedPayload: WebSendLinkedPayload;
+  unauthChat: UnauthenticatedChatConnection;
+}>): Promise<void> {
+  try {
+    await createSessionsFromUnauthServerKeys({
+      auth: getGroupSendFullToken(groupSendToken),
+      destinationServiceId,
+      linkedPayload,
+      unauthChat,
+    });
+  } catch (error) {
+    if (!isUint8ArrayDowncastError(error)) {
+      throw error;
+    }
+
+    console.warn(
+      'createSessionsFromGroupSendServerKeys: unauth group token auth failed Uint8Array downcast, falling back to authenticated key fetch',
+      JSON.stringify({
+        destinationServiceId,
+        cause: getErrorSummary(error),
+      })
+    );
+    await createSessionsFromServerKeys({
+      chat,
+      destinationServiceId,
+      deviceIds: null,
+      linkedPayload,
+    });
+  }
+}
+
+async function createSessionsFromUnauthServerKeys({
+  auth,
+  destinationServiceId,
+  linkedPayload,
+  unauthChat,
+}: Readonly<{
+  auth: WebUnauthPreKeyAuth;
+  destinationServiceId: string;
   linkedPayload: WebSendLinkedPayload;
   unauthChat: UnauthenticatedChatConnection;
 }>): Promise<void> {
@@ -4698,7 +5106,7 @@ async function createSessionsFromUnauthServerKeys({
   const response = await unauthChat.getPreKeys({
     target: ServiceId.parseFromServiceIdString(destinationServiceId),
     device: 'all',
-    auth: groupSendToken,
+    auth,
   });
 
   for (const preKeyBundle of response.preKeyBundles) {
@@ -4800,6 +5208,7 @@ async function createSessionsFromServerKeys({
 
 async function encryptForDestination({
   chat,
+  accessKey,
   destinationServiceId,
   groupSendToken,
   linkedPayload,
@@ -4807,8 +5216,9 @@ async function encryptForDestination({
   unauthChat,
 }: Readonly<{
   chat: AuthenticatedChatConnection;
+  accessKey?: string;
   destinationServiceId: string;
-  groupSendToken?: GroupSendFullToken;
+  groupSendToken?: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   plaintext: Uint8Array<ArrayBuffer>;
   unauthChat?: UnauthenticatedChatConnection;
@@ -4827,19 +5237,42 @@ async function encryptForDestination({
   );
   if (knownSessions.length === 0) {
     if (groupSendToken && unauthChat) {
-      await createSessionsFromUnauthServerKeys({
+      await createSessionsFromGroupSendServerKeys({
+        chat,
         destinationServiceId,
         groupSendToken,
         linkedPayload,
         unauthChat,
       });
     } else {
-      await createSessionsFromServerKeys({
-        chat,
-        destinationServiceId,
-        deviceIds: null,
-        linkedPayload,
-      });
+      const accessKeyAuth = getAccessKeyPreKeyAuth(accessKey);
+      if (accessKeyAuth && unauthChat) {
+        try {
+          await createSessionsFromUnauthServerKeys({
+            auth: accessKeyAuth,
+            destinationServiceId,
+            linkedPayload,
+            unauthChat,
+          });
+        } catch (error) {
+          if (!isUnauthorizedKeyFetchError(error)) {
+            throw error;
+          }
+          await createSessionsFromServerKeys({
+            chat,
+            destinationServiceId,
+            deviceIds: null,
+            linkedPayload,
+          });
+        }
+      } else {
+        await createSessionsFromServerKeys({
+          chat,
+          destinationServiceId,
+          deviceIds: null,
+          linkedPayload,
+        });
+      }
     }
     knownSessions = sessionStore.getKnownSessionsForServiceId(
       destinationServiceId,
@@ -4870,15 +5303,21 @@ async function encryptForDestination({
 }
 
 async function createPlaintextContentMessages({
+  accessKey,
   chat,
   destinationServiceId,
+  groupSendToken,
   linkedPayload,
   plaintext,
+  unauthChat,
 }: Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
+  groupSendToken?: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   plaintext: PlaintextContent;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<ReadonlyArray<SingleOutboundUnsealedMessage>> {
   const aci = getLinkedAci(linkedPayload);
   const ourDeviceId = linkedPayload.credentials?.deviceId;
@@ -4892,12 +5331,44 @@ async function createPlaintextContentMessages({
     destinationServiceId === aci ? ourDeviceId : -1
   );
   if (knownSessions.length === 0) {
-    await createSessionsFromServerKeys({
-      chat,
-      destinationServiceId,
-      deviceIds: null,
-      linkedPayload,
-    });
+    if (groupSendToken && unauthChat) {
+      await createSessionsFromGroupSendServerKeys({
+        chat,
+        destinationServiceId,
+        groupSendToken,
+        linkedPayload,
+        unauthChat,
+      });
+    } else {
+      const accessKeyAuth = getAccessKeyPreKeyAuth(accessKey);
+      if (accessKeyAuth && unauthChat) {
+        try {
+          await createSessionsFromUnauthServerKeys({
+            auth: accessKeyAuth,
+            destinationServiceId,
+            linkedPayload,
+            unauthChat,
+          });
+        } catch (error) {
+          if (!isUnauthorizedKeyFetchError(error)) {
+            throw error;
+          }
+          await createSessionsFromServerKeys({
+            chat,
+            destinationServiceId,
+            deviceIds: null,
+            linkedPayload,
+          });
+        }
+      } else {
+        await createSessionsFromServerKeys({
+          chat,
+          destinationServiceId,
+          deviceIds: null,
+          linkedPayload,
+        });
+      }
+    }
     knownSessions = sessionStore.getKnownSessionsForServiceId(
       destinationServiceId,
       destinationServiceId === aci ? ourDeviceId : -1
@@ -4933,7 +5404,9 @@ function getMissingSenderKeyDevices(
   currentDevices: ReadonlyArray<WebSenderKeyDevice>
 ): Array<WebSenderKeyDevice> {
   const known = new Set(knownDevices.map(getSenderKeyDeviceKey));
-  return currentDevices.filter(device => !known.has(getSenderKeyDeviceKey(device)));
+  return currentDevices.filter(
+    device => !known.has(getSenderKeyDeviceKey(device))
+  );
 }
 
 function hasRemovedSenderKeyDevices(
@@ -4941,7 +5414,9 @@ function hasRemovedSenderKeyDevices(
   currentDevices: ReadonlyArray<WebSenderKeyDevice>
 ): boolean {
   const current = new Set(currentDevices.map(getSenderKeyDeviceKey));
-  return knownDevices.some(device => !current.has(getSenderKeyDeviceKey(device)));
+  return knownDevices.some(
+    device => !current.has(getSenderKeyDeviceKey(device))
+  );
 }
 
 async function fetchSenderCertificate({
@@ -4953,7 +5428,10 @@ async function fetchSenderCertificate({
 }>): Promise<SenderCertificate | undefined> {
   const aci = getLinkedAci(linkedPayload);
   const cached = senderCertificateByAci.get(aci);
-  if (cached && cached.expiresAt > Date.now() + SENDER_CERTIFICATE_REFRESH_BUFFER_MS) {
+  if (
+    cached &&
+    cached.expiresAt > Date.now() + SENDER_CERTIFICATE_REFRESH_BUFFER_MS
+  ) {
     return cached.certificate;
   }
 
@@ -4963,9 +5441,9 @@ async function fetchSenderCertificate({
     headers: [],
     timeoutMillis: 30_000,
   });
-  const responseBody = Buffer.from(
-    response.body ?? new Uint8Array()
-  ).toString('utf8');
+  const responseBody = Buffer.from(response.body ?? new Uint8Array()).toString(
+    'utf8'
+  );
   if (response.status === 429) {
     throw createChatResponseError({
       message: responseBody
@@ -4998,12 +5476,14 @@ async function fetchSenderCertificate({
 }
 
 async function getSenderKeyRecipientDevices({
+  chat,
   groupSendToken,
   linkedPayload,
   recipientServiceIds,
   unauthChat,
 }: Readonly<{
-  groupSendToken: GroupSendFullToken;
+  chat: AuthenticatedChatConnection;
+  groupSendToken: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   recipientServiceIds: ReadonlyArray<string>;
   unauthChat: UnauthenticatedChatConnection;
@@ -5022,7 +5502,8 @@ async function getSenderKeyRecipientDevices({
       serviceId === ourAci ? ourDeviceId : -1
     );
     if (knownSessions.length === 0) {
-      await createSessionsFromUnauthServerKeys({
+      await createSessionsFromGroupSendServerKeys({
+        chat,
         destinationServiceId: serviceId,
         groupSendToken,
         linkedPayload,
@@ -5059,7 +5540,7 @@ async function sendSenderKeyDistributionMessages({
 }: Readonly<{
   chat: AuthenticatedChatConnection;
   distributionMessage: SenderKeyDistributionMessage;
-  groupSendToken: GroupSendFullToken;
+  groupSendToken: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   recipientServiceIds: ReadonlyArray<string>;
   timestamp: number;
@@ -5150,6 +5631,7 @@ async function trySendGroupWithSenderKey({
 
   const protocolStore = getProtocolStore(linkedPayload);
   let currentDevices = await getSenderKeyRecipientDevices({
+    chat,
     groupSendToken,
     linkedPayload,
     recipientServiceIds,
@@ -5181,9 +5663,7 @@ async function trySendGroupWithSenderKey({
       senderKeyInfo.distributionId,
       protocolStore.senderKeyStore
     );
-    const serviceIds = [
-      ...new Set(newDevices.map(device => device.serviceId)),
-    ];
+    const serviceIds = [...new Set(newDevices.map(device => device.serviceId))];
     await sendSenderKeyDistributionMessages({
       chat,
       distributionMessage,
@@ -5194,6 +5674,7 @@ async function trySendGroupWithSenderKey({
       unauthChat,
     });
     currentDevices = await getSenderKeyRecipientDevices({
+      chat,
       groupSendToken,
       linkedPayload,
       recipientServiceIds,
@@ -5245,7 +5726,7 @@ async function trySendGroupWithSenderKey({
     const response = await unauthChat.sendMultiRecipientMessage({
       payload,
       timestamp,
-      auth: groupSendToken,
+      auth: getGroupSendFullToken(groupSendToken),
       onlineOnly: false,
       urgent,
     });
@@ -5367,14 +5848,16 @@ function getMismatchedDevicesEntries(
 
 async function handleWebMismatchedDevices({
   chat,
+  accessKey,
   entries,
   groupSendToken,
   linkedPayload,
   unauthChat,
 }: Readonly<{
   chat: AuthenticatedChatConnection;
+  accessKey?: string;
   entries: ReadonlyArray<WebMismatchedDevicesEntry>;
-  groupSendToken?: GroupSendFullToken;
+  groupSendToken?: GroupSendToken;
   linkedPayload: WebSendLinkedPayload;
   unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<void> {
@@ -5421,13 +5904,31 @@ async function handleWebMismatchedDevices({
     }
 
     if (groupSendToken && unauthChat) {
-      await createSessionsFromUnauthServerKeys({
+      await createSessionsFromGroupSendServerKeys({
+        chat,
         destinationServiceId: entry.serviceId,
         groupSendToken,
         linkedPayload,
         unauthChat,
       });
       continue;
+    }
+
+    const accessKeyAuth = getAccessKeyPreKeyAuth(accessKey);
+    if (accessKeyAuth && unauthChat) {
+      try {
+        await createSessionsFromUnauthServerKeys({
+          auth: accessKeyAuth,
+          destinationServiceId: entry.serviceId,
+          linkedPayload,
+          unauthChat,
+        });
+        continue;
+      } catch (error) {
+        if (!isUnauthorizedKeyFetchError(error)) {
+          throw error;
+        }
+      }
     }
 
     if (shouldFetchAll) {
@@ -5438,10 +5939,9 @@ async function handleWebMismatchedDevices({
         linkedPayload,
       });
     } else {
-      const deviceIds = [
-        ...entry.missingDevices,
-        ...entry.staleDevices,
-      ].filter((deviceId, index, all) => all.indexOf(deviceId) === index);
+      const deviceIds = [...entry.missingDevices, ...entry.staleDevices].filter(
+        (deviceId, index, all) => all.indexOf(deviceId) === index
+      );
       await createSessionsFromServerKeys({
         chat,
         destinationServiceId: entry.serviceId,
@@ -5468,16 +5968,34 @@ function getDecryptionErrorRetryKey({
   return `${ourAci}.${ourDeviceId}:${sourceServiceId}.${sourceDevice}:${timestamp}`;
 }
 
+function getDecryptionErrorRetrySourceKey({
+  linkedPayload,
+  sourceDevice,
+  sourceServiceId,
+}: Readonly<{
+  linkedPayload: WebSendLinkedPayload;
+  sourceDevice: number;
+  sourceServiceId: string;
+}>): string {
+  const ourAci = getLinkedAci(linkedPayload);
+  const ourDeviceId = linkedPayload.credentials?.deviceId ?? 'unknown';
+  return `${ourAci}.${ourDeviceId}:${sourceServiceId}.${sourceDevice}`;
+}
+
 export async function sendDecryptionErrorMessage({
+  accessKey,
   chat,
   envelopeBytes,
   linkedPayload,
   receivedAt,
+  unauthChat,
 }: Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   envelopeBytes: Uint8Array<ArrayBuffer>;
   linkedPayload: WebSendLinkedPayload;
   receivedAt: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<WebDecryptionErrorRetryResult> {
   const envelope = Proto.Envelope.decode(envelopeBytes);
   const envelopeType = getEnvelopeType(envelope);
@@ -5543,6 +6061,32 @@ export async function sendDecryptionErrorMessage({
     };
   }
   const timestamp = toNumber(envelope.clientTimestamp) ?? receivedAt;
+  pruneDecryptionErrorRetrySourceKeys();
+  const sourceRetryKey = getDecryptionErrorRetrySourceKey({
+    linkedPayload,
+    sourceDevice,
+    sourceServiceId,
+  });
+  const recentRetryUntil =
+    decryptionErrorRetryRecentlySentUntilBySourceKey.get(sourceRetryKey);
+  if (recentRetryUntil && recentRetryUntil > Date.now()) {
+    const retryAfterMs = recentRetryUntil - Date.now();
+    lastDedupedDecryptionErrorRetry = {
+      retryAfterMs,
+      sourceDevice,
+      sourceServiceId,
+      timestamp,
+    };
+    return {
+      envelopeType,
+      reason: 'retryRecentlySent',
+      retryAfterMs,
+      sent: false,
+      sourceDevice,
+      sourceServiceId,
+      timestamp,
+    };
+  }
   const retryKey = getDecryptionErrorRetryKey({
     linkedPayload,
     sourceDevice,
@@ -5572,10 +6116,12 @@ export async function sendDecryptionErrorMessage({
     );
     const plaintext = PlaintextContent.from(decryptionErrorMessage);
     let messages = await createPlaintextContentMessages({
+      accessKey,
       chat,
       destinationServiceId: sourceServiceId,
       linkedPayload,
       plaintext,
+      unauthChat,
     });
 
     try {
@@ -5595,15 +6141,19 @@ export async function sendDecryptionErrorMessage({
         throw error;
       }
       await handleWebMismatchedDevices({
+        accessKey,
         chat,
         entries: mismatchedEntries,
         linkedPayload,
+        unauthChat,
       });
       messages = await createPlaintextContentMessages({
+        accessKey,
         chat,
         destinationServiceId: sourceServiceId,
         linkedPayload,
         plaintext,
+        unauthChat,
       });
       await chat.sendMessage({
         destination: ServiceId.parseFromServiceIdString(sourceServiceId),
@@ -5613,6 +6163,10 @@ export async function sendDecryptionErrorMessage({
         urgent: false,
       });
     }
+    decryptionErrorRetryRecentlySentUntilBySourceKey.set(
+      sourceRetryKey,
+      Date.now() + DECRYPTION_ERROR_RETRY_DEDUPE_MS
+    );
 
     return {
       envelopeType,
@@ -5628,6 +6182,7 @@ export async function sendDecryptionErrorMessage({
 
 export async function sendDirectTextMessage({
   attachments = [],
+  accessKey,
   body,
   chat,
   deleteForEveryone,
@@ -5640,6 +6195,7 @@ export async function sendDirectTextMessage({
   pinMessage,
   quote,
   timestamp,
+  unauthChat,
   unpinMessage,
 }: DirectTextSendOptions): Promise<
   WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
@@ -5658,10 +6214,12 @@ export async function sendDirectTextMessage({
     { expireTimer, expireTimerVersion, flags }
   );
   let messages = await encryptForDestination({
+    accessKey,
     chat,
     destinationServiceId,
     linkedPayload,
     plaintext,
+    unauthChat,
   });
 
   if (destinationServiceId === ourAci) {
@@ -5703,15 +6261,19 @@ export async function sendDirectTextMessage({
       );
       if (mismatchedEntries) {
         await handleWebMismatchedDevices({
+          accessKey,
           chat,
           entries: mismatchedEntries,
           linkedPayload,
+          unauthChat,
         });
         messages = await encryptForDestination({
+          accessKey,
           chat,
           destinationServiceId,
           linkedPayload,
           plaintext,
+          unauthChat,
         });
         await chat.sendMessage({
           destination: ServiceId.parseFromServiceIdString(destinationServiceId),
@@ -5818,21 +6380,26 @@ export async function sendDirectTextMessage({
 }
 
 export async function sendDirectExpirationTimerUpdate({
+  accessKey,
   chat,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
   linkedPayload,
   timestamp,
+  unauthChat,
 }: Readonly<{
+  accessKey?: string;
   chat: AuthenticatedChatConnection;
   destinationServiceId: string;
   expireTimer?: number;
   expireTimerVersion: number;
   linkedPayload: WebSendLinkedPayload;
   timestamp: number;
+  unauthChat?: UnauthenticatedChatConnection;
 }>): Promise<WebMessage> {
   return sendDirectTextMessage({
+    accessKey,
     body: '',
     chat,
     destinationServiceId,
@@ -5841,6 +6408,7 @@ export async function sendDirectExpirationTimerUpdate({
     flags: Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
     linkedPayload,
     timestamp,
+    unauthChat,
   });
 }
 
@@ -6205,6 +6773,7 @@ export async function sendGroupTextMessage({
 }
 
 export async function sendDirectReaction({
+  accessKey,
   chat,
   destinationServiceId,
   emoji,
@@ -6213,19 +6782,23 @@ export async function sendDirectReaction({
   targetAuthorAci,
   targetTimestamp,
   timestamp,
+  unauthChat,
 }: DirectReactionSendOptions): Promise<void> {
   const ourAci = getLinkedAci(linkedPayload);
-  const messages = await encryptForDestination({
+  const plaintext = createReactionContent({
+    emoji,
+    remove,
+    targetAuthorAci,
+    targetTimestamp,
+    timestamp,
+  });
+  let messages = await encryptForDestination({
+    accessKey,
     chat,
     destinationServiceId,
     linkedPayload,
-    plaintext: createReactionContent({
-      emoji,
-      remove,
-      targetAuthorAci,
-      targetTimestamp,
-      timestamp,
-    }),
+    plaintext,
+    unauthChat,
   });
 
   if (destinationServiceId === ourAci) {
@@ -6237,13 +6810,46 @@ export async function sendDirectReaction({
     return;
   }
 
-  await chat.sendMessage({
-    destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-    contents: messages,
-    timestamp,
-    onlineOnly: false,
-    urgent: true,
-  });
+  try {
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: true,
+    });
+  } catch (error) {
+    const mismatchedEntries = getMismatchedDevicesEntries(
+      error,
+      destinationServiceId
+    );
+    if (!mismatchedEntries) {
+      throw error;
+    }
+
+    await handleWebMismatchedDevices({
+      accessKey,
+      chat,
+      entries: mismatchedEntries,
+      linkedPayload,
+      unauthChat,
+    });
+    messages = await encryptForDestination({
+      accessKey,
+      chat,
+      destinationServiceId,
+      linkedPayload,
+      plaintext,
+      unauthChat,
+    });
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: true,
+    });
+  }
 
   try {
     const syncMessages = await encryptForDestination({
@@ -6420,23 +7026,28 @@ export async function sendGroupReaction({
 }
 
 export async function sendDirectEditMessage({
+  accessKey,
   body,
   chat,
   destinationServiceId,
   linkedPayload,
   targetTimestamp,
   timestamp,
+  unauthChat,
 }: DirectEditSendOptions): Promise<{ ok: true; timestamp: number }> {
   const ourAci = getLinkedAci(linkedPayload);
-  const messages = await encryptForDestination({
+  const plaintext = createEditContent({
+    body,
+    targetTimestamp,
+    timestamp,
+  });
+  let messages = await encryptForDestination({
+    accessKey,
     chat,
     destinationServiceId,
     linkedPayload,
-    plaintext: createEditContent({
-      body,
-      targetTimestamp,
-      timestamp,
-    }),
+    plaintext,
+    unauthChat,
   });
 
   if (destinationServiceId === ourAci) {
@@ -6448,13 +7059,46 @@ export async function sendDirectEditMessage({
     return { ok: true, timestamp };
   }
 
-  await chat.sendMessage({
-    destination: ServiceId.parseFromServiceIdString(destinationServiceId),
-    contents: messages,
-    timestamp,
-    onlineOnly: false,
-    urgent: true,
-  });
+  try {
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: true,
+    });
+  } catch (error) {
+    const mismatchedEntries = getMismatchedDevicesEntries(
+      error,
+      destinationServiceId
+    );
+    if (!mismatchedEntries) {
+      throw error;
+    }
+
+    await handleWebMismatchedDevices({
+      accessKey,
+      chat,
+      entries: mismatchedEntries,
+      linkedPayload,
+      unauthChat,
+    });
+    messages = await encryptForDestination({
+      accessKey,
+      chat,
+      destinationServiceId,
+      linkedPayload,
+      plaintext,
+      unauthChat,
+    });
+    await chat.sendMessage({
+      destination: ServiceId.parseFromServiceIdString(destinationServiceId),
+      contents: messages,
+      timestamp,
+      onlineOnly: false,
+      urgent: true,
+    });
+  }
 
   try {
     const syncMessages = await encryptForDestination({

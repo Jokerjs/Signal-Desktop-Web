@@ -1180,6 +1180,7 @@ export function toDesktopConversation(
     about: conversation.about,
     aboutEmoji: conversation.aboutEmoji,
     activeAt: conversation.activeAt,
+    accessKey: conversation.accessKey,
     announcementsOnly: conversation.announcementsOnly,
     avatars:
       conversation.avatars && conversation.avatars.length
@@ -1248,6 +1249,7 @@ export function toDesktopConversation(
     quotedMessageId: conversation.quotedMessageId,
     removalStage: conversation.removalStage,
     searchableTitle: title,
+    sealedSender: conversation.sealedSender,
     serviceId,
     sharingPhoneNumber: true,
     sentMessageCount: conversation.sentMessageCount,

@@ -721,6 +721,8 @@ export function Preferences({
   );
 
   const localeDisplayNames = window.SignalContext.getLocaleDisplayNames();
+  const shouldShowSystemSettings =
+    isAutoLaunchSupported || isHideMenuBarSupported || isSystemTraySupported;
 
   const getLocaleDisplayName = useCallback(
     (inLocale: string, ofLocale: string): string => {
@@ -813,6 +815,8 @@ export function Preferences({
     if (
       isSignalWebRuntime &&
       (settingsLocation.page === SettingsPage.Calls ||
+        settingsLocation.page === SettingsPage.NotificationProfilesHome ||
+        settingsLocation.page === SettingsPage.NotificationProfilesCreateFlow ||
         isBackupPage(settingsLocation.page) ||
         isDonationsPage(settingsLocation.page))
     ) {
@@ -868,54 +872,56 @@ export function Preferences({
             </div>
           </FlowingControl>
         </SettingsRow>
-        <SettingsRow title={i18n('icu:Preferences--system')}>
-          {isAutoLaunchSupported && (
-            <Checkbox
-              checked={hasAutoLaunch}
-              disabled={hasAutoLaunch === undefined}
-              label={i18n('icu:autoLaunchDescription')}
-              moduleClassName="Preferences__checkbox"
-              name="autoLaunch"
-              onChange={onAutoLaunchChange}
-            />
-          )}
-          {isHideMenuBarSupported && (
-            <Checkbox
-              checked={hasHideMenuBar}
-              label={i18n('icu:hideMenuBar')}
-              moduleClassName="Preferences__checkbox"
-              name="hideMenuBar"
-              onChange={onHideMenuBarChange}
-            />
-          )}
-          {isSystemTraySupported && (
-            <>
+        {shouldShowSystemSettings && (
+          <SettingsRow title={i18n('icu:Preferences--system')}>
+            {isAutoLaunchSupported && (
               <Checkbox
-                checked={hasMinimizeToSystemTray}
-                disabled={hasMinimizeToSystemTray === undefined}
-                label={i18n('icu:SystemTraySetting__minimize-to-system-tray')}
+                checked={hasAutoLaunch}
+                disabled={hasAutoLaunch === undefined}
+                label={i18n('icu:autoLaunchDescription')}
                 moduleClassName="Preferences__checkbox"
-                name="system-tray-setting-minimize-to-system-tray"
-                onChange={onMinimizeToSystemTrayChange}
+                name="autoLaunch"
+                onChange={onAutoLaunchChange}
               />
-              {isMinimizeToAndStartInSystemTraySupported && (
+            )}
+            {isHideMenuBarSupported && (
+              <Checkbox
+                checked={hasHideMenuBar}
+                label={i18n('icu:hideMenuBar')}
+                moduleClassName="Preferences__checkbox"
+                name="hideMenuBar"
+                onChange={onHideMenuBarChange}
+              />
+            )}
+            {isSystemTraySupported && (
+              <>
                 <Checkbox
-                  checked={hasMinimizeToAndStartInSystemTray}
-                  disabled={
-                    !hasMinimizeToSystemTray ||
-                    hasMinimizeToAndStartInSystemTray === undefined
-                  }
-                  label={i18n(
-                    'icu:SystemTraySetting__minimize-to-and-start-in-system-tray'
-                  )}
+                  checked={hasMinimizeToSystemTray}
+                  disabled={hasMinimizeToSystemTray === undefined}
+                  label={i18n('icu:SystemTraySetting__minimize-to-system-tray')}
                   moduleClassName="Preferences__checkbox"
-                  name="system-tray-setting-minimize-to-and-start-in-system-tray"
-                  onChange={onMinimizeToAndStartInSystemTrayChange}
+                  name="system-tray-setting-minimize-to-system-tray"
+                  onChange={onMinimizeToSystemTrayChange}
                 />
-              )}
-            </>
-          )}
-        </SettingsRow>
+                {isMinimizeToAndStartInSystemTraySupported && (
+                  <Checkbox
+                    checked={hasMinimizeToAndStartInSystemTray}
+                    disabled={
+                      !hasMinimizeToSystemTray ||
+                      hasMinimizeToAndStartInSystemTray === undefined
+                    }
+                    label={i18n(
+                      'icu:SystemTraySetting__minimize-to-and-start-in-system-tray'
+                    )}
+                    moduleClassName="Preferences__checkbox"
+                    name="system-tray-setting-minimize-to-and-start-in-system-tray"
+                    onChange={onMinimizeToAndStartInSystemTrayChange}
+                  />
+                )}
+              </>
+            )}
+          </SettingsRow>
+        )}
         {!isSignalWebRuntime && (
           <SettingsRow title={i18n('icu:permissions')}>
             <Checkbox
@@ -987,128 +993,134 @@ export function Preferences({
 
     const pageContents = (
       <SettingsRow>
-        <Control
-          icon="Preferences__LanguageIcon"
-          left={i18n('icu:Preferences__Language__Label')}
-          right={
-            <span
-              className="Preferences__LanguageButton"
-              lang={localeOverride ?? resolvedLocale}
-            >
-              {localeText}
-            </span>
-          }
-          onClick={() => {
-            // We haven't loaded the user's setting yet
-            if (localeOverride === undefined) {
-              return;
-            }
-            setLanguageDialog(LanguageDialog.Selection);
-          }}
-        />
-        {languageDialog === LanguageDialog.Selection && (
-          <Modal
-            i18n={i18n}
-            modalName="Preferences__LanguageModal"
-            moduleClassName="Preferences__LanguageModal"
-            padded={false}
-            onClose={closeLanguageDialog}
-            title={i18n('icu:Preferences__Language__ModalTitle')}
-            modalHeaderChildren={
-              <SearchInput
+        {!isSignalWebRuntime && (
+          <>
+            <Control
+              icon="Preferences__LanguageIcon"
+              left={i18n('icu:Preferences__Language__Label')}
+              right={
+                <span
+                  className="Preferences__LanguageButton"
+                  lang={localeOverride ?? resolvedLocale}
+                >
+                  {localeText}
+                </span>
+              }
+              onClick={() => {
+                // We haven't loaded the user's setting yet
+                if (localeOverride === undefined) {
+                  return;
+                }
+                setLanguageDialog(LanguageDialog.Selection);
+              }}
+            />
+            {languageDialog === LanguageDialog.Selection && (
+              <Modal
                 i18n={i18n}
-                value={languageSearchInput}
-                placeholder={i18n('icu:Preferences__Language__SearchLanguages')}
-                moduleClassName="Preferences__LanguageModal__SearchInput"
-                onChange={event => {
-                  setLanguageSearchInput(event.currentTarget.value);
-                }}
-              />
-            }
-            modalFooter={
-              <>
-                <AxoButton.Root
-                  variant="secondary"
-                  size="lg"
-                  onClick={closeLanguageDialog}
-                >
-                  {i18n('icu:cancel')}
-                </AxoButton.Root>
-                <AxoButton.Root
-                  variant="primary"
-                  size="lg"
-                  disabled={selectedLanguageLocale === localeOverride}
-                  onClick={() => {
-                    setLanguageDialog(LanguageDialog.Confirmation);
-                  }}
-                >
-                  {i18n('icu:Preferences__LanguageModal__Set')}
-                </AxoButton.Root>
-              </>
-            }
-          >
-            {localeSearchResults.length === 0 && (
-              <div className="Preferences__LanguageModal__NoResults">
-                {i18n('icu:Preferences__Language__NoResults', {
-                  searchTerm: languageSearchInput.trim(),
-                })}
-              </div>
-            )}
-            {localeSearchResults.map(option => {
-              const id = `${languageId}:${option.locale ?? 'system'}`;
-              const isSelected = option.locale === selectedLanguageLocale;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className="Preferences__LanguageModal__Item"
-                  onClick={() => {
-                    setSelectedLanguageLocale(option.locale);
-                  }}
-                  aria-pressed={isSelected}
-                >
-                  <span className="Preferences__LanguageModal__Item__Inner">
-                    <span className="Preferences__LanguageModal__Item__Label">
-                      <span className="Preferences__LanguageModal__Item__Current">
-                        {option.currentLocaleLabel}
-                      </span>
-                      {option.matchingLocaleLabel != null && (
-                        <span
-                          lang={option.locale ?? resolvedLocale}
-                          className="Preferences__LanguageModal__Item__Matching"
-                        >
-                          {option.matchingLocaleLabel}
-                        </span>
-                      )}
-                    </span>
-                    {isSelected && (
-                      <span className="Preferences__LanguageModal__Item__Check" />
+                modalName="Preferences__LanguageModal"
+                moduleClassName="Preferences__LanguageModal"
+                padded={false}
+                onClose={closeLanguageDialog}
+                title={i18n('icu:Preferences__Language__ModalTitle')}
+                modalHeaderChildren={
+                  <SearchInput
+                    i18n={i18n}
+                    value={languageSearchInput}
+                    placeholder={i18n(
+                      'icu:Preferences__Language__SearchLanguages'
                     )}
-                  </span>
-                </button>
-              );
-            })}
-          </Modal>
-        )}
-        {languageDialog === LanguageDialog.Confirmation && (
-          <AxoConfirmDialog.Root
-            open
-            onOpenChange={closeLanguageDialog}
-            title={i18n('icu:Preferences__LanguageModal__Restart__Title')}
-            description={i18n(
-              'icu:Preferences__LanguageModal__Restart__Description'
+                    moduleClassName="Preferences__LanguageModal__SearchInput"
+                    onChange={event => {
+                      setLanguageSearchInput(event.currentTarget.value);
+                    }}
+                  />
+                }
+                modalFooter={
+                  <>
+                    <AxoButton.Root
+                      variant="secondary"
+                      size="lg"
+                      onClick={closeLanguageDialog}
+                    >
+                      {i18n('icu:cancel')}
+                    </AxoButton.Root>
+                    <AxoButton.Root
+                      variant="primary"
+                      size="lg"
+                      disabled={selectedLanguageLocale === localeOverride}
+                      onClick={() => {
+                        setLanguageDialog(LanguageDialog.Confirmation);
+                      }}
+                    >
+                      {i18n('icu:Preferences__LanguageModal__Set')}
+                    </AxoButton.Root>
+                  </>
+                }
+              >
+                {localeSearchResults.length === 0 && (
+                  <div className="Preferences__LanguageModal__NoResults">
+                    {i18n('icu:Preferences__Language__NoResults', {
+                      searchTerm: languageSearchInput.trim(),
+                    })}
+                  </div>
+                )}
+                {localeSearchResults.map(option => {
+                  const id = `${languageId}:${option.locale ?? 'system'}`;
+                  const isSelected = option.locale === selectedLanguageLocale;
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      className="Preferences__LanguageModal__Item"
+                      onClick={() => {
+                        setSelectedLanguageLocale(option.locale);
+                      }}
+                      aria-pressed={isSelected}
+                    >
+                      <span className="Preferences__LanguageModal__Item__Inner">
+                        <span className="Preferences__LanguageModal__Item__Label">
+                          <span className="Preferences__LanguageModal__Item__Current">
+                            {option.currentLocaleLabel}
+                          </span>
+                          {option.matchingLocaleLabel != null && (
+                            <span
+                              lang={option.locale ?? resolvedLocale}
+                              className="Preferences__LanguageModal__Item__Matching"
+                            >
+                              {option.matchingLocaleLabel}
+                            </span>
+                          )}
+                        </span>
+                        {isSelected && (
+                          <span className="Preferences__LanguageModal__Item__Check" />
+                        )}
+                      </span>
+                    </button>
+                  );
+                })}
+              </Modal>
             )}
-          >
-            <AxoConfirmDialog.Cancel>
-              {i18n('icu:cancel')}
-            </AxoConfirmDialog.Cancel>
-            <AxoConfirmDialog.Action
-              variant="primary"
-              onClick={() => onLocaleChange(selectedLanguageLocale)}
-            >
-              {i18n('icu:Preferences__LanguageModal__Restart__Button')}
-            </AxoConfirmDialog.Action>
-          </AxoConfirmDialog.Root>
+            {languageDialog === LanguageDialog.Confirmation && (
+              <AxoConfirmDialog.Root
+                open
+                onOpenChange={closeLanguageDialog}
+                title={i18n('icu:Preferences__LanguageModal__Restart__Title')}
+                description={i18n(
+                  'icu:Preferences__LanguageModal__Restart__Description'
+                )}
+              >
+                <AxoConfirmDialog.Cancel>
+                  {i18n('icu:cancel')}
+                </AxoConfirmDialog.Cancel>
+                <AxoConfirmDialog.Action
+                  variant="primary"
+                  onClick={() => onLocaleChange(selectedLanguageLocale)}
+                >
+                  {i18n('icu:Preferences__LanguageModal__Restart__Button')}
+                </AxoConfirmDialog.Action>
+              </AxoConfirmDialog.Root>
+            )}
+          </>
         )}
         <Control
           icon
@@ -1227,16 +1239,18 @@ export function Preferences({
             name="linkPreviews"
             onChange={onLinkPreviewsChange}
           />
-          <Checkbox
-            checked={hasPreferContactAvatars}
-            label={i18n('icu:Preferences__address-book-photos--title')}
-            description={i18n(
-              'icu:Preferences__address-book-photos--description'
-            )}
-            moduleClassName="Preferences__checkbox"
-            name="typingIndicators"
-            onChange={onPreferContactAvatarsChange}
-          />
+          {!isSignalWebRuntime && (
+            <Checkbox
+              checked={hasPreferContactAvatars}
+              label={i18n('icu:Preferences__address-book-photos--title')}
+              description={i18n(
+                'icu:Preferences__address-book-photos--description'
+              )}
+              moduleClassName="Preferences__checkbox"
+              name="typingIndicators"
+              onChange={onPreferContactAvatarsChange}
+            />
+          )}
           <Checkbox
             checked={hasAutoConvertEmoji}
             description={
@@ -1320,31 +1334,35 @@ export function Preferences({
           />
         </SettingsRow>
 
-        <SettingsRow>
-          <Control
-            left={
-              <>
-                <div>{i18n('icu:PlaintextExport--PreferencesRow--Header')}</div>
-                <div className="Preferences__description">
-                  {i18n('icu:PlaintextExport--PreferencesRow--Description')}
+        {!isSignalWebRuntime && (
+          <SettingsRow>
+            <Control
+              left={
+                <>
+                  <div>
+                    {i18n('icu:PlaintextExport--PreferencesRow--Header')}
+                  </div>
+                  <div className="Preferences__description">
+                    {i18n('icu:PlaintextExport--PreferencesRow--Description')}
+                  </div>
+                </>
+              }
+              right={
+                <div className="Preferences__right-button">
+                  <AxoButton.Root
+                    variant="secondary"
+                    size="lg"
+                    onClick={startPlaintextExport}
+                  >
+                    {i18n('icu:PlaintextExport--ActionButton')}
+                  </AxoButton.Root>
                 </div>
-              </>
-            }
-            right={
-              <div className="Preferences__right-button">
-                <AxoButton.Root
-                  variant="secondary"
-                  size="lg"
-                  onClick={startPlaintextExport}
-                >
-                  {i18n('icu:PlaintextExport--ActionButton')}
-                </AxoButton.Root>
-              </div>
-            }
-          />
-        </SettingsRow>
+              }
+            />
+          </SettingsRow>
+        )}
 
-        {isSyncSupported && (
+        {!isSignalWebRuntime && isSyncSupported && (
           <SettingsRow>
             <Control
               left={
@@ -1562,13 +1580,15 @@ export function Preferences({
             name="notifications"
             onChange={onNotificationsChange}
           />
-          <Checkbox
-            checked={hasCallNotifications}
-            label={i18n('icu:callSystemNotificationDescription')}
-            moduleClassName="Preferences__checkbox"
-            name="callSystemNotification"
-            onChange={onCallNotificationsChange}
-          />
+          {!isSignalWebRuntime && (
+            <Checkbox
+              checked={hasCallNotifications}
+              label={i18n('icu:callSystemNotificationDescription')}
+              moduleClassName="Preferences__checkbox"
+              name="callSystemNotification"
+              onChange={onCallNotificationsChange}
+            />
+          )}
           {isNotificationAttentionSupported && (
             <Checkbox
               checked={hasNotificationAttention}
@@ -1632,57 +1652,58 @@ export function Preferences({
             onChange={onMessageAudioChange}
           />
         </SettingsRow>
-        {notificationProfileCount > 0 ? (
-          <FullWidthButton
-            testId="ManageNotificationProfiles"
-            className={tw(
-              'mx-[10px] mt-[-3px] min-h-[52px] max-w-[calc(100%-20px)]'
-            )}
-            onClick={() =>
-              setSettingsLocation({
-                page: SettingsPage.NotificationProfilesHome,
-              })
-            }
-          >
-            <div className={tw('grow text-start')}>
-              <div>{i18n('icu:NotificationProfiles--setting')}</div>
-              <div className="Preferences__description">
-                {i18n('icu:NotificationProfiles--manage-description')}
+        {!isSignalWebRuntime &&
+          (notificationProfileCount > 0 ? (
+            <FullWidthButton
+              testId="ManageNotificationProfiles"
+              className={tw(
+                'mx-[10px] mt-[-3px] min-h-[52px] max-w-[calc(100%-20px)]'
+              )}
+              onClick={() =>
+                setSettingsLocation({
+                  page: SettingsPage.NotificationProfilesHome,
+                })
+              }
+            >
+              <div className={tw('grow text-start')}>
+                <div>{i18n('icu:NotificationProfiles--setting')}</div>
+                <div className="Preferences__description">
+                  {i18n('icu:NotificationProfiles--manage-description')}
+                </div>
               </div>
-            </div>
-            <span className={tw('ms-4')}>
-              {i18n('icu:NotificationProfiles--manage-profiles', {
-                profileCount: notificationProfileCount,
-              })}
-            </span>
-          </FullWidthButton>
-        ) : (
-          <SettingsRow>
-            <Control
-              left={
-                <>
-                  <div>{i18n('icu:NotificationProfiles--setting')}</div>
-                  <div className="Preferences__description">
-                    {i18n('icu:NotificationProfiles--setup-description')}
-                  </div>
-                </>
-              }
-              right={
-                <AxoButton.Root
-                  variant="secondary"
-                  size="lg"
-                  onClick={() =>
-                    setSettingsLocation({
-                      page: SettingsPage.NotificationProfilesHome,
-                    })
-                  }
-                >
-                  {i18n('icu:NotificationProfiles--setup')}
-                </AxoButton.Root>
-              }
-            />
-          </SettingsRow>
-        )}
+              <span className={tw('ms-4')}>
+                {i18n('icu:NotificationProfiles--manage-profiles', {
+                  profileCount: notificationProfileCount,
+                })}
+              </span>
+            </FullWidthButton>
+          ) : (
+            <SettingsRow>
+              <Control
+                left={
+                  <>
+                    <div>{i18n('icu:NotificationProfiles--setting')}</div>
+                    <div className="Preferences__description">
+                      {i18n('icu:NotificationProfiles--setup-description')}
+                    </div>
+                  </>
+                }
+                right={
+                  <AxoButton.Root
+                    variant="secondary"
+                    size="lg"
+                    onClick={() =>
+                      setSettingsLocation({
+                        page: SettingsPage.NotificationProfilesHome,
+                      })
+                    }
+                  >
+                    {i18n('icu:NotificationProfiles--setup')}
+                  </AxoButton.Root>
+                }
+              />
+            </SettingsRow>
+          ))}
       </>
     );
     content = (
@@ -1881,43 +1902,45 @@ export function Preferences({
             </AxoConfirmDialog.Action>
           </AxoConfirmDialog.Root>
         ) : null}
-        <SettingsRow title={i18n('icu:Stories__title')}>
-          <FlowingControl>
-            <div className="Preferences__two-thirds-flow">
-              <label htmlFor={storiesId}>
-                <div>{i18n('icu:Stories__settings-toggle--title')}</div>
-                <div className="Preferences__description">
-                  {i18n('icu:Stories__settings-toggle--description')}
-                </div>
-              </label>
-            </div>
-            <div
-              className={classNames(
-                'Preferences__flow-button',
-                'Preferences__one-third-flow',
-                'Preferences__one-third-flow--align-right'
-              )}
-            >
-              {hasStoriesDisabled ? (
-                <AxoButton.Root
-                  onClick={() => onHasStoriesDisabledChanged(false)}
-                  variant="secondary"
-                  size="lg"
-                >
-                  {i18n('icu:Preferences__turn-stories-on')}
-                </AxoButton.Root>
-              ) : (
-                <AxoButton.Root
-                  onClick={() => setConfirmStoriesOff(true)}
-                  variant="subtle-destructive"
-                  size="lg"
-                >
-                  {i18n('icu:Preferences__turn-stories-off')}
-                </AxoButton.Root>
-              )}
-            </div>
-          </FlowingControl>
-        </SettingsRow>
+        {!isSignalWebRuntime && (
+          <SettingsRow title={i18n('icu:Stories__title')}>
+            <FlowingControl>
+              <div className="Preferences__two-thirds-flow">
+                <label htmlFor={storiesId}>
+                  <div>{i18n('icu:Stories__settings-toggle--title')}</div>
+                  <div className="Preferences__description">
+                    {i18n('icu:Stories__settings-toggle--description')}
+                  </div>
+                </label>
+              </div>
+              <div
+                className={classNames(
+                  'Preferences__flow-button',
+                  'Preferences__one-third-flow',
+                  'Preferences__one-third-flow--align-right'
+                )}
+              >
+                {hasStoriesDisabled ? (
+                  <AxoButton.Root
+                    onClick={() => onHasStoriesDisabledChanged(false)}
+                    variant="secondary"
+                    size="lg"
+                  >
+                    {i18n('icu:Preferences__turn-stories-on')}
+                  </AxoButton.Root>
+                ) : (
+                  <AxoButton.Root
+                    onClick={() => setConfirmStoriesOff(true)}
+                    variant="subtle-destructive"
+                    size="lg"
+                  >
+                    {i18n('icu:Preferences__turn-stories-off')}
+                  </AxoButton.Root>
+                )}
+              </div>
+            </FlowingControl>
+          </SettingsRow>
+        )}
         <SettingsRow title={i18n('icu:Preferences--advanced')}>
           <Checkbox
             checked={hasSealedSenderIndicators}

@@ -32,7 +32,7 @@ import {
 import { getNotificationDataForMessage } from '../../util/getNotificationDataForMessage.preload.ts';
 import { getMessagePropStatus } from '../../state/selectors/message.preload.ts';
 import OS from './osMainShim.dom.ts';
-import type { LocalizerType, ThemeType } from '../../types/Util.std.ts';
+import type { LocalizerType } from '../../types/Util.std.ts';
 import { SIGNAL_ACI } from '../../types/SignalConversation.std.ts';
 import type { AciString } from '../../types/ServiceId.std.ts';
 import { isPniString } from '../../types/ServiceId.std.ts';
@@ -43,6 +43,7 @@ import { ToastType } from '../../types/Toast.dom.tsx';
 import { isAciString } from '../../util/isAciString.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
 import { deriveAccessKeyFromProfileKey } from '../../util/zkgroup.node.ts';
+import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 import { getPinnedMessagesLimit } from '../../util/pinnedMessages.dom.ts';
 import { getPinnedMessageExpiresAt } from '../../util/pinnedMessages.std.ts';
 import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
@@ -58,8 +59,16 @@ import { TimelineMessageLoadingState } from '../../util/timelineUtil.std.ts';
 import { isNotNil } from '../../util/isNotNil.std.ts';
 import countryDisplayNames from '../../../build/country-display-names.json';
 import packageJson from '../../../package.json';
-import { loadWebSettings, updateWebSettings } from './webSettings.dom.ts';
+import {
+  DEFAULT_WEB_SETTINGS,
+  getBrowserSystemTheme,
+  loadWebSettings,
+  updateWebSettings,
+  type WebSettings,
+} from './webSettings.dom.ts';
 import { itemStorage } from '../../textsecure/Storage.preload.ts';
+import type { StorageAccessType } from '../../types/Storage.d.ts';
+import type { ThemeSettingType } from '../../util/theme.std.ts';
 import type {
   ConversationAttributesType,
   MessageAttributesType,
@@ -67,12 +76,25 @@ import type {
 } from '../../model-types.d.ts';
 import type { GroupV2ChangeDetailType } from '../../types/groups.std.ts';
 import type { AttachmentType } from '../../types/Attachment.std.ts';
+import type { ChatFolder, ChatFolderId } from '../../types/ChatFolder.std.ts';
 import {
   isAudio,
   isFile,
   isVisualMedia,
   isVoiceMessage,
 } from '../../util/Attachment.std.ts';
+import {
+  createWebAllChatsChatFolder,
+  createWebChatFolder,
+  deleteExpiredWebChatFolders,
+  getOldestDeletedWebChatFolder,
+  loadWebChatFolders,
+  markWebChatFolderDeleted,
+  updateWebChatFolder,
+  updateWebChatFolderDeletedAtTimestampMsFromSync,
+  updateWebChatFolderPositions,
+  updateWebChatFolderToggleChat,
+} from './webChatFolders.dom.ts';
 import type {
   ContactMediaItemDBType,
   GetSortedDocumentsOptionsType,
@@ -2490,17 +2512,17 @@ class WebConversationModel {
   public async markRead(): Promise<void> {
     const messages = getConversationMessages(this.id);
     const unreadMessages = messages.filter(
-        message =>
-            message.type === 'incoming' && message.readStatus === ReadStatus.Unread
+      message =>
+        message.type === 'incoming' && message.readStatus === ReadStatus.Unread
     );
 
     const unreadCount = this.get('unreadCount');
     const markedUnread = this.get('markedUnread');
 
     if (
-        unreadMessages.length === 0 &&
-        unreadCount === 0 &&
-        markedUnread !== true
+      unreadMessages.length === 0 &&
+      unreadCount === 0 &&
+      markedUnread !== true
     ) {
       return;
     }
@@ -2516,10 +2538,10 @@ class WebConversationModel {
       webRuntimeMessagesLookup = {
         ...webRuntimeMessagesLookup,
         ...Object.fromEntries(
-            unreadMessages.map(message => [
-              message.id,
-              { ...message, readStatus: ReadStatus.Read },
-            ])
+          unreadMessages.map(message => [
+            message.id,
+            { ...message, readStatus: ReadStatus.Read },
+          ])
         ),
       };
 
@@ -2959,6 +2981,7 @@ class WebConversationModel {
 
     const sent = await sendDirectExpirationTimerUpdate({
       runtimeSessionId: currentMessageRuntimeSessionId,
+      accessKey: getDirectSendAccessKey(this.attributes as WebConversation),
       destinationServiceId,
       expireTimer,
       expireTimerVersion: nextVersion,
@@ -3143,6 +3166,7 @@ class WebConversationModel {
         })
       : await sendDirectTextMessage({
           runtimeSessionId: currentMessageRuntimeSessionId,
+          accessKey: getDirectSendAccessKey(this.attributes as WebConversation),
           destinationServiceId: String(this.attributes.serviceId ?? this.id),
           body,
           timestamp,
@@ -3729,6 +3753,138 @@ function installKeyboardLayoutFallback(): void {
   };
 }
 
+function getWebSettingsStorageItems(
+  settings: WebSettings = loadWebSettings()
+): Partial<StorageAccessType> {
+  return {
+    'audio-notification': settings.audioNotifications,
+    'auto-download-attachment': settings.autoDownloadAttachment,
+    autoConvertEmoji: settings.autoConvertEmoji,
+    'badge-count-muted-conversations': settings.countMutedConversations,
+    customColors: settings.customColors,
+    defaultConversationColor: settings.defaultConversationColor,
+    emojiSkinToneDefault: settings.emojiSkinToneDefault,
+    keepMutedChatsArchived: settings.keepMutedChatsArchived,
+    linkPreviews: settings.linkPreviews,
+    audioMessage: settings.messageAudio,
+    navTabsCollapsed: settings.navTabsCollapsed,
+    'notification-setting': settings.notificationContent,
+    phoneNumberDiscoverability: settings.phoneNumberDiscoverability,
+    phoneNumberSharingMode: settings.phoneNumberSharingMode,
+    preferContactAvatars: settings.preferContactAvatars,
+    'read-receipt-setting': settings.readReceipts,
+    sealedSenderIndicators: settings.sealedSenderIndicators,
+    'sent-media-quality': settings.sentMediaQuality,
+    textFormatting: settings.textFormatting,
+    typingIndicators: settings.typingIndicators,
+    universalExpireTimer: settings.universalExpireTimer,
+  };
+}
+
+function updateWebSettingsStorageItem(
+  key: keyof StorageAccessType,
+  value: unknown
+): void {
+  switch (key) {
+    case 'audio-notification':
+      updateWebSettings({ audioNotifications: Boolean(value) });
+      break;
+    case 'auto-download-attachment':
+      updateWebSettings({
+        autoDownloadAttachment:
+          value as StorageAccessType['auto-download-attachment'],
+      });
+      break;
+    case 'autoConvertEmoji':
+      updateWebSettings({ autoConvertEmoji: Boolean(value) });
+      break;
+    case 'badge-count-muted-conversations':
+      updateWebSettings({ countMutedConversations: Boolean(value) });
+      break;
+    case 'customColors':
+      updateWebSettings({
+        customColors: value as StorageAccessType['customColors'],
+      });
+      break;
+    case 'defaultConversationColor':
+      updateWebSettings({
+        defaultConversationColor:
+          value as StorageAccessType['defaultConversationColor'],
+      });
+      break;
+    case 'emojiSkinToneDefault':
+      updateWebSettings({
+        emojiSkinToneDefault:
+          value as StorageAccessType['emojiSkinToneDefault'],
+      });
+      break;
+    case 'keepMutedChatsArchived':
+      updateWebSettings({ keepMutedChatsArchived: Boolean(value) });
+      break;
+    case 'linkPreviews':
+      updateWebSettings({ linkPreviews: Boolean(value) });
+      break;
+    case 'audioMessage':
+      updateWebSettings({ messageAudio: Boolean(value) });
+      break;
+    case 'navTabsCollapsed':
+      updateWebSettings({ navTabsCollapsed: Boolean(value) });
+      break;
+    case 'notification-setting':
+      updateWebSettings({
+        notificationContent: value as StorageAccessType['notification-setting'],
+      });
+      break;
+    case 'phoneNumberDiscoverability':
+      updateWebSettings({
+        phoneNumberDiscoverability:
+          value as StorageAccessType['phoneNumberDiscoverability'],
+      });
+      break;
+    case 'phoneNumberSharingMode':
+      updateWebSettings({
+        phoneNumberSharingMode:
+          value as StorageAccessType['phoneNumberSharingMode'],
+      });
+      break;
+    case 'preferContactAvatars':
+      updateWebSettings({ preferContactAvatars: Boolean(value) });
+      break;
+    case 'read-receipt-setting':
+      updateWebSettings({ readReceipts: Boolean(value) });
+      break;
+    case 'sealedSenderIndicators':
+      updateWebSettings({ sealedSenderIndicators: Boolean(value) });
+      break;
+    case 'sent-media-quality':
+      updateWebSettings({
+        sentMediaQuality: value as StorageAccessType['sent-media-quality'],
+      });
+      break;
+    case 'textFormatting':
+      updateWebSettings({ textFormatting: Boolean(value) });
+      break;
+    case 'typingIndicators':
+      updateWebSettings({ typingIndicators: Boolean(value) });
+      break;
+    case 'universalExpireTimer':
+      updateWebSettings({
+        universalExpireTimer:
+          typeof value === 'number' && Number.isFinite(value) ? value : 0,
+      });
+      break;
+    default:
+      break;
+  }
+}
+
+function removeWebSettingsStorageItem(key: keyof StorageAccessType): void {
+  const defaults = getWebSettingsStorageItems(DEFAULT_WEB_SETTINGS);
+  if (key in defaults) {
+    updateWebSettingsStorageItem(key, defaults[key]);
+  }
+}
+
 function noop(): void {}
 
 export function setupWebGlobals({
@@ -3766,10 +3922,10 @@ export function setupWebGlobals({
     getLocaleOverride: async () => null,
     getMediaCameraPermissions: async () => false,
     getMediaPermissions: async () => false,
-    getSpellCheck: async () => true,
+    getSpellCheck: async () => loadWebSettings().spellCheck,
     getSystemTraySetting: async () => false,
     getThemeSetting: async () => loadWebSettings().theme,
-    getZoomFactor: async () => 1,
+    getZoomFactor: async () => loadWebSettings().zoomFactor,
     offZoomFactorChange: noop,
     onZoomFactorChange: noop,
     removeDarkOverlay: noop,
@@ -3778,12 +3934,16 @@ export function setupWebGlobals({
     setLocaleOverride: async () => undefined,
     setMediaCameraPermissions: async () => undefined,
     setMediaPermissions: async () => undefined,
-    setSpellCheck: async () => undefined,
+    setSpellCheck: async (value: boolean) => {
+      updateWebSettings({ spellCheck: value });
+    },
     setSystemTraySetting: async () => undefined,
-    setThemeSetting: async (value: ThemeType) => {
+    setThemeSetting: async (value: ThemeSettingType) => {
       updateWebSettings({ theme: value });
     },
-    setZoomFactor: async () => undefined,
+    setZoomFactor: async (value: number) => {
+      updateWebSettings({ zoomFactor: value });
+    },
     showKeyboardShortcuts: noop,
   };
 
@@ -3822,7 +3982,29 @@ export function setupWebGlobals({
     sqlCall: async (name: string, args?: ReadonlyArray<unknown>) => {
       const state = window.reduxStore?.getState?.();
       if (name === 'getAllItems') {
-        return {};
+        return getWebSettingsStorageItems();
+      }
+      if (name === 'createOrUpdateItem') {
+        const item = args?.[0] as
+          | { id?: keyof StorageAccessType; value?: unknown }
+          | undefined;
+        if (item?.id) {
+          updateWebSettingsStorageItem(item.id, item.value);
+        }
+        return undefined;
+      }
+      if (name === 'removeItemById') {
+        const id = args?.[0];
+        if (Array.isArray(id)) {
+          for (const itemId of id) {
+            if (typeof itemId === 'string') {
+              removeWebSettingsStorageItem(itemId as keyof StorageAccessType);
+            }
+          }
+        } else if (typeof id === 'string') {
+          removeWebSettingsStorageItem(id as keyof StorageAccessType);
+        }
+        return 0;
       }
       if (name === 'getAllConversations') {
         return Object.values(state?.conversations?.conversationLookup ?? {});
@@ -3992,7 +4174,100 @@ export function setupWebGlobals({
         return [];
       }
       if (name === 'getCurrentChatFolders') {
-        return [];
+        return loadWebChatFolders(getOurAci());
+      }
+      if (name === 'getOldestDeletedChatFolder') {
+        return getOldestDeletedWebChatFolder(getOurAci()) ?? null;
+      }
+      if (name === 'createChatFolder') {
+        const chatFolder = args?.[0] as ChatFolder | undefined;
+        if (chatFolder) {
+          createWebChatFolder(getOurAci(), chatFolder);
+        }
+        return undefined;
+      }
+      if (name === 'createAllChatsChatFolder') {
+        return createWebAllChatsChatFolder(getOurAci());
+      }
+      if (name === 'upsertAllChatsChatFolderFromSync') {
+        const chatFolder = args?.[0] as ChatFolder | undefined;
+        if (chatFolder) {
+          createWebChatFolder(getOurAci(), chatFolder);
+        }
+        return undefined;
+      }
+      if (name === 'updateChatFolder') {
+        const chatFolder = args?.[0] as ChatFolder | undefined;
+        if (chatFolder) {
+          updateWebChatFolder(getOurAci(), chatFolder);
+        }
+        return undefined;
+      }
+      if (name === 'updateChatFolderToggleChat') {
+        const chatFolderId = args?.[0];
+        const conversationId = args?.[1];
+        const toggle = args?.[2];
+        if (
+          typeof chatFolderId === 'string' &&
+          typeof conversationId === 'string' &&
+          typeof toggle === 'boolean'
+        ) {
+          updateWebChatFolderToggleChat(
+            getOurAci(),
+            chatFolderId as ChatFolderId,
+            conversationId,
+            toggle
+          );
+        }
+        return undefined;
+      }
+      if (name === 'updateChatFolderPositions') {
+        const chatFolders = args?.[0];
+        if (Array.isArray(chatFolders)) {
+          updateWebChatFolderPositions(
+            getOurAci(),
+            chatFolders as ReadonlyArray<ChatFolder>
+          );
+        }
+        return undefined;
+      }
+      if (name === 'markChatFolderDeleted') {
+        const chatFolderId = args?.[0];
+        const deletedAtTimestampMs = args?.[1];
+        const storageNeedsSync = args?.[2];
+        if (
+          typeof chatFolderId === 'string' &&
+          typeof deletedAtTimestampMs === 'number'
+        ) {
+          markWebChatFolderDeleted(
+            getOurAci(),
+            chatFolderId as ChatFolderId,
+            deletedAtTimestampMs,
+            typeof storageNeedsSync === 'boolean' ? storageNeedsSync : true
+          );
+        }
+        return undefined;
+      }
+      if (name === 'updateChatFolderDeletedAtTimestampMsFromSync') {
+        const chatFolderId = args?.[0];
+        const deletedAtTimestampMs = args?.[1];
+        if (
+          typeof chatFolderId === 'string' &&
+          typeof deletedAtTimestampMs === 'number'
+        ) {
+          updateWebChatFolderDeletedAtTimestampMsFromSync(
+            getOurAci(),
+            chatFolderId as ChatFolderId,
+            deletedAtTimestampMs
+          );
+        }
+        return undefined;
+      }
+      if (name === 'deleteExpiredChatFolders') {
+        const messageQueueTime = args?.[0];
+        return typeof messageQueueTime === 'number'
+          ? deleteExpiredWebChatFolders(getOurAci(), messageQueueTime)
+          : [];
       }
       if (name === 'getAllCallHistory') {
         return [];
@@ -4052,7 +4327,7 @@ export function setupWebGlobals({
   const signalContext = {
     ...(window.SignalContext ?? {}),
     config: {
-      appStartInitialSpellcheckSetting: true,
+      appStartInitialSpellcheckSetting: loadWebSettings().spellCheck,
       cdnBaseUrl: getRenderCdnBaseUrl(),
       disableScreenSecurity: true,
       renderApiBaseUrl: getRenderApiBaseUrl(),
@@ -4097,7 +4372,7 @@ export function setupWebGlobals({
     i18n,
     isTestOrMockEnvironment: () => false,
     nativeThemeListener: {
-      getSystemTheme: () => 'light',
+      getSystemTheme: () => getBrowserSystemTheme(),
       subscribe: noop,
       unsubscribe: noop,
     },
@@ -4106,7 +4381,7 @@ export function setupWebGlobals({
     Settings: {
       themeSetting: {
         getValue: async () => loadWebSettings().theme,
-        setValue: async (value: ThemeType) => {
+        setValue: async (value: ThemeSettingType) => {
           updateWebSettings({ theme: value });
           return value;
         },

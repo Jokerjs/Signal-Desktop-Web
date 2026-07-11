@@ -125,6 +125,12 @@ import { AppProvider } from '../../windows/AppProvider.dom.tsx';
 
 const DEFAULT_NOTIFICATION_SETTING = 'message';
 
+type SignalWebRuntimePhoneNumberDiscoverability = typeof window & {
+  SignalWebRuntime?: {
+    setPhoneNumberDiscoverability?: (discoverable: boolean) => Promise<void>;
+  };
+};
+
 function renderUpdateDialog(
   props: Readonly<{ containerWidthBreakpoint: WidthBreakpoint }>
 ): JSX.Element {
@@ -825,9 +831,14 @@ export function SmartPreferences({
     'phoneNumberDiscoverability',
     PhoneNumberDiscoverability.NotDiscoverable,
     async (newValue: PhoneNumberDiscoverability) => {
-      await setPhoneNumberDiscoverability(
-        newValue === PhoneNumberDiscoverability.Discoverable
-      );
+      const discoverable = newValue === PhoneNumberDiscoverability.Discoverable;
+      const webSetter = (window as SignalWebRuntimePhoneNumberDiscoverability)
+        .SignalWebRuntime?.setPhoneNumberDiscoverability;
+      if (isSignalWebRuntime && webSetter) {
+        await webSetter(discoverable);
+      } else {
+        await setPhoneNumberDiscoverability(discoverable);
+      }
       const account = window.ConversationController.getOurConversationOrThrow();
       account.captureChange('phoneNumberDiscoverability');
     }
@@ -980,9 +991,7 @@ export function SmartPreferences({
         i18n={i18n}
         initialSpellCheckSetting={initialSpellCheckSetting}
         isAutoDownloadUpdatesSupported={isAutoDownloadUpdatesSupported}
-        isAutoLaunchSupported={
-          !isSignalWebRuntime && isAutoLaunchSupported
-        }
+        isAutoLaunchSupported={!isSignalWebRuntime && isAutoLaunchSupported}
         isContentProtectionNeeded={isContentProtectionNeeded}
         isContentProtectionSupported={
           !isSignalWebRuntime && isContentProtectionSupported

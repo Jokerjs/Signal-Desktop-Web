@@ -23,6 +23,7 @@ import * as KeyboardLayout from '../services/keyboardLayout.dom.ts';
 import { createStore } from '../state/createStore.preload.ts';
 import { reducer, type StateType } from '../state/reducer.preload.ts';
 import { actionCreators } from '../state/actions.preload.ts';
+import { getInitialChatFoldersState } from '../state/ducks/chatFolders.preload.ts';
 import { retryPlaceholders } from '../services/retryPlaceholders.std.ts';
 import { MessageCache } from '../services/MessageCache.preload.ts';
 import { initialize as initializeExpiringMessageService } from '../services/expiringMessagesDeletion.preload.ts';
@@ -51,7 +52,11 @@ import {
   persistLinkedSessionRecordToIndexedDb,
   persistLinkedSessionToStorage,
 } from './persistence.dom.ts';
-import { loadWebSettings } from './runtime/webSettings.dom.ts';
+import {
+  getEffectiveWebTheme,
+  loadWebSettings,
+} from './runtime/webSettings.dom.ts';
+import { loadWebChatFolders } from './runtime/webChatFolders.dom.ts';
 
 const EMPTY_SHELL: ChatShellState = {
   conversationLookup: {},
@@ -136,7 +141,10 @@ MessageCache.install();
 
 const i18n = setupI18n('zh-CN', zhCNMessages);
 
-function bindActionCreatorsDeep<T>(creators: T, dispatch: Store['dispatch']): T {
+function bindActionCreatorsDeep<T>(
+  creators: T,
+  dispatch: Store['dispatch']
+): T {
   if (typeof creators === 'function') {
     return bindActionCreators(creators as never, dispatch) as T;
   }
@@ -153,7 +161,9 @@ function bindActionCreatorsDeep<T>(creators: T, dispatch: Store['dispatch']): T 
 
 async function buildInitialState(): Promise<{
   initialState: StateType;
-  linkedSession: Awaited<ReturnType<typeof loadLinkedSessionRecordFromIndexedDb>>;
+  linkedSession: Awaited<
+    ReturnType<typeof loadLinkedSessionRecordFromIndexedDb>
+  >;
   shell: ChatShellState;
 }> {
   await itemStorage.fetch();
@@ -174,7 +184,11 @@ async function buildInitialState(): Promise<{
     loadContactsBootstrapForSession(sessionUserId),
   ]);
   const shell = storedSession
-    ? applyContactsBootstrap(storedShell ?? EMPTY_SHELL, contacts, storedSession)
+    ? applyContactsBootstrap(
+        storedShell ?? EMPTY_SHELL,
+        contacts,
+        storedSession
+      )
     : EMPTY_SHELL;
   const pinnedConversationIds =
     contacts?.pinned.map(conversation => conversation.id) ??
@@ -216,15 +230,38 @@ async function buildInitialState(): Promise<{
         ...baseState.conversations,
         ...(desktopConversations ?? {}),
       } as StateType['conversations'],
+      chatFolders: getInitialChatFoldersState(
+        storedSession ? loadWebChatFolders(sessionUserId) : []
+      ),
       items: {
         ...baseState.items,
-        backupTier: storedSession ? BackupLevel.Paid : baseState.items.backupTier,
+        backupTier: storedSession
+          ? BackupLevel.Paid
+          : baseState.items.backupTier,
+        'audio-notification': webSettings.audioNotifications,
+        'auto-download-attachment': webSettings.autoDownloadAttachment,
+        autoConvertEmoji: webSettings.autoConvertEmoji,
+        'badge-count-muted-conversations': webSettings.countMutedConversations,
+        customColors: webSettings.customColors,
+        defaultConversationColor: webSettings.defaultConversationColor,
+        emojiSkinToneDefault: webSettings.emojiSkinToneDefault,
+        keepMutedChatsArchived: webSettings.keepMutedChatsArchived,
         pinnedConversationIds,
         linkPreviews: webSettings.linkPreviews,
+        audioMessage: webSettings.messageAudio,
+        navTabsCollapsed: webSettings.navTabsCollapsed,
         'notification-setting': webSettings.notificationContent,
+        phoneNumberDiscoverability: webSettings.phoneNumberDiscoverability,
+        phoneNumberSharingMode: webSettings.phoneNumberSharingMode,
+        preferContactAvatars: webSettings.preferContactAvatars,
+        'read-receipt-setting': webSettings.readReceipts,
+        sealedSenderIndicators: webSettings.sealedSenderIndicators,
+        'sent-media-quality': webSettings.sentMediaQuality,
         hasStoriesDisabled: true,
         remoteConfig,
         textFormatting: webSettings.textFormatting,
+        typingIndicators: webSettings.typingIndicators,
+        universalExpireTimer: webSettings.universalExpireTimer,
       },
       nav: {
         ...baseState.nav,
@@ -258,7 +295,7 @@ async function buildInitialState(): Promise<{
         regionCode: undefined,
         stickersPath: '',
         tempPath: '',
-        theme: webSettings.theme,
+        theme: getEffectiveWebTheme(webSettings),
         version: window.getVersion?.() ?? 'web',
       },
     },
@@ -266,7 +303,10 @@ async function buildInitialState(): Promise<{
 }
 
 function getWindowViteSecret(): unknown {
-  return (window as typeof window & { _SIGNAL_SECRET?: unknown })._SIGNAL_SECRET || localStorage.getItem('_SIGNAL_SECRET');
+  return (
+    (window as typeof window & { _SIGNAL_SECRET?: unknown })._SIGNAL_SECRET ||
+    localStorage.getItem('_SIGNAL_SECRET')
+  );
 }
 
 function redirectToNotFound(): void {

@@ -34,6 +34,7 @@ import type {
   WebConversation,
   WebMessage,
 } from './types.std.ts';
+import { getDirectSendAccessKey } from './directSendAccessKey.dom.ts';
 
 type ActiveTab = 'chats' | 'settings';
 
@@ -628,6 +629,8 @@ export function WebApp() {
   const [transportSessionId, setTransportSessionId] = useState<string>();
   const [streamError, setStreamError] = useState<string>();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const transportSessionIdRef = useRef<string>();
+  const latestProtocolStateRevisionRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -694,6 +697,8 @@ export function WebApp() {
   const applyStreamEvent = useCallback(
     (event: MessageStreamEvent) => {
       if (event.type === 'session') {
+        transportSessionIdRef.current = event.sessionId;
+        latestProtocolStateRevisionRef.current = 0;
         setTransportSessionId(event.sessionId);
         return;
       }
@@ -717,6 +722,13 @@ export function WebApp() {
         return;
       }
       if (event.type === 'protocol-state') {
+        if (event.sessionId !== transportSessionIdRef.current) {
+          return;
+        }
+        if (event.protocolRevision <= latestProtocolStateRevisionRef.current) {
+          return;
+        }
+        latestProtocolStateRevisionRef.current = event.protocolRevision;
         setLinkedSession(current => {
           if (!current) {
             return current;
@@ -838,6 +850,7 @@ export function WebApp() {
     try {
       const sent = await sendDirectTextMessage({
         runtimeSessionId: transportSessionId,
+        accessKey: getDirectSendAccessKey(selectedConversation),
         destinationServiceId,
         body,
         timestamp: localMessage.timestamp,

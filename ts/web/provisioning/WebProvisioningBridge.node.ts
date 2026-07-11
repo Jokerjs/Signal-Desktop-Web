@@ -53,6 +53,7 @@ import { MediaTier } from '../../types/AttachmentDownload.std.ts';
 import { supportsIncrementalMac } from '../../types/MIME.std.ts';
 import type { MIMEType } from '../../types/MIME.std.ts';
 import { MY_STORY_ID } from '../../types/Stories.std.ts';
+import { ZERO_ACCESS_KEY } from '../../types/SealedSender.std.ts';
 import {
   getDiscriminator,
   getNickname,
@@ -61,7 +62,10 @@ import {
 import type { ProvisionDecryptResult } from '../../textsecure/ProvisioningCipher.node.ts';
 import type { AciString, ServiceIdString } from '../../types/ServiceId.std.ts';
 import { fromAciObject } from '../../types/ServiceId.std.ts';
-import { toAciObject } from '../../util/ServiceId.node.ts';
+import {
+  fromServiceIdBinaryOrString,
+  toAciObject,
+} from '../../util/ServiceId.node.ts';
 import { normalizeAci } from '../../util/normalizeAci.std.ts';
 import { DAY, DurationInSeconds } from '../../util/durations/index.std.ts';
 import { toDayMillis } from '../../util/timestamp.std.ts';
@@ -95,8 +99,10 @@ import {
 } from './WebStorageContactsSync.node.ts';
 import {
   decryptIncomingSignalEnvelope,
+  cleanupWebSignalSendRuntimeState,
   exportProtocolState,
   getLinkedPayloadProtocolKeyIds,
+  getWebSignalSendDiagnostics,
   maybeUpdateWebPreKeys,
   sendAttachmentBackfillRequestSync,
   sendDecryptionErrorMessage,
@@ -111,6 +117,7 @@ import {
   sendFetchStorageManifestSync,
   sendMessageRequestResponseSync,
 } from './WebSignalSendBridge.node.ts';
+import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 import {
   createGroupConversation,
   enrichGroupConversations,
@@ -192,12 +199,36 @@ const WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS = Number(
   process.env.SIGNAL_WEB_EMOJI_MEMORY_CACHE_MAX_SHEETS ?? 16
 );
 const MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT = 500;
-const MAX_PERSISTED_STREAM_EVENT_AGE = 14 * 24 * 60 * 60 * 1000;
+const MAX_PERSISTED_STREAM_EVENT_AGE = Number(
+  process.env.SIGNAL_WEB_PERSISTED_STREAM_EVENT_TTL_MS ?? 30 * 60 * 1000
+);
 const PROTOCOL_STATE_EMIT_DEBOUNCE_MS = Number(
   process.env.SIGNAL_WEB_PROTOCOL_STATE_EMIT_DEBOUNCE_MS ?? 1000
 );
-const SIGNAL_ACK_WAIT_FOR_BROWSER_MS = Number(
-  process.env.SIGNAL_WEB_SIGNAL_ACK_WAIT_FOR_BROWSER_MS ?? 30_000
+const PROVISIONING_SESSION_TTL_MS = Number(
+  process.env.SIGNAL_WEB_PROVISIONING_SESSION_TTL_MS ?? 10 * 60 * 1000
+);
+const STREAM_CONNECTING_SESSION_TTL_MS = Number(
+  process.env.SIGNAL_WEB_STREAM_CONNECTING_SESSION_TTL_MS ?? 60_000
+);
+const STREAM_CLOSED_SESSION_TTL_MS = Number(
+  process.env.SIGNAL_WEB_STREAM_CLOSED_SESSION_TTL_MS ?? 5 * 60 * 1000
+);
+const RUNTIME_CLEANUP_INTERVAL_MS = Number(
+  process.env.SIGNAL_WEB_RUNTIME_CLEANUP_INTERVAL_MS ?? 60_000
+);
+const SIGNAL_CHAT_KEEPALIVE_INTERVAL_MS = Number(
+  process.env.SIGNAL_WEB_SIGNAL_CHAT_KEEPALIVE_INTERVAL_MS ?? 30_000
+);
+const SIGNAL_CHAT_KEEPALIVE_TIMEOUT_MS = Number(
+  process.env.SIGNAL_WEB_SIGNAL_CHAT_KEEPALIVE_TIMEOUT_MS ?? 30_000
+);
+const SIGNAL_CHAT_KEEPALIVE_STALE_THRESHOLD_MS = Number(
+  process.env.SIGNAL_WEB_SIGNAL_CHAT_KEEPALIVE_STALE_THRESHOLD_MS ??
+    5 * 60 * 1000
+);
+const SIGNAL_CHAT_KEEPALIVE_LOG_AFTER_MS = Number(
+  process.env.SIGNAL_WEB_SIGNAL_CHAT_KEEPALIVE_LOG_AFTER_MS ?? 500
 );
 const PROFILE_FETCH_CONCURRENCY = Number(
   process.env.SIGNAL_WEB_PROFILE_FETCH_CONCURRENCY ?? 30
@@ -306,9 +337,20 @@ type PersistedStreamEventEntry = {
   event: MessageStreamEvent;
 };
 
-type PendingSignalAck = {
-  complete: (statusCode: number) => void;
-  timeout: ReturnType<typeof setTimeout>;
+type SignalChatKeepaliveHandle = {
+  stop: () => void;
+};
+
+type TargetOperationStats = {
+  activeCount: number;
+  completedCount: number;
+  failedCount: number;
+  lastFailure?: string;
+  lastFinishedAt?: number;
+  lastOperationName?: string;
+  lastQueuedAt?: number;
+  lastStartedAt?: number;
+  queuedCount: number;
 };
 
 type ProvisioningSessionEvent = {
@@ -347,6 +389,9 @@ type MessageStreamSession = {
   incomingEnvelopeCount: number;
   decodedMessageCount: number;
   lastDecodedMessageSummary?: unknown;
+  receivedAlertCount?: number;
+  lastReceivedAlerts?: ReadonlyArray<string>;
+  lastReceivedAlertsAt?: number;
   attachmentBackfillEventCount?: number;
   lastAttachmentBackfillSummary?: unknown;
   ignoredEnvelopeCount: number;
@@ -365,9 +410,35 @@ type MessageStreamSession = {
   lastSendAttemptAt?: number;
   connection?: AuthenticatedChatConnection;
   linkedPayload?: LinkedPayloadWithProtocol;
+  conversationLookup?: Record<string, WebConversation>;
   pendingProtocolState?: ProtocolState;
+  pendingProtocolStateRevision?: number;
+  protocolStateRevision?: number;
   protocolStateEmitTimer?: ReturnType<typeof setTimeout>;
-  pendingSignalAcks?: Map<string, PendingSignalAck>;
+  lastStreamEndedAt?: number;
+  lastStreamInterruptedAt?: number;
+  lastStreamOpenedAt?: number;
+  lastStreamStartedAt?: number;
+  lastTransportError?: string;
+  lastTransportStatusAt?: number;
+  signalKeepalive?: SignalChatKeepaliveHandle;
+  signalKeepaliveCount?: number;
+  signalKeepaliveFailureCount?: number;
+  lastSignalKeepaliveAt?: number;
+  lastSignalKeepaliveError?: string;
+  lastSignalKeepaliveResponseMs?: number;
+  lastSignalKeepaliveStatus?: number;
+  backupUnauthKeepalive?: SignalChatKeepaliveHandle;
+  backupUnauthKeepaliveCount?: number;
+  backupUnauthKeepaliveFailureCount?: number;
+  lastBackupUnauthKeepaliveAt?: number;
+  lastBackupUnauthKeepaliveError?: string;
+  lastBackupUnauthKeepaliveResponseMs?: number;
+  lastBackupUnauthKeepaliveStatus?: number;
+  streamCloseCount?: number;
+  streamOpenCount?: number;
+  targetOperationStats?: Map<string, TargetOperationStats>;
+  transportReconnectHintCount?: number;
   cdsiAuth?: {
     timestamp: number;
     auth: ServiceAuth;
@@ -399,6 +470,48 @@ class RequestBodyTooLargeError extends Error {
   constructor() {
     super('JSON request body exceeds maximum size');
   }
+}
+
+function mergeStreamConversation(
+  streamSession: MessageStreamSession,
+  conversation: WebConversation
+): WebConversation {
+  const previous = streamSession.conversationLookup?.[conversation.id];
+  const next = {
+    ...previous,
+    ...conversation,
+  };
+  streamSession.conversationLookup = {
+    ...streamSession.conversationLookup,
+    [conversation.id]: next,
+  };
+  if (next.serviceId) {
+    streamSession.conversationLookup[next.serviceId] = next;
+  }
+  if (next.pni) {
+    streamSession.conversationLookup[next.pni] = next;
+  }
+  if (next.e164) {
+    streamSession.conversationLookup[next.e164] = next;
+  }
+  return next;
+}
+
+function mergeStreamConversations(
+  streamSession: MessageStreamSession,
+  conversations: ReadonlyArray<WebConversation>
+): void {
+  for (const conversation of conversations) {
+    mergeStreamConversation(streamSession, conversation);
+  }
+}
+
+function normalizeDirectAccessKey(accessKey: unknown): string | undefined {
+  if (typeof accessKey !== 'string') {
+    return undefined;
+  }
+
+  return accessKey.trim() ? accessKey : ZERO_ACCESS_KEY;
 }
 
 type BackupArchiveInfo = Readonly<{
@@ -446,6 +559,7 @@ const persistedStreamEventsByAccount = new Map<
 const transferArchiveCooldownUntilByAccount = new Map<string, number>();
 const sessionOperationQueues = new Map<string, Promise<unknown>>();
 const sessionOperationQueueSizes = new Map<string, number>();
+const recentlyClosedStreamAcis = new Map<string, number>();
 
 let signalModulesPromise: ReturnType<typeof loadSignalModules> | undefined;
 let libsignalNetInstance:
@@ -457,6 +571,157 @@ const CACHED_CDSI_AUTH_TTL_MS = 23 * 60 * 60 * 1000;
 
 function now(): number {
   return Date.now();
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function startSignalChatKeepalive({
+  connection,
+  logId,
+  onFailure,
+  onSuccess,
+}: Readonly<{
+  connection: ChatConnection;
+  logId: string;
+  onFailure: (details: {
+    error: string;
+    responseMs?: number;
+    status?: number;
+  }) => void;
+  onSuccess: (details: {
+    responseMs: number;
+    status: number;
+    timestamp: number;
+  }) => void;
+}>): SignalChatKeepaliveHandle {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let lastAliveAt = now();
+
+  const clearTimer = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  const stop = (): void => {
+    stopped = true;
+    clearTimer();
+  };
+
+  const fail = (details: {
+    error: string;
+    responseMs?: number;
+    status?: number;
+  }): void => {
+    if (stopped) {
+      return;
+    }
+    stop();
+    onFailure(details);
+  };
+
+  const schedule = (): void => {
+    if (
+      stopped ||
+      !Number.isFinite(SIGNAL_CHAT_KEEPALIVE_INTERVAL_MS) ||
+      SIGNAL_CHAT_KEEPALIVE_INTERVAL_MS <= 0
+    ) {
+      return;
+    }
+    clearTimer();
+    timer = setTimeout(() => {
+      void send();
+    }, SIGNAL_CHAT_KEEPALIVE_INTERVAL_MS);
+  };
+
+  const send = async (): Promise<void> => {
+    clearTimer();
+    if (stopped) {
+      return;
+    }
+
+    if (
+      Number.isFinite(SIGNAL_CHAT_KEEPALIVE_STALE_THRESHOLD_MS) &&
+      SIGNAL_CHAT_KEEPALIVE_STALE_THRESHOLD_MS > 0 &&
+      now() - lastAliveAt > SIGNAL_CHAT_KEEPALIVE_STALE_THRESHOLD_MS
+    ) {
+      fail({
+        error: `Last Signal keepalive request was too far in the past: ${lastAliveAt}`,
+      });
+      return;
+    }
+
+    const sentAt = now();
+    try {
+      const response = await withTimeout(
+        connection.fetch({
+          verb: 'GET',
+          path: '/v1/keepalive',
+          headers: [],
+          timeoutMillis: SIGNAL_CHAT_KEEPALIVE_TIMEOUT_MS,
+        }),
+        SIGNAL_CHAT_KEEPALIVE_TIMEOUT_MS,
+        `No response to Signal keepalive request after ${SIGNAL_CHAT_KEEPALIVE_TIMEOUT_MS}ms`
+      );
+      const responseMs = now() - sentAt;
+      if (response.status < 200 || response.status >= 300) {
+        fail({
+          error: `Signal keepalive response with ${response.status} code`,
+          responseMs,
+          status: response.status,
+        });
+        return;
+      }
+
+      lastAliveAt = now();
+      onSuccess({
+        responseMs,
+        status: response.status,
+        timestamp: lastAliveAt,
+      });
+      if (responseMs > SIGNAL_CHAT_KEEPALIVE_LOG_AFTER_MS) {
+        console.warn(
+          `${logId}: delayed response to Signal keepalive request, response time: ${responseMs}ms`
+        );
+      }
+      schedule();
+    } catch (error) {
+      fail({
+        error: errorToLogString(error),
+        responseMs: now() - sentAt,
+      });
+    }
+  };
+
+  schedule();
+
+  return { stop };
 }
 
 function createConcurrencyLimiter(
@@ -503,10 +768,47 @@ const limitAttachmentDownload = createConcurrencyLimiter(
 const limitBackupImport = createConcurrencyLimiter(BACKUP_IMPORT_CONCURRENCY);
 const limitProfileFetch = createConcurrencyLimiter(PROFILE_FETCH_CONCURRENCY);
 
+function getTargetOperationStats(
+  streamSession: MessageStreamSession,
+  operationKey: string
+): TargetOperationStats {
+  streamSession.targetOperationStats ??= new Map();
+  const existing = streamSession.targetOperationStats.get(operationKey);
+  if (existing) {
+    return existing;
+  }
+
+  const next: TargetOperationStats = {
+    activeCount: 0,
+    completedCount: 0,
+    failedCount: 0,
+    queuedCount: 0,
+  };
+  streamSession.targetOperationStats.set(operationKey, next);
+  return next;
+}
+
+function getTargetOperationDiagnostics(
+  streamSession: MessageStreamSession
+): ReadonlyArray<unknown> {
+  return [...(streamSession.targetOperationStats?.entries() ?? [])]
+    .map(([operationKey, stats]) => ({
+      operationKey,
+      ...stats,
+    }))
+    .sort(
+      (left, right) =>
+        (right.lastQueuedAt ?? right.lastStartedAt ?? 0) -
+        (left.lastQueuedAt ?? left.lastStartedAt ?? 0)
+    )
+    .slice(0, 50);
+}
+
 async function runSessionOperation<T>(
   streamSession: MessageStreamSession,
   operationName: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  operationKey?: string
 ): Promise<T> {
   const { sessionId } = streamSession;
   const queueSize = sessionOperationQueueSizes.get(sessionId) ?? 0;
@@ -514,6 +816,15 @@ async function runSessionOperation<T>(
     throw new Error(
       `${operationName}: session operation queue is full for ${sessionId}`
     );
+  }
+
+  const targetStats = operationKey
+    ? getTargetOperationStats(streamSession, operationKey)
+    : undefined;
+  if (targetStats) {
+    targetStats.queuedCount += 1;
+    targetStats.lastOperationName = operationName;
+    targetStats.lastQueuedAt = now();
   }
 
   sessionOperationQueueSizes.set(sessionId, queueSize + 1);
@@ -527,9 +838,31 @@ async function runSessionOperation<T>(
 
   await previous.catch(() => undefined);
 
+  if (targetStats) {
+    targetStats.queuedCount = Math.max(0, targetStats.queuedCount - 1);
+    targetStats.activeCount += 1;
+    targetStats.lastStartedAt = now();
+  }
+
+  let didFail = false;
   try {
     return await operation();
+  } catch (error) {
+    didFail = true;
+    if (targetStats) {
+      targetStats.lastFailure = errorToLogString(error);
+    }
+    throw error;
   } finally {
+    if (targetStats) {
+      targetStats.activeCount = Math.max(0, targetStats.activeCount - 1);
+      if (didFail) {
+        targetStats.failedCount += 1;
+      } else {
+        targetStats.completedCount += 1;
+      }
+      targetStats.lastFinishedAt = now();
+    }
     releaseCurrent?.();
     const nextQueueSize = (sessionOperationQueueSizes.get(sessionId) ?? 1) - 1;
     if (nextQueueSize <= 0) {
@@ -677,52 +1010,280 @@ function acknowledgePersistedStreamEvent(
   persistedStreamEventsByAccount.set(accountKey, nextItems);
 }
 
-function completePendingSignalAck(
-  streamSession: MessageStreamSession,
-  eventId: string,
-  statusCode: number
-): boolean {
-  const pending = streamSession.pendingSignalAcks?.get(eventId);
-  if (!pending) {
-    return false;
-  }
+function getPersistedStreamEventDiagnostics(accountKey: string): unknown {
+  const items = persistedStreamEventsByAccount.get(accountKey) ?? [];
+  const oldest = items.reduce<PersistedStreamEventEntry | undefined>(
+    (result, item) => {
+      if (!result || item.createdAt < result.createdAt) {
+        return item;
+      }
+      return result;
+    },
+    undefined
+  );
+  const newest = items.reduce<PersistedStreamEventEntry | undefined>(
+    (result, item) => {
+      if (!result || item.createdAt > result.createdAt) {
+        return item;
+      }
+      return result;
+    },
+    undefined
+  );
 
-  clearTimeout(pending.timeout);
-  streamSession.pendingSignalAcks?.delete(eventId);
-  pending.complete(statusCode);
-  return true;
+  return {
+    count: items.length,
+    newestCreatedAt: newest?.createdAt,
+    oldestCreatedAt: oldest?.createdAt,
+    oldestAgeMs: oldest ? now() - oldest.createdAt : undefined,
+  };
 }
 
-function registerPendingSignalAck({
-  eventId,
-  sendAck,
-  streamSession,
-}: Readonly<{
-  eventId: string;
-  sendAck: (statusCode: number) => void;
-  streamSession: MessageStreamSession;
-}>): void {
-  streamSession.pendingSignalAcks ??= new Map();
-  if (streamSession.pendingSignalAcks.has(eventId)) {
+function getStreamSessionAci(
+  streamSession: MessageStreamSession
+): string | undefined {
+  return (
+    streamSession.linkedPayload?.credentials?.aci ??
+    streamSession.linkedPayload?.account.aci
+  );
+}
+
+function getProvisioningSessionAci(
+  session: ProvisioningSession
+): string | undefined {
+  return (
+    session.linkedPayload?.credentials?.aci ??
+    session.linkedPayload?.account.aci
+  );
+}
+
+function getActiveStreamSessions(): Array<MessageStreamSession> {
+  return [...streamSessions.values()].filter(
+    streamSession => streamSession.status === 'open'
+  );
+}
+
+function getActiveStreamAcis(): Set<string> {
+  const activeAcis = new Set<string>();
+  for (const streamSession of getActiveStreamSessions()) {
+    const aci = getStreamSessionAci(streamSession);
+    if (aci) {
+      activeAcis.add(aci);
+    }
+  }
+  return activeAcis;
+}
+
+function getProtectedStreamAcis(timestamp: number): Set<string> {
+  const protectedAcis = getActiveStreamAcis();
+  for (const [aci, expiresAt] of recentlyClosedStreamAcis) {
+    if (expiresAt <= timestamp) {
+      recentlyClosedStreamAcis.delete(aci);
+      continue;
+    }
+    protectedAcis.add(aci);
+  }
+  return protectedAcis;
+}
+
+function getActiveStreamUsernames(): Set<string> {
+  return new Set(
+    getActiveStreamSessions().map(streamSession => streamSession.username)
+  );
+}
+
+function getActiveStreamAccountKeys(): Set<string> {
+  const accountKeys = new Set<string>();
+  for (const streamSession of getActiveStreamSessions()) {
+    accountKeys.add(
+      getStreamEventAccountKey(
+        streamSession.linkedPayload,
+        streamSession.username
+      )
+    );
+  }
+  return accountKeys;
+}
+
+function rememberRecentlyClosedStreamAci(
+  streamSession: MessageStreamSession
+): void {
+  if (!Number.isFinite(STREAM_CLOSED_SESSION_TTL_MS)) {
     return;
   }
-
-  const timeout = setTimeout(() => {
-    completePendingSignalAck(streamSession, eventId, 500);
-  }, SIGNAL_ACK_WAIT_FOR_BROWSER_MS);
-  streamSession.pendingSignalAcks.set(eventId, {
-    complete: sendAck,
-    timeout,
-  });
+  const aci = getStreamSessionAci(streamSession);
+  if (!aci) {
+    return;
+  }
+  recentlyClosedStreamAcis.set(
+    aci,
+    Math.max(
+      recentlyClosedStreamAcis.get(aci) ?? 0,
+      now() + STREAM_CLOSED_SESSION_TTL_MS
+    )
+  );
 }
 
-function flushPendingSignalAcks(
-  streamSession: MessageStreamSession,
-  statusCode: number
+function disposeStreamSession(
+  sessionId: string,
+  streamSession: MessageStreamSession
 ): void {
-  const pendingIds = [...(streamSession.pendingSignalAcks?.keys() ?? [])];
-  for (const eventId of pendingIds) {
-    completePendingSignalAck(streamSession, eventId, statusCode);
+  if (streamSession.closeStream) {
+    streamSession.closeStream();
+  } else {
+    rememberRecentlyClosedStreamAci(streamSession);
+    if (streamSession.protocolStateEmitTimer) {
+      clearTimeout(streamSession.protocolStateEmitTimer);
+      streamSession.protocolStateEmitTimer = undefined;
+    }
+    streamSession.signalKeepalive?.stop();
+    streamSession.signalKeepalive = undefined;
+    streamSession.backupUnauthKeepalive?.stop();
+    streamSession.backupUnauthKeepalive = undefined;
+    void streamSession.disconnect().catch(() => undefined);
+    void streamSession.backupUnauthConnection
+      ?.disconnect()
+      .catch(() => undefined);
+    void cleanupAttachmentTmpDir(streamSession).catch(() => undefined);
+    streamSessions.delete(sessionId);
+  }
+  sessionOperationQueues.delete(sessionId);
+  sessionOperationQueueSizes.delete(sessionId);
+}
+
+function cleanupProvisioningSessions(timestamp: number): number {
+  if (!Number.isFinite(PROVISIONING_SESSION_TTL_MS)) {
+    return 0;
+  }
+
+  const activeAcis = getActiveStreamAcis();
+  const activeUsernames = getActiveStreamUsernames();
+  let removed = 0;
+  for (const [sessionId, session] of sessions) {
+    const sessionAci = getProvisioningSessionAci(session);
+    const sessionUsername = session.linkedPayload?.credentials.username;
+    const isBackedByActiveStream =
+      (sessionAci != null && activeAcis.has(sessionAci)) ||
+      (sessionUsername != null && activeUsernames.has(sessionUsername));
+    if (isBackedByActiveStream) {
+      continue;
+    }
+    if (timestamp - session.updatedAt <= PROVISIONING_SESSION_TTL_MS) {
+      continue;
+    }
+
+    void session.disconnect?.().catch(() => undefined);
+    sessions.delete(sessionId);
+    removed += 1;
+  }
+  return removed;
+}
+
+function cleanupStreamSessions(timestamp: number): number {
+  let removed = 0;
+  for (const [sessionId, streamSession] of streamSessions) {
+    if (streamSession.status === 'open') {
+      continue;
+    }
+
+    const ttl =
+      streamSession.status === 'connecting'
+        ? STREAM_CONNECTING_SESSION_TTL_MS
+        : STREAM_CLOSED_SESSION_TTL_MS;
+    if (Number.isFinite(ttl) && timestamp - streamSession.updatedAt <= ttl) {
+      continue;
+    }
+
+    disposeStreamSession(sessionId, streamSession);
+    removed += 1;
+  }
+  return removed;
+}
+
+function cleanupPersistedStreamEvents(timestamp: number): number {
+  if (!Number.isFinite(MAX_PERSISTED_STREAM_EVENT_AGE)) {
+    return 0;
+  }
+
+  const activeAccountKeys = getActiveStreamAccountKeys();
+  const cutoff = timestamp - MAX_PERSISTED_STREAM_EVENT_AGE;
+  let removed = 0;
+  for (const [accountKey, items] of persistedStreamEventsByAccount) {
+    const nextItems = items
+      .filter(item => item.createdAt >= cutoff)
+      .slice(-MAX_PERSISTED_STREAM_EVENTS_PER_ACCOUNT);
+    if (nextItems.length === 0) {
+      persistedStreamEventsByAccount.delete(accountKey);
+      removed += items.length;
+      continue;
+    }
+
+    const newestCreatedAt = nextItems.reduce(
+      (result, item) => Math.max(result, item.createdAt),
+      0
+    );
+    if (!activeAccountKeys.has(accountKey) && newestCreatedAt < cutoff) {
+      persistedStreamEventsByAccount.delete(accountKey);
+      removed += items.length;
+      continue;
+    }
+
+    if (nextItems.length !== items.length) {
+      persistedStreamEventsByAccount.set(accountKey, nextItems);
+      removed += items.length - nextItems.length;
+    }
+  }
+  return removed;
+}
+
+function cleanupTransferArchiveCooldowns(timestamp: number): number {
+  let removed = 0;
+  for (const [
+    accountKey,
+    cooldownUntil,
+  ] of transferArchiveCooldownUntilByAccount) {
+    if (cooldownUntil <= timestamp) {
+      transferArchiveCooldownUntilByAccount.delete(accountKey);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+function cleanupRuntimeState(reason: string): void {
+  const timestamp = now();
+  const removedProvisioningSessions = cleanupProvisioningSessions(timestamp);
+  const removedStreamSessions = cleanupStreamSessions(timestamp);
+  const removedPersistedStreamEvents = cleanupPersistedStreamEvents(timestamp);
+  const removedTransferArchiveCooldowns =
+    cleanupTransferArchiveCooldowns(timestamp);
+  const signalCleanup = cleanupWebSignalSendRuntimeState({
+    activeAcis: getProtectedStreamAcis(timestamp),
+    nowMs: timestamp,
+  });
+
+  const removedSignalItems = Object.values(signalCleanup).reduce(
+    (total, value) => total + value,
+    0
+  );
+  const removedCount =
+    removedProvisioningSessions +
+    removedStreamSessions +
+    removedPersistedStreamEvents +
+    removedTransferArchiveCooldowns +
+    removedSignalItems;
+  if (removedCount > 0) {
+    console.info(
+      'Signal Web runtime cleanup',
+      JSON.stringify({
+        reason,
+        removedPersistedStreamEvents,
+        removedProvisioningSessions,
+        removedStreamSessions,
+        removedTransferArchiveCooldowns,
+        signalCleanup,
+      })
+    );
   }
 }
 
@@ -771,11 +1332,27 @@ function queueDecryptionErrorRetry({
       }
 
       try {
+        const envelopeForRetry = Proto.Envelope.decode(envelope);
+        const retrySourceServiceId = fromServiceIdBinaryOrString(
+          envelopeForRetry.sourceServiceIdBinary,
+          envelopeForRetry.sourceServiceId,
+          'sendDecryptionErrorRetry.sourceServiceId'
+        );
+        const retryConversation = retrySourceServiceId
+          ? streamSession.conversationLookup?.[retrySourceServiceId]
+          : undefined;
+        const retryAccessKey = retryConversation
+          ? getDirectSendAccessKey(retryConversation)
+          : undefined;
         const retryResult = await sendDecryptionErrorMessage({
+          accessKey: retryAccessKey,
           chat: connection,
           envelopeBytes: envelope,
           linkedPayload: activeLinkedPayload,
           receivedAt: timestamp,
+          unauthChat: retryAccessKey
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined,
         });
         streamSession.lastDecryptionErrorRetry = retryResult;
         streamSession.lastDecryptionErrorRetryError = undefined;
@@ -873,12 +1450,13 @@ async function kickOffProfileFetches({
             return;
           }
           streamSession.updatedAt = now();
+          const nextConversation = mergeStreamConversation(streamSession, {
+            ...conversation,
+            ...profile,
+          });
           writeEvent({
             type: 'conversation',
-            conversation: {
-              ...conversation,
-              ...profile,
-            },
+            conversation: nextConversation,
           });
         } catch (error) {
           console.warn('kickOffProfileFetches: failed to fetch profile', {
@@ -969,13 +1547,18 @@ function flushProtocolState(streamSession: MessageStreamSession): void {
     streamSession.protocolStateEmitTimer = undefined;
   }
   const protocol = streamSession.pendingProtocolState;
+  const protocolRevision = streamSession.pendingProtocolStateRevision;
   if (!protocol || !streamSession.writeEvent) {
     return;
   }
   streamSession.pendingProtocolState = undefined;
+  streamSession.pendingProtocolStateRevision = undefined;
   streamSession.writeEvent({
     type: 'protocol-state',
     protocol,
+    protocolRevision:
+      protocolRevision ?? streamSession.protocolStateRevision ?? 0,
+    sessionId: streamSession.sessionId,
   });
 }
 
@@ -987,11 +1570,14 @@ function emitProtocolState(
     return;
   }
   const protocol = exportProtocolState(streamSession.linkedPayload);
+  const protocolRevision = (streamSession.protocolStateRevision ?? 0) + 1;
   streamSession.linkedPayload = {
     ...streamSession.linkedPayload,
     protocol,
   };
+  streamSession.protocolStateRevision = protocolRevision;
   streamSession.pendingProtocolState = protocol;
+  streamSession.pendingProtocolStateRevision = protocolRevision;
 
   if (options.immediate || PROTOCOL_STATE_EMIT_DEBOUNCE_MS <= 0) {
     flushProtocolState(streamSession);
@@ -1548,7 +2134,10 @@ type WebHttpErrorInfo = Readonly<{
   status: number;
 }>;
 
-function getNumericErrorProperty(error: Error, key: string): number | undefined {
+function getNumericErrorProperty(
+  error: Error,
+  key: string
+): number | undefined {
   const value = (error as Error & Record<string, unknown>)[key];
   return typeof value === 'number' && Number.isFinite(value)
     ? value
@@ -1665,7 +2254,9 @@ function rememberSendFailure(
     streamSession.sendChallenge = {
       token: typeof body.token === 'string' ? body.token : undefined,
       options: Array.isArray(body.options)
-        ? body.options.filter((item): item is string => typeof item === 'string')
+        ? body.options.filter(
+            (item): item is string => typeof item === 'string'
+          )
         : undefined,
     };
   }
@@ -1680,7 +2271,10 @@ function rememberSendSuccess(streamSession: MessageStreamSession): void {
 }
 
 function assertSendAllowed(streamSession: MessageStreamSession): void {
-  if (!streamSession.sendBlockedUntil || streamSession.sendBlockedUntil <= now()) {
+  if (
+    !streamSession.sendBlockedUntil ||
+    streamSession.sendBlockedUntil <= now()
+  ) {
     streamSession.sendBlockedUntil = undefined;
     streamSession.sendBlockedStatus = undefined;
     streamSession.sendBlockedReason = undefined;
@@ -1689,10 +2283,13 @@ function assertSendAllowed(streamSession: MessageStreamSession): void {
   }
 
   const retryAfterMs = streamSession.sendBlockedUntil - now();
-  throw Object.assign(new Error(streamSession.sendBlockedReason ?? 'Send is rate limited'), {
-    retryAfterMs,
-    status: streamSession.sendBlockedStatus ?? 429,
-  });
+  throw Object.assign(
+    new Error(streamSession.sendBlockedReason ?? 'Send is rate limited'),
+    {
+      retryAfterMs,
+      status: streamSession.sendBlockedStatus ?? 429,
+    }
+  );
 }
 
 function getProtocolStateFromStreamBody(
@@ -2468,6 +3065,11 @@ type ProfileWriteRequestBody = Readonly<{
   timestamp?: number;
 }>;
 
+type PhoneNumberDiscoverabilityRequestBody = Readonly<{
+  discoverable: boolean;
+  sessionId?: string;
+}>;
+
 type ProfileRequestData = Readonly<{
   about: string | null;
   aboutEmoji: string | null;
@@ -2913,12 +3515,39 @@ async function getBackupUnauthConnection(
   const connection = await net.connectUnauthenticatedChat(
     {
       onConnectionInterrupted() {
+        streamSession.backupUnauthKeepalive?.stop();
+        streamSession.backupUnauthKeepalive = undefined;
         streamSession.backupUnauthConnection = undefined;
       },
     },
     { languages: ['zh-CN', 'en-US'] }
   );
   streamSession.backupUnauthConnection = connection;
+  streamSession.backupUnauthKeepalive?.stop();
+  streamSession.backupUnauthKeepalive = startSignalChatKeepalive({
+    connection,
+    logId: `WebMessageStream(${streamSession.sessionId}).backupUnauthKeepalive`,
+    onFailure: ({ error, responseMs, status }) => {
+      streamSession.backupUnauthKeepaliveFailureCount =
+        (streamSession.backupUnauthKeepaliveFailureCount ?? 0) + 1;
+      streamSession.lastBackupUnauthKeepaliveError = error;
+      streamSession.lastBackupUnauthKeepaliveResponseMs = responseMs;
+      streamSession.lastBackupUnauthKeepaliveStatus = status;
+      streamSession.updatedAt = now();
+      streamSession.backupUnauthConnection = undefined;
+      streamSession.backupUnauthKeepalive = undefined;
+      void connection.disconnect().catch(() => undefined);
+    },
+    onSuccess: ({ responseMs, status, timestamp }) => {
+      streamSession.backupUnauthKeepaliveCount =
+        (streamSession.backupUnauthKeepaliveCount ?? 0) + 1;
+      streamSession.lastBackupUnauthKeepaliveAt = timestamp;
+      streamSession.lastBackupUnauthKeepaliveError = undefined;
+      streamSession.lastBackupUnauthKeepaliveResponseMs = responseMs;
+      streamSession.lastBackupUnauthKeepaliveStatus = status;
+      streamSession.updatedAt = now();
+    },
+  });
   return connection;
 }
 
@@ -3358,6 +3987,12 @@ async function importBackupForMessageStream({
         linkedPayload,
       }));
     }
+    mergeStreamConversations(streamSession, [
+      ...contactsBootstrap.conversations,
+      ...contactsBootstrap.archived,
+      ...contactsBootstrap.pinned,
+      ...Object.values(chatShell.conversationLookup),
+    ]);
     writeEvent({ type: 'contacts-bootstrap', data: contactsBootstrap });
     writeEvent({ type: 'chat-shell', state: chatShell });
     writeEvent({
@@ -3500,13 +4135,7 @@ async function handleMessageStream(
     if (existingSession.username === username) {
       existingSession.status = 'closed';
       existingSession.updatedAt = now();
-      if (existingSession.closeStream) {
-        existingSession.closeStream();
-      } else {
-        void existingSession.disconnect().catch(() => undefined);
-        void cleanupAttachmentTmpDir(existingSession).catch(() => undefined);
-        streamSessions.delete(existingSessionId);
-      }
+      disposeStreamSession(existingSessionId, existingSession);
     }
   }
 
@@ -3516,6 +4145,8 @@ async function handleMessageStream(
     updatedAt: now(),
     username,
     status: 'connecting',
+    lastStreamStartedAt: now(),
+    lastTransportStatusAt: now(),
     backupImportStatus: 'idle',
     incomingEnvelopeCount: 0,
     decodedMessageCount: 0,
@@ -3532,8 +4163,15 @@ async function handleMessageStream(
         clearInterval(heartbeat);
         heartbeat = undefined;
       }
+      streamSession.signalKeepalive?.stop();
+      streamSession.signalKeepalive = undefined;
+      streamSession.backupUnauthKeepalive?.stop();
+      streamSession.backupUnauthKeepalive = undefined;
       flushProtocolState(streamSession);
-      flushPendingSignalAcks(streamSession, 500);
+      streamSession.lastStreamEndedAt = now();
+      streamSession.streamCloseCount =
+        (streamSession.streamCloseCount ?? 0) + 1;
+      rememberRecentlyClosedStreamAci(streamSession);
       abortController.abort();
       void connection?.disconnect().catch(() => undefined);
       void streamSession.backupUnauthConnection
@@ -3541,6 +4179,9 @@ async function handleMessageStream(
         .catch(() => undefined);
       void cleanupAttachmentTmpDir(streamSession).catch(() => undefined);
       streamSessions.delete(sessionId);
+      sessionOperationQueues.delete(sessionId);
+      sessionOperationQueueSizes.delete(sessionId);
+      cleanupRuntimeState('stream-close');
       if (!res.destroyed && !res.writableEnded) {
         res.end();
       }
@@ -3555,8 +4196,9 @@ async function handleMessageStream(
   sendCors(req, res);
   res.writeHead(200, {
     'Content-Type': 'application/x-ndjson; charset=utf-8',
-    'Cache-Control': 'no-store',
+    'Cache-Control': 'no-store, no-transform',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
 
   const writeEvent = (event: unknown) => {
@@ -3644,259 +4286,269 @@ async function handleMessageStream(
           const currentReceive = previousReceive
             .catch(() => undefined)
             .then(async () => {
-          const signalAckState: { registeredEventId?: string } = {};
-          const writePersistedEnvelopeEvent = (event: MessageStreamEvent) => {
-            const persistedEvent = persistStreamEvent(
-              streamEventAccountKey,
-              event
-            );
-            writeEvent(persistedEvent);
-            if (
-              !signalAckState.registeredEventId &&
-              persistedEvent.streamEventId
-            ) {
-              signalAckState.registeredEventId = persistedEvent.streamEventId;
-              registerPendingSignalAck({
-                eventId: persistedEvent.streamEventId,
-                sendAck,
-                streamSession,
-              });
-            }
-          };
-          const activeLinkedPayload = streamSession.linkedPayload;
-          if (!activeLinkedPayload) {
-            streamSession.lastReceiveError =
-              'decryptIncomingSignalEnvelope: missing linked payload';
-            writeEvent({
-              type: 'error',
-              error: streamSession.lastReceiveError,
-              timestamp,
-              envelopeSize: envelope.byteLength,
-            });
-            sendAck(500);
-            return;
-          }
-          await decryptIncomingSignalEnvelope({
-            chat: connection,
-            envelopeBytes: envelope,
-            linkedPayload: activeLinkedPayload,
-          })
-            .then(
-              async ({
-                contentSummary,
-                ignoredReason,
-                message,
-                pinMessage,
-                reaction,
-                editMessage,
-                deleteMessage,
-                unpinMessage,
-                attachmentBackfill,
-                receipt,
-                typing,
-                pollVote,
-                pollTerminate,
-                retryRequest,
-                storageManifestFetchLatest,
-              }) => {
-                streamSession.lastReceiveError = undefined;
-                streamSession.updatedAt = now();
-                emitProtocolState(streamSession);
-                if (retryRequest) {
-                  streamSession.retryRequestCount =
-                    (streamSession.retryRequestCount ?? 0) + 1;
-                  if (retryRequest.resent) {
-                    streamSession.retryRequestResentCount =
-                      (streamSession.retryRequestResentCount ?? 0) + 1;
-                  }
-                  streamSession.lastRetryRequestSummary = retryRequest;
-                  streamSession.lastRetryRequestError = retryRequest.error;
-                  emitProtocolState(streamSession);
-                }
-                let conversation: WebConversation | undefined;
-                let outputMessage = message;
-                if (message?.groupV2 && connection) {
-                  try {
-                    conversation = await enrichConversationForGroupMessage({
-                      connection,
-                      linkedPayload: activeLinkedPayload,
-                      message,
-                    });
-                    outputMessage = maybeConvertInitialGroupMessageToChange({
-                      conversation,
-                      linkedPayload: activeLinkedPayload,
-                      message,
-                    });
-                  } catch (error) {
-                    console.warn(
-                      'message stream failed to enrich group conversation',
-                      error
-                    );
-                  }
-                }
-                if (outputMessage) {
-                  streamSession.decodedMessageCount += 1;
-                  streamSession.lastDecodedMessageSummary = {
-                    id: outputMessage.id,
-                    conversationId: outputMessage.conversationId,
-                    direction: outputMessage.direction,
-                    timestamp: outputMessage.timestamp,
-                    bodyLength: outputMessage.body?.length ?? 0,
-                    sourceServiceId: outputMessage.sourceServiceId,
-                  };
-                  if (conversation) {
-                    writePersistedEnvelopeEvent({
-                      type: 'conversation',
-                      conversation,
-                    });
-                  }
-                  writePersistedEnvelopeEvent({
-                    type: 'message',
-                    message: outputMessage,
-                  });
-                }
-                if (pinMessage) {
-                  writePersistedEnvelopeEvent(pinMessage);
-                }
-                if (reaction) {
-                  writePersistedEnvelopeEvent(reaction);
-                }
-                if (editMessage) {
-                  writePersistedEnvelopeEvent(editMessage);
-                }
-                if (deleteMessage) {
-                  writePersistedEnvelopeEvent(deleteMessage);
-                }
-                if (unpinMessage) {
-                  writePersistedEnvelopeEvent(unpinMessage);
-                }
-                if (attachmentBackfill) {
-                  streamSession.attachmentBackfillEventCount =
-                    (streamSession.attachmentBackfillEventCount ?? 0) + 1;
-                  streamSession.lastAttachmentBackfillSummary = {
-                    conversationId: attachmentBackfill.conversationId,
-                    targetAuthorAci: attachmentBackfill.targetAuthorAci,
-                    targetSentTimestamp: attachmentBackfill.targetSentTimestamp,
-                    attachmentCount:
-                      attachmentBackfill.attachments?.length ?? 0,
-                    attachmentStates: attachmentBackfill.attachments?.map(
-                      item => {
-                        if ('status' in item) {
-                          return { status: item.status };
-                        }
-                        return {
-                          contentType: item.attachment.contentType,
-                          cdnId: item.attachment.cdnId,
-                          cdnKey: item.attachment.cdnKey,
-                          cdnNumber: item.attachment.cdnNumber,
-                          size: item.attachment.size,
-                          flags: item.attachment.flags,
-                        };
-                      }
-                    ),
-                    error: attachmentBackfill.error,
-                    timestamp: attachmentBackfill.timestamp,
-                  };
-                  writePersistedEnvelopeEvent(attachmentBackfill);
-                }
-                if (receipt) {
-                  writePersistedEnvelopeEvent(receipt);
-                }
-                if (typing) {
-                  writePersistedEnvelopeEvent(typing);
-                }
-                if (pollVote) {
-                  writePersistedEnvelopeEvent(pollVote);
-                }
-                if (pollTerminate) {
-                  writePersistedEnvelopeEvent(pollTerminate);
-                }
-                if (storageManifestFetchLatest && connection) {
-                  void syncStorageContacts({
-                    allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-                    chat: connection,
-                    cdnUrl: getDefaultCdnUrl(),
-                    linkedPayload: activeLinkedPayload,
-                    storageUrl: productionConfig.storageUrl,
-                  })
-                    .then(syncResult => {
-                      streamSession.updatedAt = now();
-                      writePersistedEvent({
-                        type: 'contacts-bootstrap',
-                        data: syncResult.contactsBootstrap,
-                      });
-                      void kickOffProfileFetches({
-                        streamSession,
-                        syncResult,
-                        writeEvent: writePersistedEvent,
-                      });
-                    })
-                    .catch(error => {
-                      streamSession.lastReceiveError = errorToLogString(error);
-                      streamSession.updatedAt = now();
-                      writeEvent({
-                        type: 'error',
-                        error: streamSession.lastReceiveError,
-                        timestamp,
-                        envelopeSize: envelope.byteLength,
-                      });
-                    });
-                }
-                const hasModifierEvent = Boolean(
-                  pinMessage ||
-                  reaction ||
-                  editMessage ||
-                  deleteMessage ||
-                  unpinMessage ||
-                  attachmentBackfill ||
-                  receipt ||
-                  typing ||
-                  pollVote ||
-                  pollTerminate ||
-                  retryRequest ||
-                  storageManifestFetchLatest
+              const writePersistedEnvelopeEvent = (
+                event: MessageStreamEvent
+              ) => {
+                const persistedEvent = persistStreamEvent(
+                  streamEventAccountKey,
+                  event
                 );
-                if (!message && !hasModifierEvent) {
-                  streamSession.ignoredEnvelopeCount += 1;
-                  streamSession.lastIgnoredEnvelopeReason =
-                    ignoredReason ??
-                    'Decrypted content did not contain a supported message, edit, delete, pin, reaction, receipt, typing, or sent sync message';
-                  streamSession.lastIgnoredContentSummary = contentSummary;
-                } else {
-                  streamSession.decodedMessageCount +=
-                    hasModifierEvent && !message ? 1 : 0;
-                }
-                if (!signalAckState.registeredEventId) {
-                  sendAck(200);
-                }
-              }
-            )
-            .catch(async error => {
-              if (
-                LibSignalErrorBase.is(
-                  error,
-                  LibSignalErrorCode.DuplicatedMessage
-                )
-              ) {
-                streamSession.ignoredEnvelopeCount += 1;
-                streamSession.lastIgnoredEnvelopeReason =
-                  errorToLogString(error);
-                streamSession.updatedAt = now();
-                sendAck(200);
+                writeEvent(persistedEvent);
+              };
+              const activeLinkedPayload = streamSession.linkedPayload;
+              if (!activeLinkedPayload) {
+                streamSession.lastReceiveError =
+                  'decryptIncomingSignalEnvelope: missing linked payload';
+                writeEvent({
+                  type: 'error',
+                  error: streamSession.lastReceiveError,
+                  timestamp,
+                  envelopeSize: envelope.byteLength,
+                });
+                sendAck(500);
                 return;
               }
-              streamSession.lastReceiveError = errorToLogString(error);
-              streamSession.updatedAt = now();
-              queueDecryptionErrorRetry({
-                activeLinkedPayload,
-                connection,
-                envelope,
-                sendAck,
-                streamSession,
-                timestamp,
-                writeEvent,
-              });
-            });
+              await decryptIncomingSignalEnvelope({
+                chat: connection,
+                envelopeBytes: envelope,
+                getDirectSendAuth: async serviceId => {
+                  const conversation =
+                    streamSession.conversationLookup?.[serviceId];
+                  const accessKey = conversation
+                    ? getDirectSendAccessKey(conversation)
+                    : undefined;
+                  return {
+                    accessKey,
+                    unauthChat: accessKey
+                      ? await getBackupUnauthConnection(streamSession)
+                      : undefined,
+                  };
+                },
+                linkedPayload: activeLinkedPayload,
+              })
+                .then(
+                  async ({
+                    contentSummary,
+                    ignoredReason,
+                    message,
+                    pinMessage,
+                    reaction,
+                    editMessage,
+                    deleteMessage,
+                    unpinMessage,
+                    attachmentBackfill,
+                    receipt,
+                    typing,
+                    pollVote,
+                    pollTerminate,
+                    retryRequest,
+                    storageManifestFetchLatest,
+                  }) => {
+                    streamSession.lastReceiveError = undefined;
+                    streamSession.updatedAt = now();
+                    emitProtocolState(streamSession);
+                    if (retryRequest) {
+                      streamSession.retryRequestCount =
+                        (streamSession.retryRequestCount ?? 0) + 1;
+                      if (retryRequest.resent) {
+                        streamSession.retryRequestResentCount =
+                          (streamSession.retryRequestResentCount ?? 0) + 1;
+                      }
+                      streamSession.lastRetryRequestSummary = retryRequest;
+                      streamSession.lastRetryRequestError = retryRequest.error;
+                      emitProtocolState(streamSession);
+                    }
+                    let conversation: WebConversation | undefined;
+                    let outputMessage = message;
+                    if (message?.groupV2 && connection) {
+                      try {
+                        conversation = await enrichConversationForGroupMessage({
+                          connection,
+                          linkedPayload: activeLinkedPayload,
+                          message,
+                        });
+                        outputMessage = maybeConvertInitialGroupMessageToChange(
+                          {
+                            conversation,
+                            linkedPayload: activeLinkedPayload,
+                            message,
+                          }
+                        );
+                      } catch (error) {
+                        console.warn(
+                          'message stream failed to enrich group conversation',
+                          error
+                        );
+                      }
+                    }
+                    if (outputMessage) {
+                      streamSession.decodedMessageCount += 1;
+                      streamSession.lastDecodedMessageSummary = {
+                        id: outputMessage.id,
+                        conversationId: outputMessage.conversationId,
+                        direction: outputMessage.direction,
+                        timestamp: outputMessage.timestamp,
+                        bodyLength: outputMessage.body?.length ?? 0,
+                        sourceServiceId: outputMessage.sourceServiceId,
+                      };
+                      if (conversation) {
+                        writePersistedEnvelopeEvent({
+                          type: 'conversation',
+                          conversation,
+                        });
+                      }
+                      writePersistedEnvelopeEvent({
+                        type: 'message',
+                        message: outputMessage,
+                      });
+                    }
+                    if (pinMessage) {
+                      writePersistedEnvelopeEvent(pinMessage);
+                    }
+                    if (reaction) {
+                      writePersistedEnvelopeEvent(reaction);
+                    }
+                    if (editMessage) {
+                      writePersistedEnvelopeEvent(editMessage);
+                    }
+                    if (deleteMessage) {
+                      writePersistedEnvelopeEvent(deleteMessage);
+                    }
+                    if (unpinMessage) {
+                      writePersistedEnvelopeEvent(unpinMessage);
+                    }
+                    if (attachmentBackfill) {
+                      streamSession.attachmentBackfillEventCount =
+                        (streamSession.attachmentBackfillEventCount ?? 0) + 1;
+                      streamSession.lastAttachmentBackfillSummary = {
+                        conversationId: attachmentBackfill.conversationId,
+                        targetAuthorAci: attachmentBackfill.targetAuthorAci,
+                        targetSentTimestamp:
+                          attachmentBackfill.targetSentTimestamp,
+                        attachmentCount:
+                          attachmentBackfill.attachments?.length ?? 0,
+                        attachmentStates: attachmentBackfill.attachments?.map(
+                          item => {
+                            if ('status' in item) {
+                              return { status: item.status };
+                            }
+                            return {
+                              contentType: item.attachment.contentType,
+                              cdnId: item.attachment.cdnId,
+                              cdnKey: item.attachment.cdnKey,
+                              cdnNumber: item.attachment.cdnNumber,
+                              size: item.attachment.size,
+                              flags: item.attachment.flags,
+                            };
+                          }
+                        ),
+                        error: attachmentBackfill.error,
+                        timestamp: attachmentBackfill.timestamp,
+                      };
+                      writePersistedEnvelopeEvent(attachmentBackfill);
+                    }
+                    if (receipt) {
+                      writePersistedEnvelopeEvent(receipt);
+                    }
+                    if (typing) {
+                      writePersistedEnvelopeEvent(typing);
+                    }
+                    if (pollVote) {
+                      writePersistedEnvelopeEvent(pollVote);
+                    }
+                    if (pollTerminate) {
+                      writePersistedEnvelopeEvent(pollTerminate);
+                    }
+                    if (storageManifestFetchLatest && connection) {
+                      void syncStorageContacts({
+                        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+                        chat: connection,
+                        cdnUrl: getDefaultCdnUrl(),
+                        linkedPayload: activeLinkedPayload,
+                        storageUrl: productionConfig.storageUrl,
+                      })
+                        .then(syncResult => {
+                          streamSession.updatedAt = now();
+                          mergeStreamConversations(streamSession, [
+                            ...syncResult.contactsBootstrap.conversations,
+                            ...syncResult.contactsBootstrap.archived,
+                            ...syncResult.contactsBootstrap.pinned,
+                          ]);
+                          writePersistedEvent({
+                            type: 'contacts-bootstrap',
+                            data: syncResult.contactsBootstrap,
+                          });
+                          void kickOffProfileFetches({
+                            streamSession,
+                            syncResult,
+                            writeEvent: writePersistedEvent,
+                          });
+                        })
+                        .catch(error => {
+                          streamSession.lastReceiveError =
+                            errorToLogString(error);
+                          streamSession.updatedAt = now();
+                          writeEvent({
+                            type: 'error',
+                            error: streamSession.lastReceiveError,
+                            timestamp,
+                            envelopeSize: envelope.byteLength,
+                          });
+                        });
+                    }
+                    const hasModifierEvent = Boolean(
+                      pinMessage ||
+                      reaction ||
+                      editMessage ||
+                      deleteMessage ||
+                      unpinMessage ||
+                      attachmentBackfill ||
+                      receipt ||
+                      typing ||
+                      pollVote ||
+                      pollTerminate ||
+                      retryRequest ||
+                      storageManifestFetchLatest
+                    );
+                    if (!message && !hasModifierEvent) {
+                      streamSession.ignoredEnvelopeCount += 1;
+                      streamSession.lastIgnoredEnvelopeReason =
+                        ignoredReason ??
+                        'Decrypted content did not contain a supported message, edit, delete, pin, reaction, receipt, typing, or sent sync message';
+                      streamSession.lastIgnoredContentSummary = contentSummary;
+                    } else {
+                      streamSession.decodedMessageCount +=
+                        hasModifierEvent && !message ? 1 : 0;
+                    }
+                    sendAck(200);
+                  }
+                )
+                .catch(async error => {
+                  if (
+                    LibSignalErrorBase.is(
+                      error,
+                      LibSignalErrorCode.DuplicatedMessage
+                    )
+                  ) {
+                    streamSession.ignoredEnvelopeCount += 1;
+                    streamSession.lastIgnoredEnvelopeReason =
+                      errorToLogString(error);
+                    streamSession.updatedAt = now();
+                    sendAck(200);
+                    return;
+                  }
+                  streamSession.lastReceiveError = errorToLogString(error);
+                  streamSession.updatedAt = now();
+                  queueDecryptionErrorRetry({
+                    activeLinkedPayload,
+                    connection,
+                    envelope,
+                    sendAck,
+                    streamSession,
+                    timestamp,
+                    writeEvent,
+                  });
+                });
             });
           const nextReceiveChain = currentReceive.finally(() => {
             if (streamSession.receiveChain === nextReceiveChain) {
@@ -3911,15 +4563,30 @@ async function handleMessageStream(
           streamSession.updatedAt = now();
           writeEvent({ type: 'queue-empty' });
         },
+        onReceivedAlerts(alerts) {
+          streamSession.receivedAlertCount =
+            (streamSession.receivedAlertCount ?? 0) + alerts.length;
+          streamSession.lastReceivedAlerts = alerts;
+          streamSession.lastReceivedAlertsAt = now();
+          streamSession.updatedAt = now();
+          console.warn('Message stream received Signal server alerts', alerts);
+        },
         onConnectionInterrupted(cause) {
           streamSession.status = cause ? 'error' : 'closed';
           streamSession.error = cause ? String(cause) : undefined;
+          streamSession.lastStreamInterruptedAt = now();
+          streamSession.lastTransportError = cause ? String(cause) : undefined;
+          streamSession.lastTransportStatusAt = now();
+          streamSession.transportReconnectHintCount =
+            (streamSession.transportReconnectHintCount ?? 0) + 1;
           streamSession.updatedAt = now();
+          flushProtocolState(streamSession);
           writeEvent({
             type: 'transport-status',
             status: cause ? 'error' : 'closed',
             error: cause ? String(cause) : undefined,
           });
+          streamSession.closeStream?.();
         },
       },
       {
@@ -3928,7 +4595,50 @@ async function handleMessageStream(
       }
     );
     streamSession.connection = connection;
+    streamSession.signalKeepalive?.stop();
+    streamSession.signalKeepalive = startSignalChatKeepalive({
+      connection,
+      logId: `WebMessageStream(${sessionId}).authenticatedKeepalive`,
+      onFailure: ({ error, responseMs, status }) => {
+        if (didCloseStream) {
+          return;
+        }
+        streamSession.signalKeepaliveFailureCount =
+          (streamSession.signalKeepaliveFailureCount ?? 0) + 1;
+        streamSession.lastSignalKeepaliveError = error;
+        streamSession.lastSignalKeepaliveResponseMs = responseMs;
+        streamSession.lastSignalKeepaliveStatus = status;
+        streamSession.lastTransportError = error;
+        streamSession.lastTransportStatusAt = now();
+        streamSession.status = 'error';
+        streamSession.transportReconnectHintCount =
+          (streamSession.transportReconnectHintCount ?? 0) + 1;
+        streamSession.updatedAt = now();
+        flushProtocolState(streamSession);
+        if (!res.destroyed && !res.writableEnded) {
+          writeEvent({
+            type: 'transport-status',
+            status: 'error',
+            error,
+          });
+        }
+        void connection?.disconnect().catch(() => undefined);
+        streamSession.closeStream?.();
+      },
+      onSuccess: ({ responseMs, status, timestamp }) => {
+        streamSession.signalKeepaliveCount =
+          (streamSession.signalKeepaliveCount ?? 0) + 1;
+        streamSession.lastSignalKeepaliveAt = timestamp;
+        streamSession.lastSignalKeepaliveError = undefined;
+        streamSession.lastSignalKeepaliveResponseMs = responseMs;
+        streamSession.lastSignalKeepaliveStatus = status;
+        streamSession.updatedAt = now();
+      },
+    });
     streamSession.status = 'open';
+    streamSession.lastStreamOpenedAt = now();
+    streamSession.lastTransportStatusAt = now();
+    streamSession.streamOpenCount = (streamSession.streamOpenCount ?? 0) + 1;
     streamSession.updatedAt = now();
     writeEvent({ type: 'transport-status', status: 'open' });
     void registerLinkedDeviceCapabilities(connection).catch(error => {
@@ -3982,6 +4692,7 @@ async function handleMessageStream(
       status: 'error',
       error: streamSession.error,
     });
+    streamSession.closeStream?.();
     throw error;
   }
 
@@ -4021,10 +4732,37 @@ async function handleMessageStreamAck(
   }
 
   acknowledgePersistedStreamEvent(accountKey, eventId);
-  if (streamSession) {
-    completePendingSignalAck(streamSession, eventId, 200);
-  }
   sendJson(req, res, 200, { ok: true });
+}
+
+async function handleNetworkChange(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = await readJson(req);
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  libsignalNetInstance?.onNetworkChange();
+
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (streamSession) {
+    streamSession.status = 'closed';
+    streamSession.lastTransportStatusAt = now();
+    streamSession.transportReconnectHintCount =
+      (streamSession.transportReconnectHintCount ?? 0) + 1;
+    streamSession.updatedAt = now();
+    flushProtocolState(streamSession);
+    streamSession.writeEvent?.({
+      type: 'transport-status',
+      status: 'closed',
+    });
+    streamSession.closeStream?.();
+  }
+
+  sendJson(req, res, 200, {
+    ok: true,
+    closedStreamSession: Boolean(streamSession),
+  });
 }
 
 async function handleSendMessage(
@@ -4044,6 +4782,7 @@ async function handleSendMessage(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const accessKey = normalizeDirectAccessKey(body.accessKey);
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const attachments = parseWebAttachments(body.attachments);
   const deleteForEveryone = parseWebDeleteForEveryone(body.deleteForEveryone);
@@ -4079,30 +4818,39 @@ async function handleSendMessage(
   }
 
   try {
-    await runSessionOperation(streamSession, 'handleSendMessage', async () => {
-      assertSendAllowed(streamSession);
-      const resolvedAttachments = await resolveInlineAttachments({
-        attachments,
-        streamSession,
-      });
-      const message = await sendDirectTextMessage({
-        attachments: resolvedAttachments,
-        body: messageBody ?? '',
-        chat: streamSession.connection,
-        deleteForEveryone,
-        destinationServiceId: checkedDestinationServiceId,
-        isViewOnce,
-        linkedPayload: streamSession.linkedPayload,
-        pinMessage,
-        quote,
-        timestamp,
-        unpinMessage,
-      });
-      rememberSendSuccess(streamSession);
-      streamSession.updatedAt = now();
-      emitProtocolState(streamSession, { immediate: true });
-      sendJson(req, res, 200, message);
-    });
+    await runSessionOperation(
+      streamSession,
+      'handleSendMessage',
+      async () => {
+        assertSendAllowed(streamSession);
+        const resolvedAttachments = await resolveInlineAttachments({
+          attachments,
+          streamSession,
+        });
+        const message = await sendDirectTextMessage({
+          accessKey,
+          attachments: resolvedAttachments,
+          body: messageBody ?? '',
+          chat: streamSession.connection,
+          deleteForEveryone,
+          destinationServiceId: checkedDestinationServiceId,
+          isViewOnce,
+          linkedPayload: streamSession.linkedPayload,
+          pinMessage,
+          quote,
+          timestamp,
+          unauthChat: accessKey
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined,
+          unpinMessage,
+        });
+        rememberSendSuccess(streamSession);
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession, { immediate: true });
+        sendJson(req, res, 200, message);
+      },
+      `direct:${checkedDestinationServiceId}`
+    );
   } catch (error) {
     rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
@@ -4167,7 +4915,8 @@ async function handleSubmitMessageChallenge(
       rememberSendSuccess(streamSession);
       streamSession.updatedAt = now();
       sendJson(req, res, 200, { ok: true });
-    }
+    },
+    'account:challenge'
   );
 }
 
@@ -4188,6 +4937,7 @@ async function handleSendExpirationTimer(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const accessKey = normalizeDirectAccessKey(body.accessKey);
   const expireTimer =
     typeof body.expireTimer === 'number' && body.expireTimer > 0
       ? body.expireTimer
@@ -4218,18 +4968,23 @@ async function handleSendExpirationTimer(
       async () => {
         assertSendAllowed(streamSession);
         const message = await sendDirectExpirationTimerUpdate({
+          accessKey,
           chat: streamSession.connection,
           destinationServiceId,
           expireTimer,
           expireTimerVersion,
           linkedPayload: streamSession.linkedPayload,
           timestamp,
+          unauthChat: accessKey
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined,
         });
         rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, message);
-      }
+      },
+      `direct:${destinationServiceId}`
     );
   } catch (error) {
     rememberSendFailure(streamSession, error);
@@ -4673,6 +5428,7 @@ async function handleSendReaction(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const accessKey = normalizeDirectAccessKey(body.accessKey);
   const groupId = typeof body.groupId === 'string' ? body.groupId : undefined;
   const rawGroupV2 =
     body.groupV2 && typeof body.groupV2 === 'object'
@@ -4733,43 +5489,52 @@ async function handleSendReaction(
   }
 
   try {
-    await runSessionOperation(streamSession, 'handleSendReaction', async () => {
-      assertSendAllowed(streamSession);
-      if (groupId && groupV2) {
-        const unauthChat = groupSendEndorsements
-          ? await getBackupUnauthConnection(streamSession)
-          : undefined;
-        await sendGroupReaction({
-          chat: streamSession.connection,
-          emoji,
-          groupId,
-          groupV2,
-          groupSendEndorsements,
-          linkedPayload: streamSession.linkedPayload,
-          recipients,
-          remove,
-          targetAuthorAci,
-          targetTimestamp,
-          timestamp,
-          unauthChat,
-        });
-      } else if (destinationServiceId) {
-        await sendDirectReaction({
-          chat: streamSession.connection,
-          destinationServiceId,
-          emoji,
-          linkedPayload: streamSession.linkedPayload,
-          remove,
-          targetAuthorAci,
-          targetTimestamp,
-          timestamp,
-        });
-      }
-      rememberSendSuccess(streamSession);
-      streamSession.updatedAt = now();
-      emitProtocolState(streamSession, { immediate: true });
-      sendJson(req, res, 200, { ok: true, timestamp });
-    });
+    await runSessionOperation(
+      streamSession,
+      'handleSendReaction',
+      async () => {
+        assertSendAllowed(streamSession);
+        if (groupId && groupV2) {
+          const unauthChat = groupSendEndorsements
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined;
+          await sendGroupReaction({
+            chat: streamSession.connection,
+            emoji,
+            groupId,
+            groupV2,
+            groupSendEndorsements,
+            linkedPayload: streamSession.linkedPayload,
+            recipients,
+            remove,
+            targetAuthorAci,
+            targetTimestamp,
+            timestamp,
+            unauthChat,
+          });
+        } else if (destinationServiceId) {
+          await sendDirectReaction({
+            accessKey,
+            chat: streamSession.connection,
+            destinationServiceId,
+            emoji,
+            linkedPayload: streamSession.linkedPayload,
+            remove,
+            targetAuthorAci,
+            targetTimestamp,
+            timestamp,
+            unauthChat: accessKey
+              ? await getBackupUnauthConnection(streamSession)
+              : undefined,
+          });
+        }
+        rememberSendSuccess(streamSession);
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession, { immediate: true });
+        sendJson(req, res, 200, { ok: true, timestamp });
+      },
+      groupId ? `group:${groupId}` : `direct:${destinationServiceId}`
+    );
   } catch (error) {
     rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
@@ -5003,7 +5768,8 @@ async function handleAttachmentBackfillRequest(
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
-      }
+      },
+      `${conversationType}:${conversationId}`
     );
   } catch (error) {
     rememberSendFailure(streamSession, error);
@@ -5030,6 +5796,7 @@ async function handleSendEdit(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const accessKey = normalizeDirectAccessKey(body.accessKey);
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const targetTimestamp =
     typeof body.targetTimestamp === 'number' ? body.targetTimestamp : undefined;
@@ -5052,21 +5819,30 @@ async function handleSendEdit(
   }
 
   try {
-    await runSessionOperation(streamSession, 'handleSendEdit', async () => {
-      assertSendAllowed(streamSession);
-      const result = await sendDirectEditMessage({
-        body: messageBody,
-        chat: streamSession.connection,
-        destinationServiceId,
-        linkedPayload: streamSession.linkedPayload,
-        targetTimestamp,
-        timestamp,
-      });
-      rememberSendSuccess(streamSession);
-      streamSession.updatedAt = now();
-      emitProtocolState(streamSession, { immediate: true });
-      sendJson(req, res, 200, result);
-    });
+    await runSessionOperation(
+      streamSession,
+      'handleSendEdit',
+      async () => {
+        assertSendAllowed(streamSession);
+        const result = await sendDirectEditMessage({
+          accessKey,
+          body: messageBody,
+          chat: streamSession.connection,
+          destinationServiceId,
+          linkedPayload: streamSession.linkedPayload,
+          targetTimestamp,
+          timestamp,
+          unauthChat: accessKey
+            ? await getBackupUnauthConnection(streamSession)
+            : undefined,
+        });
+        rememberSendSuccess(streamSession);
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession, { immediate: true });
+        sendJson(req, res, 200, result);
+      },
+      `direct:${destinationServiceId}`
+    );
   } catch (error) {
     rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
@@ -5180,7 +5956,8 @@ async function handleSendGroupMessage(
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, message);
-      }
+      },
+      `group:${groupId}`
     );
   } catch (error) {
     rememberSendFailure(streamSession, error);
@@ -5383,59 +6160,64 @@ async function handleCreateGroup(
   streamSession.updatedAt = now();
 
   try {
-    await runSessionOperation(streamSession, 'handleCreateGroup', async () => {
-      assertSendAllowed(streamSession);
-      const group = await createGroupConversation({
-        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-        avatar,
-        cdnUrl: getDefaultCdnUrl(),
-        chat: streamSession.connection,
-        conversationIds,
-        conversations,
-        expireTimer,
-        linkedPayload: streamSession.linkedPayload,
-        name,
-        storageUrl: productionConfig.storageUrl,
-      });
+    await runSessionOperation(
+      streamSession,
+      'handleCreateGroup',
+      async () => {
+        assertSendAllowed(streamSession);
+        const group = await createGroupConversation({
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          avatar,
+          cdnUrl: getDefaultCdnUrl(),
+          chat: streamSession.connection,
+          conversationIds,
+          conversations,
+          expireTimer,
+          linkedPayload: streamSession.linkedPayload,
+          name,
+          storageUrl: productionConfig.storageUrl,
+        });
 
-      const recipients = getGroupUpdateRecipients(
-        group,
-        streamSession.linkedPayload
-      );
-      if (group.masterKey && recipients.length > 0) {
-        try {
-          const unauthChat = group.groupSendEndorsements
-            ? await getBackupUnauthConnection(streamSession)
-            : undefined;
-          await sendGroupUpdateMessage({
-            chat: streamSession.connection,
-            groupSendEndorsements: group.groupSendEndorsements,
-            groupId: String(group.groupId ?? group.id),
-            groupV2: {
-              masterKey: group.masterKey,
-              revision: group.revision ?? 0,
-            },
-            linkedPayload: streamSession.linkedPayload,
-            recipients,
-            timestamp: now(),
-            unauthChat,
-          });
-        } catch (error) {
-          if (getSendErrorInfo(error)) {
-            throw error;
+        const recipients = getGroupUpdateRecipients(
+          group,
+          streamSession.linkedPayload
+        );
+        if (group.masterKey && recipients.length > 0) {
+          try {
+            const unauthChat = group.groupSendEndorsements
+              ? await getBackupUnauthConnection(streamSession)
+              : undefined;
+            await sendGroupUpdateMessage({
+              chat: streamSession.connection,
+              groupSendEndorsements: group.groupSendEndorsements,
+              groupId: String(group.groupId ?? group.id),
+              groupV2: {
+                masterKey: group.masterKey,
+                revision: group.revision ?? 0,
+              },
+              linkedPayload: streamSession.linkedPayload,
+              recipients,
+              timestamp: now(),
+              unauthChat,
+            });
+          } catch (error) {
+            if (getSendErrorInfo(error)) {
+              throw error;
+            }
+            console.warn(
+              'handleCreateGroup: group created, but failed to send group update message',
+              errorToLogString(error)
+            );
           }
-          console.warn(
-            'handleCreateGroup: group created, but failed to send group update message',
-            errorToLogString(error)
-          );
         }
-      }
 
-      rememberSendSuccess(streamSession);
-      streamSession.updatedAt = now();
-      emitProtocolState(streamSession, { immediate: true });
-      sendJson(req, res, 200, group);
-    });
+        rememberSendSuccess(streamSession);
+        streamSession.updatedAt = now();
+        emitProtocolState(streamSession, { immediate: true });
+        sendJson(req, res, 200, group);
+      },
+      `group-create:${conversationIds.join(',')}`
+    );
   } catch (error) {
     rememberSendFailure(streamSession, error);
     streamSession.lastSendError = errorToLogString(error);
@@ -5550,7 +6332,8 @@ async function handleModifyGroupMember(
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
-      }
+      },
+      `group:${conversation.id}`
     );
   } catch (error) {
     if (
@@ -5676,7 +6459,8 @@ async function handleModifyGroupSettings(
         streamSession.updatedAt = now();
         emitProtocolState(streamSession, { immediate: true });
         sendJson(req, res, 200, result);
-      }
+      },
+      `group:${conversation.id}`
     );
   } catch (error) {
     rememberSendFailure(streamSession, error);
@@ -5748,7 +6532,8 @@ async function handleMessageRequestResponse(
           ...result,
           storageVersion: storageResult.version,
         });
-      }
+      },
+      `direct:${threadAci}`
     );
   } catch (error) {
     rememberSendFailure(streamSession, error);
@@ -5813,99 +6598,144 @@ async function handleWriteProfile(
       ? encryptProfile(avatarData, Bytes.fromBase64(profileKey))
       : undefined;
 
-  await runSessionOperation(streamSession, 'handleWriteProfile', async () => {
-    const currentProfile = await fetchCurrentProfileForWrite(
-      streamSession.connection,
-      streamSession.linkedPayload
-    );
-
-    const profileData = getProfileRequestData({
-      aboutEmoji,
-      aboutText,
-      avatarData,
-      familyName,
-      firstName,
-      linkedPayload: streamSession.linkedPayload,
-      paymentAddress: currentProfile.paymentAddress ?? null,
-      phoneNumberSharing,
-      removeAvatar: body.removeAvatar,
-    });
-
-    const avatarUploadHeaders = await fetchSignalJson<unknown>({
-      body: profileData,
-      chat: streamSession.connection,
-      method: 'PUT',
-      path: '/v1/profile',
-    });
-    let avatarUrlPath: string | undefined;
-    if (encryptedAvatarData) {
-      if (!isProfileAvatarUploadHeaders(avatarUploadHeaders)) {
-        throw new Error('writeProfile: missing avatar upload headers');
-      }
-      avatarUrlPath = await uploadProfileAvatar(
-        avatarUploadHeaders,
-        encryptedAvatarData
+  await runSessionOperation(
+    streamSession,
+    'handleWriteProfile',
+    async () => {
+      const currentProfile = await fetchCurrentProfileForWrite(
+        streamSession.connection,
+        streamSession.linkedPayload
       );
-    }
 
-    try {
-      await updateStorageAccountProfile({
-        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-        avatarUrlPath,
-        chat: streamSession.connection,
+      const profileData = getProfileRequestData({
+        aboutEmoji,
+        aboutText,
+        avatarData,
         familyName,
         firstName,
         linkedPayload: streamSession.linkedPayload,
+        paymentAddress: currentProfile.paymentAddress ?? null,
         phoneNumberSharing,
         removeAvatar: body.removeAvatar,
-        storageUrl: productionConfig.storageUrl,
       });
-      await sendFetchStorageManifestSync({
+
+      const avatarUploadHeaders = await fetchSignalJson<unknown>({
+        body: profileData,
         chat: streamSession.connection,
+        method: 'PUT',
+        path: '/v1/profile',
+      });
+      let avatarUrlPath: string | undefined;
+      if (encryptedAvatarData) {
+        if (!isProfileAvatarUploadHeaders(avatarUploadHeaders)) {
+          throw new Error('writeProfile: missing avatar upload headers');
+        }
+        avatarUrlPath = await uploadProfileAvatar(
+          avatarUploadHeaders,
+          encryptedAvatarData
+        );
+      }
+
+      try {
+        await updateStorageAccountProfile({
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          avatarUrlPath,
+          chat: streamSession.connection,
+          familyName,
+          firstName,
+          linkedPayload: streamSession.linkedPayload,
+          phoneNumberSharing,
+          removeAvatar: body.removeAvatar,
+          storageUrl: productionConfig.storageUrl,
+        });
+        await sendFetchStorageManifestSync({
+          chat: streamSession.connection,
+          linkedPayload: streamSession.linkedPayload,
+          timestamp,
+        });
+      } catch (error) {
+        console.warn(
+          'handleWriteProfile: profile updated, but storage service sync failed',
+          error
+        );
+      }
+
+      if (body.hasOtherDevices === true) {
+        await sendFetchLocalProfileSync({
+          chat: streamSession.connection,
+          linkedPayload: streamSession.linkedPayload,
+          timestamp,
+        });
+      }
+
+      const account = getProfileAccountUpdate({
+        aboutEmoji,
+        aboutText,
+        avatarUrlPath,
+        familyName,
+        firstName,
         linkedPayload: streamSession.linkedPayload,
+        removeAvatar: body.removeAvatar,
         timestamp,
       });
-    } catch (error) {
-      console.warn(
-        'handleWriteProfile: profile updated, but storage service sync failed',
-        error
-      );
-    }
+      streamSession.linkedPayload = {
+        ...streamSession.linkedPayload,
+        account: {
+          ...streamSession.linkedPayload.account,
+          ...account,
+        },
+        protocol: exportProtocolState(streamSession.linkedPayload),
+      } as LinkedPayloadWithProtocol;
+      streamSession.updatedAt = now();
 
-    if (body.hasOtherDevices === true) {
-      await sendFetchLocalProfileSync({
-        chat: streamSession.connection,
-        linkedPayload: streamSession.linkedPayload,
+      sendJson(req, res, 200, {
+        account,
+        protocol: streamSession.linkedPayload.protocol,
         timestamp,
       });
-    }
+    },
+    'account:profile'
+  );
+}
 
-    const account = getProfileAccountUpdate({
-      aboutEmoji,
-      aboutText,
-      avatarUrlPath,
-      familyName,
-      firstName,
-      linkedPayload: streamSession.linkedPayload,
-      removeAvatar: body.removeAvatar,
-      timestamp,
-    });
-    streamSession.linkedPayload = {
-      ...streamSession.linkedPayload,
-      account: {
-        ...streamSession.linkedPayload.account,
-        ...account,
-      },
-      protocol: exportProtocolState(streamSession.linkedPayload),
-    } as LinkedPayloadWithProtocol;
-    streamSession.updatedAt = now();
+async function handlePhoneNumberDiscoverability(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const body = (await readJson(
+    req
+  )) as Partial<PhoneNumberDiscoverabilityRequestBody>;
+  const sessionId =
+    typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
+  if (!isReadyMessageStreamSession(streamSession)) {
+    sendText(req, res, 404, 'Message runtime session not found');
+    return;
+  }
 
-    sendJson(req, res, 200, {
-      account,
-      protocol: streamSession.linkedPayload.protocol,
-      timestamp,
-    });
-  });
+  if (typeof body.discoverable !== 'boolean') {
+    sendText(req, res, 400, 'Missing discoverable');
+    return;
+  }
+  const { discoverable } = body;
+
+  await runSessionOperation(
+    streamSession,
+    'handlePhoneNumberDiscoverability',
+    async () => {
+      await fetchSignalJson<void>({
+        body: {
+          discoverableByPhoneNumber: discoverable,
+        },
+        chat: streamSession.connection,
+        method: 'PUT',
+        path: '/v2/accounts/phone_number_discoverability',
+      });
+
+      sendJson(req, res, 200, { ok: true });
+    },
+    'account:phoneNumberDiscoverability'
+  );
 }
 
 function getRuntimeSessionForRequest(
@@ -6447,7 +7277,8 @@ async function handleSyncUsernameProfile(
         syncError,
         timestamp,
       });
-    }
+    },
+    'account:username-profile'
   );
 }
 
@@ -6460,23 +7291,28 @@ async function handleContactsSync(
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (isReadyMessageStreamSession(streamSession)) {
-    await runSessionOperation(streamSession, 'handleContactsSync', async () => {
-      const syncResult = await syncStorageContacts({
-        allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
-        chat: streamSession.connection,
-        cdnUrl: getDefaultCdnUrl(),
-        linkedPayload: streamSession.linkedPayload,
-        storageUrl: productionConfig.storageUrl,
-      });
-      sendJson(req, res, 200, syncResult.contactsBootstrap);
-      if (streamSession.writeEvent) {
-        void kickOffProfileFetches({
-          streamSession,
-          syncResult,
-          writeEvent: streamSession.writeEvent,
+    await runSessionOperation(
+      streamSession,
+      'handleContactsSync',
+      async () => {
+        const syncResult = await syncStorageContacts({
+          allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
+          chat: streamSession.connection,
+          cdnUrl: getDefaultCdnUrl(),
+          linkedPayload: streamSession.linkedPayload,
+          storageUrl: productionConfig.storageUrl,
         });
-      }
-    });
+        sendJson(req, res, 200, syncResult.contactsBootstrap);
+        if (streamSession.writeEvent) {
+          void kickOffProfileFetches({
+            streamSession,
+            syncResult,
+            writeEvent: streamSession.writeEvent,
+          });
+        }
+      },
+      'account:contacts-sync'
+    );
     return;
   }
 
@@ -6594,7 +7430,8 @@ async function handleConversationArchive(
         timestamp: now(),
       });
       sendJson(req, res, 200, result);
-    }
+    },
+    `conversation:${conversationId}`
   );
 }
 
@@ -6637,7 +7474,8 @@ async function handleConversationMute(
         timestamp: now(),
       });
       sendJson(req, res, 200, result);
-    }
+    },
+    `conversation:${conversationId}`
   );
 }
 
@@ -6680,7 +7518,8 @@ async function handleConversationMarkedUnread(
         timestamp: now(),
       });
       sendJson(req, res, 200, result);
-    }
+    },
+    `conversation:${conversationId}`
   );
 }
 
@@ -6723,7 +7562,8 @@ async function handleConversationPin(
         timestamp: now(),
       });
       sendJson(req, res, 200, result);
-    }
+    },
+    `conversation:${conversationId}`
   );
 }
 
@@ -7087,6 +7927,11 @@ async function handleRequest(
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/network/change') {
+    await handleNetworkChange(req, res);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/messages/sessions') {
     sendJson(
       req,
@@ -7110,6 +7955,9 @@ async function handleRequest(
         incomingEnvelopeCount: session.incomingEnvelopeCount,
         decodedMessageCount: session.decodedMessageCount,
         lastDecodedMessageSummary: session.lastDecodedMessageSummary,
+        receivedAlertCount: session.receivedAlertCount,
+        lastReceivedAlerts: session.lastReceivedAlerts,
+        lastReceivedAlertsAt: session.lastReceivedAlertsAt,
         attachmentBackfillEventCount: session.attachmentBackfillEventCount,
         lastAttachmentBackfillSummary: session.lastAttachmentBackfillSummary,
         ignoredEnvelopeCount: session.ignoredEnvelopeCount,
@@ -7121,9 +7969,40 @@ async function handleRequest(
         lastRetryRequestError: session.lastRetryRequestError,
         lastDecryptionErrorRetry: session.lastDecryptionErrorRetry,
         lastDecryptionErrorRetryError: session.lastDecryptionErrorRetryError,
+        lastStreamEndedAt: session.lastStreamEndedAt,
+        lastStreamInterruptedAt: session.lastStreamInterruptedAt,
+        lastStreamOpenedAt: session.lastStreamOpenedAt,
+        lastStreamStartedAt: session.lastStreamStartedAt,
+        lastTransportError: session.lastTransportError,
+        lastTransportStatusAt: session.lastTransportStatusAt,
+        signalKeepaliveCount: session.signalKeepaliveCount,
+        signalKeepaliveFailureCount: session.signalKeepaliveFailureCount,
+        lastSignalKeepaliveAt: session.lastSignalKeepaliveAt,
+        lastSignalKeepaliveError: session.lastSignalKeepaliveError,
+        lastSignalKeepaliveResponseMs: session.lastSignalKeepaliveResponseMs,
+        lastSignalKeepaliveStatus: session.lastSignalKeepaliveStatus,
+        backupUnauthKeepaliveCount: session.backupUnauthKeepaliveCount,
+        backupUnauthKeepaliveFailureCount:
+          session.backupUnauthKeepaliveFailureCount,
+        lastBackupUnauthKeepaliveAt: session.lastBackupUnauthKeepaliveAt,
+        lastBackupUnauthKeepaliveError: session.lastBackupUnauthKeepaliveError,
+        lastBackupUnauthKeepaliveResponseMs:
+          session.lastBackupUnauthKeepaliveResponseMs,
+        lastBackupUnauthKeepaliveStatus:
+          session.lastBackupUnauthKeepaliveStatus,
         queueEmptyCount: session.queueEmptyCount,
+        persistedStreamEvents: getPersistedStreamEventDiagnostics(
+          getStreamEventAccountKey(session.linkedPayload, session.username)
+        ),
+        sessionOperationQueueSize:
+          sessionOperationQueueSizes.get(sessionId) ?? 0,
+        signalSendDiagnostics: getWebSignalSendDiagnostics(),
         sendAttemptCount: session.sendAttemptCount,
         lastSendAttemptAt: session.lastSendAttemptAt,
+        streamCloseCount: session.streamCloseCount,
+        streamOpenCount: session.streamOpenCount,
+        targetOperationStats: getTargetOperationDiagnostics(session),
+        transportReconnectHintCount: session.transportReconnectHintCount,
         protocolKeyIds: getLinkedPayloadProtocolKeyIds(session.linkedPayload),
         hasMediaRootBackupKey: Boolean(
           session.linkedPayload?.mediaRootBackupKeyBase64
@@ -7252,6 +8131,14 @@ async function handleRequest(
     return;
   }
 
+  if (
+    req.method === 'POST' &&
+    url.pathname === '/profile/phone-number-discoverability'
+  ) {
+    await handlePhoneNumberDiscoverability(req, res);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/username/reserve') {
     await handleReserveUsername(req, res);
     return;
@@ -7342,12 +8229,55 @@ const server = createServer((req, res) => {
   });
 });
 
+let isShuttingDown = false;
+function shutdownWebBridge(signal: NodeJS.Signals): void {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
+  console.log(`Signal Web bridge received ${signal}, closing streams`);
+  for (const [sessionId, streamSession] of streamSessions) {
+    disposeStreamSession(sessionId, streamSession);
+  }
+  server.close(error => {
+    if (error) {
+      console.error('Signal Web bridge failed to close HTTP server', error);
+      process.exit(1);
+      return;
+    }
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.warn('Signal Web bridge shutdown timed out');
+    process.exit(1);
+  }, 5_000).unref();
+}
+
+process.once('SIGTERM', shutdownWebBridge);
+process.once('SIGINT', shutdownWebBridge);
+
 void cleanupExpiredAttachmentTmpDirs().catch(error => {
   console.warn(
     'Failed to clean expired Signal Web attachment temp files',
     error
   );
 });
+
+if (
+  Number.isFinite(RUNTIME_CLEANUP_INTERVAL_MS) &&
+  RUNTIME_CLEANUP_INTERVAL_MS > 0
+) {
+  const runtimeCleanupInterval = setInterval(() => {
+    cleanupRuntimeState('interval');
+    void cleanupExpiredAttachmentTmpDirs().catch(error => {
+      console.warn(
+        'Failed to clean expired Signal Web attachment temp files',
+        error
+      );
+    });
+  }, RUNTIME_CLEANUP_INTERVAL_MS);
+  runtimeCleanupInterval.unref?.();
+}
 
 server.listen(PORT, HOST, () => {
   console.log(`Signal Web bridge listening on http://${HOST}:${PORT}`);

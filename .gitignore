@@ -10,6 +10,7 @@ stylesheets/*.css.map
 /dist
 /server-dist
 /web-dist
+.signal-web
 .DS_Store
 config/local.json
 config/local-*

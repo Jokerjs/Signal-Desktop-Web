@@ -19,12 +19,24 @@ import type {
 } from './types.std.ts';
 import { getWebAttachmentContentType } from './attachmentMime.std.ts';
 import { HTTPError } from '../types/HTTPError.std.ts';
+import { ZERO_ACCESS_KEY } from '../types/SealedSender.std.ts';
 
 function apiUrl(path: string): URL {
   return new URL(path.replace(/^\/+/, ''), getRenderApiBaseUrl());
 }
 
 let currentMessageRuntimeSessionId: string | undefined;
+const MESSAGE_STREAM_READ_TIMEOUT_MS = 90_000;
+
+function normalizeDirectAccessKey(
+  accessKey: string | undefined
+): string | undefined {
+  if (accessKey == null) {
+    return undefined;
+  }
+
+  return accessKey.trim() ? accessKey : ZERO_ACCESS_KEY;
+}
 
 function getLinkedSessionRequestBody(
   linkedSession: LinkedSessionRecord,
@@ -184,61 +196,97 @@ export async function consumeMessageTransportStream({
   signal: AbortSignal;
   onEvent: (event: MessageStreamEvent) => void | Promise<void>;
 }>): Promise<void> {
-  const response = await fetch(apiUrl('/messages/stream'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      ...getLinkedSessionRequestBody(linkedSession, includeProtocol),
-      importBackup,
-    }),
-    signal,
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to open message stream: ${response.status}`);
-  }
-  if (!response.body) {
-    throw new Error('Message stream did not return a readable body');
+  const streamAbortController = new AbortController();
+  const abortStream = (): void => {
+    streamAbortController.abort();
+  };
+  if (signal.aborted) {
+    abortStream();
+  } else {
+    signal.addEventListener('abort', abortStream, { once: true });
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let runtimeSessionId: string | undefined;
-  const handleStreamEvent = async (event: MessageStreamEvent) => {
-    await onEvent(event);
-    if (event.type === 'session') {
-      runtimeSessionId = event.sessionId;
-      currentMessageRuntimeSessionId = event.sessionId;
-    }
-    if (event.streamEventId) {
-      void acknowledgeMessageStreamEvent({
-        aci: linkedSession.credentials?.aci ?? linkedSession.account.aci,
-        eventId: event.streamEventId,
-        runtimeSessionId,
-      });
+  let readWatchdog: ReturnType<typeof setTimeout> | undefined;
+  const clearReadWatchdog = (): void => {
+    if (readWatchdog) {
+      clearTimeout(readWatchdog);
+      readWatchdog = undefined;
     }
   };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  const resetReadWatchdog = (): void => {
+    clearReadWatchdog();
+    readWatchdog = setTimeout(() => {
+      streamAbortController.abort();
+    }, MESSAGE_STREAM_READ_TIMEOUT_MS);
+  };
+
+  currentMessageRuntimeSessionId = undefined;
+  let runtimeSessionId: string | undefined;
+  try {
+    resetReadWatchdog();
+    const response = await fetch(apiUrl('/messages/stream'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...getLinkedSessionRequestBody(linkedSession, includeProtocol),
+        importBackup,
+      }),
+      signal: streamAbortController.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to open message stream: ${response.status}`);
     }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        await handleStreamEvent(JSON.parse(trimmed) as MessageStreamEvent);
+    if (!response.body) {
+      throw new Error('Message stream did not return a readable body');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const handleStreamEvent = async (event: MessageStreamEvent) => {
+      resetReadWatchdog();
+      await onEvent(event);
+      if (event.type === 'session') {
+        runtimeSessionId = event.sessionId;
+        currentMessageRuntimeSessionId = event.sessionId;
+      }
+      if (event.streamEventId) {
+        void acknowledgeMessageStreamEvent({
+          aci: linkedSession.credentials?.aci ?? linkedSession.account.aci,
+          eventId: event.streamEventId,
+          runtimeSessionId,
+        });
+      }
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      resetReadWatchdog();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          await handleStreamEvent(JSON.parse(trimmed) as MessageStreamEvent);
+        }
       }
     }
-  }
-  const remaining = buffer.trim();
-  if (remaining) {
-    await handleStreamEvent(JSON.parse(remaining) as MessageStreamEvent);
+    const remaining = buffer.trim();
+    if (remaining) {
+      await handleStreamEvent(JSON.parse(remaining) as MessageStreamEvent);
+    }
+  } finally {
+    clearReadWatchdog();
+    signal.removeEventListener('abort', abortStream);
+    if (currentMessageRuntimeSessionId === runtimeSessionId) {
+      currentMessageRuntimeSessionId = undefined;
+    }
   }
 }
 
@@ -264,8 +312,21 @@ export async function acknowledgeMessageStreamEvent({
   });
 }
 
+export async function notifySignalNetworkChange(): Promise<void> {
+  await fetch(apiUrl('/network/change'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sessionId: currentMessageRuntimeSessionId,
+    }),
+  });
+}
+
 export async function sendDirectTextMessage({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   body,
   timestamp,
@@ -276,6 +337,7 @@ export async function sendDirectTextMessage({
   quote,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   body: string;
   timestamp: number;
@@ -292,6 +354,7 @@ export async function sendDirectTextMessage({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       body,
       timestamp,
@@ -331,12 +394,14 @@ export async function submitMessageChallenge({
 
 export async function sendDirectExpirationTimerUpdate({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   expireTimer?: number;
   expireTimerVersion: number;
@@ -349,6 +414,7 @@ export async function sendDirectExpirationTimerUpdate({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       expireTimer,
       expireTimerVersion,
@@ -404,6 +470,29 @@ export async function writeProfile({
     }),
   });
   return parseJsonResponse(response);
+}
+
+export async function setPhoneNumberDiscoverability({
+  discoverable,
+  runtimeSessionId,
+}: Readonly<{
+  discoverable: boolean;
+  runtimeSessionId?: string;
+}>): Promise<void> {
+  const response = await fetch(
+    apiUrl('/profile/phone-number-discoverability'),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        discoverable,
+        sessionId: runtimeSessionId ?? currentMessageRuntimeSessionId,
+      }),
+    }
+  );
+  await parseJsonResponse(response);
 }
 
 export async function reserveSignalUsername({
@@ -599,11 +688,13 @@ export async function syncSignalUsernameProfile({
 
 export async function sendDirectDeleteForEveryone({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   deleteForEveryone,
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   deleteForEveryone: WebDeleteForEveryone;
   timestamp: number;
@@ -615,6 +706,7 @@ export async function sendDirectDeleteForEveryone({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       body: '',
       timestamp,
@@ -626,11 +718,13 @@ export async function sendDirectDeleteForEveryone({
 
 export async function sendDirectUnpinMessage({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   unpinMessage,
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   unpinMessage: WebUnpinMessage;
   timestamp: number;
@@ -642,6 +736,7 @@ export async function sendDirectUnpinMessage({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       body: '',
       timestamp,
@@ -789,6 +884,7 @@ export async function uploadMessageAttachment({
 
 export async function sendDirectReaction({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   emoji,
   remove,
@@ -797,6 +893,7 @@ export async function sendDirectReaction({
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   emoji?: string;
   remove: boolean;
@@ -811,6 +908,7 @@ export async function sendDirectReaction({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       emoji,
       remove,
@@ -871,12 +969,14 @@ export async function sendGroupReaction({
 
 export async function sendDirectEditMessage({
   runtimeSessionId,
+  accessKey,
   destinationServiceId,
   body,
   targetTimestamp,
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
+  accessKey?: string;
   destinationServiceId: string;
   body: string;
   targetTimestamp: number;
@@ -889,6 +989,7 @@ export async function sendDirectEditMessage({
     },
     body: JSON.stringify({
       sessionId: runtimeSessionId,
+      accessKey: normalizeDirectAccessKey(accessKey),
       destinationServiceId,
       body,
       targetTimestamp,

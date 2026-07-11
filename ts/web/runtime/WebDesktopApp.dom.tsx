@@ -46,6 +46,7 @@ import {
   confirmSignalUsername,
   confirmSignalUsernameReservation,
   deleteSignalUsername,
+  notifySignalNetworkChange,
   requestAttachmentBackfill,
   replaceSignalUsernameLink,
   reserveSignalUsername,
@@ -57,6 +58,7 @@ import {
   sendDirectUnpinMessage,
   sendGroupReaction,
   sendGroupTextMessage,
+  setPhoneNumberDiscoverability as setSignalPhoneNumberDiscoverability,
   syncSignalUsernameProfile,
   syncContacts,
   writeProfile as writeSignalProfile,
@@ -127,6 +129,7 @@ import { SECOND } from '../../util/durations/index.std.ts';
 import type { ConversationType } from '../../state/ducks/conversations.preload.ts';
 import type { AvatarUpdateOptionsType } from '../../types/Avatar.std.ts';
 import { isSharingPhoneNumberWithEverybody } from '../../util/phoneNumberSharingMode.preload.ts';
+import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 
 const VIDEO_THUMBNAIL_MAX_SIDE = 480;
 const VIDEO_THUMBNAIL_QUALITY = 0.82;
@@ -213,13 +216,27 @@ const EMPTY_SHELL: ChatShellState = {
 
 const MESSAGE_STREAM_RECONNECT_INITIAL_DELAY = 1_000;
 const MESSAGE_STREAM_RECONNECT_MAX_DELAY = 15_000;
+const MESSAGE_STREAM_RECONNECT_JITTER_MIN = 0.8;
+const MESSAGE_STREAM_RECONNECT_JITTER_MAX = 1.3;
+
+function getMessageStreamReconnectDelay(baseDelay: number): number {
+  const jitter =
+    MESSAGE_STREAM_RECONNECT_JITTER_MIN +
+    Math.random() *
+      (MESSAGE_STREAM_RECONNECT_JITTER_MAX -
+        MESSAGE_STREAM_RECONNECT_JITTER_MIN);
+  return Math.round(baseDelay * jitter);
+}
 const DEVICE_DELINKED_ERROR = 'DeviceDelinked: device was deregistered';
 const pendingAttachmentBackfillTimeouts = new Map<string, number>();
 
 let shellMessageIndexSource: ChatShellState['messages'] | undefined;
 let shellMessageIndexById = new Map<string, number>();
 let shellMessageIdSet = new Set<string>();
-let shellMessagesByConversationId = new Map<string, ReadonlyArray<WebMessage>>();
+let shellMessagesByConversationId = new Map<
+  string,
+  ReadonlyArray<WebMessage>
+>();
 let shellMessageMetricsByConversationId = new Map<
   string,
   ReturnType<typeof getDesktopMessageMetrics>
@@ -283,7 +300,10 @@ function getShellMessageIndexes(
     shellMessageIndexSource = messages;
     shellMessageIndexById = new Map<string, number>();
     shellMessageIdSet = new Set<string>();
-    const mutableMessagesByConversationId = new Map<string, Array<WebMessage>>();
+    const mutableMessagesByConversationId = new Map<
+      string,
+      Array<WebMessage>
+    >();
     const mutableMetricsByConversationId = new Map<
       string,
       ReturnType<typeof getDesktopMessageMetrics>
@@ -337,7 +357,9 @@ function setShellMessageIndexes(
   shellMessagesByConversationId = messagesByConversationId;
 }
 
-function rebuildShellMessageIndexes(messages: ChatShellState['messages']): void {
+function rebuildShellMessageIndexes(
+  messages: ChatShellState['messages']
+): void {
   shellMessageIndexSource = undefined;
   getShellMessageIndexes(messages);
 }
@@ -397,8 +419,7 @@ function appendUniqueMessagesSorted(
     const nextMetricsByConversationId = new Map(
       currentIndexes.metricsByConversationId
     );
-    const incomingByConversation =
-      groupMessagesByConversation(sortedIncoming);
+    const incomingByConversation = groupMessagesByConversation(sortedIncoming);
     sortedIncoming.forEach((message, index) => {
       nextIdSet.add(message.id);
       nextIndexById.set(message.id, currentMessages.length + index);
@@ -528,8 +549,9 @@ function replaceMessageById(
     shellMessageMetricsByConversationId
   );
   const nextMessagesByConversationId = new Map(shellMessagesByConversationId);
-  const existingConversationMessages =
-    shellMessagesByConversationId.get(existing.conversationId);
+  const existingConversationMessages = shellMessagesByConversationId.get(
+    existing.conversationId
+  );
   if (existing.conversationId !== updated.conversationId) {
     rebuildShellMessageIndexes(nextMessages);
     return {
@@ -649,6 +671,7 @@ type SignalWebRuntime = {
     conversation: ConversationType,
     options: AvatarUpdateOptionsType
   ) => Promise<void>;
+  setPhoneNumberDiscoverability?: (discoverable: boolean) => Promise<void>;
   forwardMessages?: (
     conversationIds: ReadonlyArray<string>,
     drafts: ReadonlyArray<MessageForwardDraft>
@@ -1205,10 +1228,7 @@ function getConversationMessagesFromShell(
     conversationMessagesSource = shell.messages;
     conversationMessagesSourceVersion += 1;
     conversationMessagesById.clear();
-    for (const [
-      currentConversationId,
-      messages,
-    ] of messagesByConversationId) {
+    for (const [currentConversationId, messages] of messagesByConversationId) {
       conversationMessagesById.set(currentConversationId, messages);
     }
     for (const [currentConversationId, cached] of [
@@ -2696,6 +2716,18 @@ export function WebDesktopApp({
           return next;
         });
       },
+      async setPhoneNumberDiscoverability(discoverable) {
+        if (!messageRuntimeSessionId) {
+          throw new Error(
+            'setPhoneNumberDiscoverability: message runtime session is not available'
+          );
+        }
+
+        await setSignalPhoneNumberDiscoverability({
+          discoverable,
+          runtimeSessionId: messageRuntimeSessionId,
+        });
+      },
       async reserveUsername(usernameHashes) {
         if (!messageRuntimeSessionId) {
           throw new Error(
@@ -3271,6 +3303,7 @@ export function WebDesktopApp({
             } else {
               await sendDirectDeleteForEveryone({
                 runtimeSessionId: messageRuntimeSessionId,
+                accessKey: getDirectSendAccessKey(conversation),
                 destinationServiceId:
                   conversation.serviceId ?? target.conversationId,
                 deleteForEveryone,
@@ -3382,6 +3415,7 @@ export function WebDesktopApp({
                     })
                   : await sendDirectTextMessage({
                       runtimeSessionId: messageRuntimeSessionId,
+                      accessKey: getDirectSendAccessKey(conversation),
                       destinationServiceId:
                         conversation.serviceId ?? conversation.id,
                       body,
@@ -3465,6 +3499,7 @@ export function WebDesktopApp({
         try {
           await sendDirectTextMessage({
             runtimeSessionId: messageRuntimeSessionId,
+            accessKey: getDirectSendAccessKey(conversation),
             destinationServiceId: conversation.serviceId ?? conversation.id,
             body: '',
             pinMessage,
@@ -3515,6 +3550,7 @@ export function WebDesktopApp({
         try {
           await sendDirectUnpinMessage({
             runtimeSessionId: messageRuntimeSessionId,
+            accessKey: getDirectSendAccessKey(conversation),
             destinationServiceId: conversation.serviceId ?? conversation.id,
             unpinMessage,
             timestamp,
@@ -3616,6 +3652,7 @@ export function WebDesktopApp({
             } else {
               await sendDirectReaction({
                 runtimeSessionId: messageRuntimeSessionId,
+                accessKey: getDirectSendAccessKey(conversation),
                 destinationServiceId: conversation.serviceId ?? conversation.id,
                 emoji: reaction.emoji,
                 remove: reaction.remove,
@@ -3964,6 +4001,19 @@ export function WebDesktopApp({
   }, []);
 
   useEffect(() => {
+    const handleOnline = (): void => {
+      void notifySignalNetworkChange().catch(error => {
+        console.error('Signal network change notification failed', error);
+      });
+    };
+
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+    };
+  }, []);
+
+  useEffect(() => {
     const initialStreamLinkedSession = linkedSessionRef.current;
     if (!initialStreamLinkedSession?.credentials?.aci) {
       return undefined;
@@ -3982,6 +4032,7 @@ export function WebDesktopApp({
       setBackupImportScreenState(undefined);
     }
     let runtimeSessionId: string | undefined;
+    let latestProtocolStateRevision = 0;
     const clearAttachmentBackfillTimeout = (messageId: string): void => {
       const existing = pendingAttachmentBackfillTimeouts.get(messageId);
       if (existing != null) {
@@ -3996,6 +4047,7 @@ export function WebDesktopApp({
       const currentLinkedSession = getCurrentLinkedSession();
       if (event.type === 'session') {
         runtimeSessionId = event.sessionId;
+        latestProtocolStateRevision = 0;
         setMessageRuntimeSessionId(event.sessionId);
       } else if (event.type === 'linked-session-updated') {
         setLinkedSession(current => {
@@ -4030,6 +4082,13 @@ export function WebDesktopApp({
           return next;
         });
       } else if (event.type === 'protocol-state') {
+        if (!runtimeSessionId || event.sessionId !== runtimeSessionId) {
+          return;
+        }
+        if (event.protocolRevision <= latestProtocolStateRevision) {
+          return;
+        }
+        latestProtocolStateRevision = event.protocolRevision;
         const current = getCurrentLinkedSession();
         const next: LinkedSessionRecord = {
           ...current,
@@ -4919,7 +4978,10 @@ export function WebDesktopApp({
         }
         setMessageRuntimeSessionId(undefined);
         try {
-          await delay(reconnectDelay, abortController.signal);
+          await delay(
+            getMessageStreamReconnectDelay(reconnectDelay),
+            abortController.signal
+          );
         } catch {
           return;
         }

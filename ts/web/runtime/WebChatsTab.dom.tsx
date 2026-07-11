@@ -109,6 +109,7 @@ import { strictAssert } from '../../util/assert.std.ts';
 import { imageToBlurHash } from '../../util/imageToBlurHash.dom.ts';
 import { isViewOnceEligible } from '../../util/viewOnceEligibility.std.ts';
 import { getSharedGroupNames } from '../../util/sharedGroupNames.dom.ts';
+import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 import {
   compareWebMessages,
   getWebConversationLastMessage,
@@ -845,6 +846,7 @@ function WebCompositionArea({
             });
             await sendDirectEditMessage({
               runtimeSessionId: messageRuntimeSessionId,
+              accessKey: getDirectSendAccessKey(conversationForSend),
               destinationServiceId:
                 conversationForSend.serviceId ?? conversationForSend.id,
               body,
@@ -988,6 +990,7 @@ function WebCompositionArea({
             : await sendDirectTextMessage({
                 attachments: remoteAttachments,
                 runtimeSessionId: messageRuntimeSessionId,
+                accessKey: getDirectSendAccessKey(conversationForSend),
                 destinationServiceId,
                 body,
                 isViewOnce: isViewOnceActive,

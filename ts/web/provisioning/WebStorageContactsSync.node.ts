@@ -12,8 +12,10 @@ import {
   deriveStorageManifestKey,
   encryptProfile,
   getRandomBytes,
+  verifyAccessKey,
 } from '../../Crypto.node.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
+import { SEALED_SENDER } from '../../types/SealedSender.std.ts';
 import type { ServiceIdString } from '../../types/ServiceId.std.ts';
 import {
   fromAciUuidBytesOrString,
@@ -23,6 +25,7 @@ import {
   deriveGroupID,
   deriveGroupPublicParams,
   deriveGroupSecretParams,
+  deriveAccessKeyFromProfileKey,
   deriveProfileKeyVersion,
 } from '../../util/zkgroup.node.ts';
 import { MY_STORY_ID } from '../../types/Stories.std.ts';
@@ -139,6 +142,8 @@ const profileAvatarUrlCacheByKey = new Map<string, ProfileAvatarCacheValue>();
 
 type ProfileResponse = Readonly<{
   avatar?: string;
+  unidentifiedAccess?: string;
+  unrestrictedUnidentifiedAccess?: boolean;
 }>;
 
 function getProfileAvatarCacheKey(
@@ -283,8 +288,15 @@ function getContactConversation(
 
   const title = getContactTitle(contact, contact.e164 || id);
   const profileSharing = Boolean(contact.whitelisted);
+  const profileKey = contact.profileKey?.byteLength
+    ? Bytes.toBase64(contact.profileKey)
+    : undefined;
+  const accessKey = profileKey
+    ? Bytes.toBase64(deriveAccessKeyFromProfileKey(Bytes.fromBase64(profileKey)))
+    : undefined;
   return {
     acceptedMessageRequest: !contact.hidden && profileSharing,
+    accessKey,
     color: fromAvatarColor(contact.avatarColor),
     conversationType: 'direct',
     e164: contact.e164 || undefined,
@@ -295,9 +307,7 @@ function getContactConversation(
     markedUnread: Boolean(contact.markedUnread),
     phoneNumber: contact.e164 || undefined,
     pni,
-    profileKey: contact.profileKey?.byteLength
-      ? Bytes.toBase64(contact.profileKey)
-      : undefined,
+    profileKey,
     nicknameFamilyName: contact.nickname?.family || undefined,
     nicknameGivenName: contact.nickname?.given || undefined,
     profileFamilyName: contact.familyName || undefined,
@@ -305,6 +315,7 @@ function getContactConversation(
     profileSharing,
     removalStage: contact.hidden ? 'justNotification' : undefined,
     searchableTitle: title,
+    sealedSender: SEALED_SENDER.UNKNOWN,
     serviceId: aci,
     systemFamilyName: contact.systemFamilyName || undefined,
     systemGivenName: contact.systemGivenName || undefined,
@@ -415,7 +426,7 @@ async function fetchProfileAvatarBytes({
   return fetchProfileAvatarBytesAllowingInsecureTls({ avatarPath, url });
 }
 
-async function fetchContactProfileAvatarUrl({
+async function fetchContactProfileData({
   allowInsecureTls,
   cdnUrl,
   chat,
@@ -425,7 +436,13 @@ async function fetchContactProfileAvatarUrl({
   cdnUrl: string;
   chat: AuthenticatedChatConnection;
   conversation: WebConversation;
-}>): Promise<string | undefined> {
+}>): Promise<
+  | Readonly<{
+      avatarUrl?: string;
+      profile: ProfileResponse;
+    }>
+  | undefined
+> {
   const { profileKey, serviceId } = conversation;
   if (!profileKey || !serviceId) {
     return undefined;
@@ -433,9 +450,6 @@ async function fetchContactProfileAvatarUrl({
 
   const cacheKey = getProfileAvatarCacheKey(conversation);
   const cachedAvatarUrl = getCachedProfileAvatarUrl(cacheKey);
-  if (cachedAvatarUrl != null) {
-    return cachedAvatarUrl;
-  }
 
   const profileKeyVersion = deriveProfileKeyVersion(
     profileKey,
@@ -461,16 +475,23 @@ async function fetchContactProfileAvatarUrl({
   const profile = JSON.parse(responseBody) as ProfileResponse;
   if (!profile.avatar) {
     setCachedProfileAvatarUrl(cacheKey, undefined);
-    return undefined;
+    return { profile };
+  }
+  if (cachedAvatarUrl != null) {
+    return {
+      avatarUrl: cachedAvatarUrl,
+      profile,
+    };
   }
 
-  return fetchProfileAvatarUrl({
+  const avatarUrl = await fetchProfileAvatarUrl({
     allowInsecureTls,
     avatarPath: profile.avatar,
     cacheKey,
     cdnUrl,
     profileKey,
   });
+  return { avatarUrl, profile };
 }
 
 async function fetchProfileAvatarUrl({
@@ -525,19 +546,49 @@ export async function syncContactProfile({
   chat: AuthenticatedChatConnection;
   conversation: WebConversation;
 }>): Promise<Partial<WebConversation>> {
-  const avatarUrl = await fetchContactProfileAvatarUrl({
+  const profileData = await fetchContactProfileData({
     allowInsecureTls,
     cdnUrl,
     chat,
     conversation,
   });
-
-  return avatarUrl
-    ? {
-        avatarUrl,
-        hasAvatar: true,
+  const { avatarUrl, profile } = profileData ?? {};
+  const accessKey = conversation.profileKey?.trim()
+    ? Bytes.toBase64(
+        deriveAccessKeyFromProfileKey(Bytes.fromBase64(conversation.profileKey))
+      )
+    : undefined;
+  let sealedSender: SEALED_SENDER | undefined;
+  if (profile) {
+    if (profile.unidentifiedAccess) {
+      if (profile.unrestrictedUnidentifiedAccess) {
+        sealedSender = SEALED_SENDER.UNRESTRICTED;
+      } else if (accessKey) {
+        const hasCorrectAccessKey = verifyAccessKey(
+          Bytes.fromBase64(accessKey),
+          Bytes.fromBase64(profile.unidentifiedAccess)
+        );
+        sealedSender = hasCorrectAccessKey
+          ? SEALED_SENDER.ENABLED
+          : SEALED_SENDER.DISABLED;
+      } else {
+        sealedSender = SEALED_SENDER.DISABLED;
       }
-    : {};
+    } else {
+      sealedSender = SEALED_SENDER.DISABLED;
+    }
+  }
+
+  return {
+    ...(accessKey ? { accessKey } : null),
+    ...(avatarUrl
+      ? {
+          avatarUrl,
+          hasAvatar: true,
+        }
+      : null),
+    ...(sealedSender != null ? { sealedSender } : null),
+  };
 }
 
 function getGroupConversation(
