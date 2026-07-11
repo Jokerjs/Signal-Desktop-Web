@@ -6099,13 +6099,28 @@ async function handleSendGroupMessage(
             groupId,
             streamSession,
           });
-          if (!refreshedConversation?.groupSendEndorsements) {
-            throw error;
+          if (refreshedConversation?.groupSendEndorsements) {
+            try {
+              message = await sendWithEndorsements(
+                refreshedConversation.groupSendEndorsements
+              );
+            } catch (refreshedError) {
+              if (!isSendAuthorizationError(refreshedError)) {
+                throw refreshedError;
+              }
+              console.warn(
+                'handleSendGroupMessage: refreshed group send endorsements were rejected; falling back to authenticated group send',
+                refreshedError
+              );
+              message = await sendWithEndorsements(undefined);
+            }
+          } else {
+            console.warn(
+              'handleSendGroupMessage: group send endorsements were rejected and no refreshed endorsements were available; falling back to authenticated group send',
+              error
+            );
+            message = await sendWithEndorsements(undefined);
           }
-
-          message = await sendWithEndorsements(
-            refreshedConversation.groupSendEndorsements
-          );
         }
         rememberSendSuccess(streamSession);
         streamSession.updatedAt = now();
