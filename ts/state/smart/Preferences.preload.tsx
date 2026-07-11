@@ -857,7 +857,10 @@ export function SmartPreferences({
 
       // Write profile after updating storage so that the write has up-to-date
       // information.
-      await writeProfile(getConversation(account), {
+      const conversation = isSignalWebRuntime
+        ? (account.attributes as ConversationType)
+        : getConversation(account);
+      await writeProfile(conversation, {
         keepAvatar: true,
       });
     }

@@ -1,6 +1,7 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { v4 as generateUuid } from 'uuid';
 import {
   ALL_CHATS_FOLDER_REQUIRED_PARAMS,
   CHAT_FOLDER_DELETED_POSITION,
@@ -86,7 +87,7 @@ function loadStoredWebChatFolders(
 
 function createAllChatsChatFolder(): ChatFolder {
   return {
-    id: crypto.randomUUID() as ChatFolderId,
+    id: generateUuid() as ChatFolderId,
     ...ALL_CHATS_FOLDER_REQUIRED_PARAMS,
     position: 0,
     deletedAtTimestampMs: 0,
