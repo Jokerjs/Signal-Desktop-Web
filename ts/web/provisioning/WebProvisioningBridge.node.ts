@@ -155,6 +155,7 @@ try {
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../../../package.json') as { version: string };
+const DEFAULT_DEVICE_NAME = 'Windows';
 const jumbomojiManifest = require('../../../build/jumbomoji.json') as Record<
   string,
   Array<string>
@@ -274,6 +275,7 @@ type ProvisioningSession = {
   sessionId: string;
   status: SessionStatus;
   deviceName: string;
+  clientUserAgent?: string;
   createdAt: number;
   updatedAt: number;
   url?: string;
@@ -408,6 +410,7 @@ type MessageStreamSession = {
   queueEmptyCount: number;
   sendAttemptCount: number;
   lastSendAttemptAt?: number;
+  clientUserAgent?: string;
   connection?: AuthenticatedChatConnection;
   linkedPayload?: LinkedPayloadWithProtocol;
   conversationLookup?: Record<string, WebConversation>;
@@ -562,8 +565,11 @@ const sessionOperationQueueSizes = new Map<string, number>();
 const recentlyClosedStreamAcis = new Map<string, number>();
 
 let signalModulesPromise: ReturnType<typeof loadSignalModules> | undefined;
-let libsignalNetInstance:
-  | InstanceType<Awaited<ReturnType<typeof getSignalModules>>['Net']['Net']>
+let libsignalNetInstances:
+  | Map<
+      string,
+      InstanceType<Awaited<ReturnType<typeof getSignalModules>>['Net']['Net']>
+    >
   | undefined;
 
 const CDSI_LOOKUP_TIMEOUT_MS = 10_000;
@@ -2390,15 +2396,46 @@ async function getSignalModules() {
   return signalModulesPromise;
 }
 
-function createNet(Net: Awaited<ReturnType<typeof getSignalModules>>['Net']) {
-  libsignalNetInstance ??= new Net.Net({
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeClientUserAgent(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const userAgent = value.trim();
+  if (userAgent.length > 128) {
+    return undefined;
+  }
+  const version = escapeRegExp(packageJson.version);
+  const pattern = new RegExp(
+    `^Signal-Desktop/${version} (macOS|Windows|Linux) [0-9A-Za-z._-]+$`
+  );
+  return pattern.test(userAgent) ? userAgent : undefined;
+}
+
+function createNet(
+  Net: Awaited<ReturnType<typeof getSignalModules>>['Net'],
+  clientUserAgent?: string
+) {
+  const userAgent =
+    normalizeClientUserAgent(clientUserAgent) ??
+    getUserAgent(packageJson.version);
+  libsignalNetInstances ??= new Map();
+  const existing = libsignalNetInstances.get(userAgent);
+  if (existing) {
+    return existing;
+  }
+  const next = new Net.Net({
     env:
       process.env.SIGNAL_WEB_SERVER_ENV === 'staging'
         ? Net.Environment.Staging
         : Net.Environment.Production,
-    userAgent: `Signal-Desktop/${packageJson.version} Web`,
+    userAgent,
   });
-  return libsignalNetInstance;
+  libsignalNetInstances.set(userAgent, next);
+  return next;
 }
 
 async function registerLinkedDeviceCapabilities(
@@ -2613,7 +2650,7 @@ async function linkDeviceFromEnvelope({
     }),
   };
 
-  const net = createNet(Net);
+  const net = createNet(Net, session.clientUserAgent);
   recordSessionEvent(session, 'link-request-start');
   const chat = await net.connectUnauthenticatedChat(
     {
@@ -2726,13 +2763,15 @@ async function linkDeviceFromEnvelope({
 }
 
 async function startProvisioningSession(
-  deviceName: string
+  deviceName: string,
+  clientUserAgent?: string
 ): Promise<ProvisioningSession> {
   const { Net, ProvisioningCipher, Bytes, Proto } = await getSignalModules();
   const session: ProvisioningSession = {
     sessionId: randomUUID(),
     status: 'starting',
-    deviceName: deviceName.trim() || 'Signal Web',
+    deviceName: deviceName.trim() || DEFAULT_DEVICE_NAME,
+    clientUserAgent: normalizeClientUserAgent(clientUserAgent),
     createdAt: now(),
     updatedAt: now(),
     events: [],
@@ -2740,7 +2779,7 @@ async function startProvisioningSession(
   sessions.set(session.sessionId, session);
   recordSessionEvent(session, 'starting');
 
-  const net = createNet(Net);
+  const net = createNet(Net, session.clientUserAgent);
   const cipher = new ProvisioningCipher();
   const abortController = new AbortController();
   let connection:
@@ -3511,7 +3550,7 @@ async function getBackupUnauthConnection(
     return streamSession.backupUnauthConnection;
   }
   const { Net } = await getSignalModules();
-  const net = createNet(Net);
+  const net = createNet(Net, streamSession.clientUserAgent);
   const connection = await net.connectUnauthenticatedChat(
     {
       onConnectionInterrupted() {
@@ -4118,6 +4157,7 @@ async function handleMessageStream(
     typeof body.password === 'string' ? body.password : undefined;
   const linkedPayload = getLinkedPayloadFromStreamBody(body);
   const importBackup = body.importBackup !== false;
+  const clientUserAgent = normalizeClientUserAgent(body.clientUserAgent);
   if (!username || !password) {
     sendText(req, res, 401, 'Linked Signal credentials are required');
     return;
@@ -4153,6 +4193,7 @@ async function handleMessageStream(
     ignoredEnvelopeCount: 0,
     queueEmptyCount: 0,
     sendAttemptCount: 0,
+    clientUserAgent,
     linkedPayload,
     closeStream: () => {
       if (didCloseStream) {
@@ -4264,7 +4305,7 @@ async function handleMessageStream(
 
   try {
     const { Net } = await getSignalModules();
-    const net = createNet(Net);
+    const net = createNet(Net, clientUserAgent);
     connection = await net.connectAuthenticatedChat(
       username,
       password,
@@ -4742,7 +4783,9 @@ async function handleNetworkChange(
   const body = await readJson(req);
   const sessionId =
     typeof body.sessionId === 'string' ? body.sessionId : undefined;
-  libsignalNetInstance?.onNetworkChange();
+  for (const net of libsignalNetInstances?.values() ?? []) {
+    net.onNetworkChange();
+  }
 
   const streamSession = sessionId ? streamSessions.get(sessionId) : undefined;
   if (streamSession) {
@@ -5692,7 +5735,7 @@ async function handleLookupPhoneNumbers(
   }
 
   const { Net } = await getSignalModules();
-  const net = createNet(Net);
+  const net = createNet(Net, streamSession.clientUserAgent);
   const auth = await fetchCdsiAuth(streamSession);
   const result = await cdsiLookupWithTimeout(net, auth, {
     e164s,
@@ -7327,6 +7370,7 @@ async function handleContactsSync(
   const aci = typeof body.aci === 'string' ? body.aci : undefined;
   const pni = typeof body.pni === 'string' ? body.pni : undefined;
   const number = typeof body.number === 'string' ? body.number : undefined;
+  const clientUserAgent = normalizeClientUserAgent(body.clientUserAgent);
   if (!username || !password || !storageServiceKey || !aci || !number) {
     sendText(
       req,
@@ -7343,7 +7387,7 @@ async function handleContactsSync(
   }
 
   const { Net } = await getSignalModules();
-  const net = createNet(Net);
+  const net = createNet(Net, clientUserAgent);
   let connection: AuthenticatedChatConnection | undefined;
   try {
     connection = await net.connectAuthenticatedChat(
@@ -7855,8 +7899,13 @@ async function handleRequest(
   if (req.method === 'POST' && url.pathname === '/provisioning/sessions') {
     const body = await readJson(req);
     const deviceName =
-      typeof body.deviceName === 'string' ? body.deviceName : 'Signal Web';
-    const session = await startProvisioningSession(deviceName);
+      typeof body.deviceName === 'string'
+        ? body.deviceName
+        : DEFAULT_DEVICE_NAME;
+    const session = await startProvisioningSession(
+      deviceName,
+      normalizeClientUserAgent(body.clientUserAgent)
+    );
     sendJson(req, res, 200, getSessionResponse(session));
     return;
   }

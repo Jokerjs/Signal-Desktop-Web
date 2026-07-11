@@ -28,6 +28,69 @@ function apiUrl(path: string): URL {
 let currentMessageRuntimeSessionId: string | undefined;
 const MESSAGE_STREAM_READ_TIMEOUT_MS = 90_000;
 
+type WebHttpError = HTTPError & {
+  body?: unknown;
+};
+
+type WebMessageChallengeRequest = Readonly<{
+  error?: string;
+  options?: ReadonlyArray<string>;
+  retryAfterMs?: number;
+  runtimeSessionId?: string;
+  token: string;
+}>;
+
+type WebMessageChallengeHandler = (
+  request: WebMessageChallengeRequest
+) => Promise<void>;
+
+type HCaptchaApi = Readonly<{
+  render: (
+    container: HTMLElement | string,
+    options: Readonly<Record<string, unknown>>
+  ) => string;
+  remove?: (widgetId: string) => void;
+}>;
+
+let messageChallengeHandler: WebMessageChallengeHandler | undefined;
+let hCaptchaLoadPromise: Promise<HCaptchaApi> | undefined;
+
+const SIGNAL_HCAPTCHA_SITEKEY = '5fad97ac-7d06-4e44-b18a-b950b20148ff';
+const SIGNAL_HCAPTCHA_SCHEME = 'signal-hcaptcha';
+const SIGNAL_HCAPTCHA_ACTION = 'challenge';
+const SIGNAL_DESKTOP_VERSION = '8.18.0';
+const SIGNAL_DESKTOP_MACOS_RELEASE = '25.4.0';
+const SIGNAL_DESKTOP_WINDOWS_RELEASE = '10.0.22000';
+const SIGNAL_DESKTOP_LINUX_RELEASE = '6.8.0';
+
+export function setMessageChallengeHandler(
+  handler: WebMessageChallengeHandler | undefined
+): void {
+  messageChallengeHandler = handler;
+}
+
+export function getSignalDesktopDeviceName(): 'macOS' | 'Windows' | 'Linux' {
+  const platform = navigator.platform.toLowerCase();
+  if (platform.includes('mac')) {
+    return 'macOS';
+  }
+  if (platform.includes('win')) {
+    return 'Windows';
+  }
+  return 'Linux';
+}
+
+export function getSignalDesktopUserAgent(): string {
+  const deviceName = getSignalDesktopDeviceName();
+  if (deviceName === 'macOS') {
+    return `Signal-Desktop/${SIGNAL_DESKTOP_VERSION} macOS ${SIGNAL_DESKTOP_MACOS_RELEASE}`;
+  }
+  if (deviceName === 'Windows') {
+    return `Signal-Desktop/${SIGNAL_DESKTOP_VERSION} Windows ${SIGNAL_DESKTOP_WINDOWS_RELEASE}`;
+  }
+  return `Signal-Desktop/${SIGNAL_DESKTOP_VERSION} Linux ${SIGNAL_DESKTOP_LINUX_RELEASE}`;
+}
+
 function normalizeDirectAccessKey(
   accessKey: string | undefined
 ): string | undefined {
@@ -52,13 +115,22 @@ function getLinkedSessionRequestBody(
     storageServiceKey: linkedSession.storageServiceKey,
     linkedPayload: linkedSession.linkedPayload,
     protocol: includeProtocol ? linkedSession.protocol : undefined,
+    clientUserAgent: getSignalDesktopUserAgent(),
   };
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const details = await response.text();
-    throw new HTTPError(
+    let body: unknown;
+    if (details) {
+      try {
+        body = JSON.parse(details);
+      } catch {
+        body = undefined;
+      }
+    }
+    const error = new HTTPError(
       details
         ? `Request failed with status ${response.status}: ${details}`
         : `Request failed with status ${response.status}`,
@@ -68,8 +140,266 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
         response,
       }
     );
+    (error as WebHttpError).body = body;
+    throw error;
   }
   return response.json() as Promise<T>;
+}
+
+function isWebRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getMessageChallengeRequest(
+  error: unknown,
+  runtimeSessionId: string | undefined
+): WebMessageChallengeRequest | undefined {
+  if (!(error instanceof HTTPError) || error.code !== 428) {
+    return undefined;
+  }
+
+  const body = (error as WebHttpError).body;
+  if (!isWebRecord(body)) {
+    return undefined;
+  }
+
+  const token = body.token;
+  if (typeof token !== 'string' || !token) {
+    return undefined;
+  }
+
+  const options = Array.isArray(body.options)
+    ? body.options.filter((item): item is string => typeof item === 'string')
+    : undefined;
+
+  return {
+    error: typeof body.error === 'string' ? body.error : undefined,
+    options,
+    retryAfterMs:
+      typeof body.retryAfterMs === 'number' ? body.retryAfterMs : undefined,
+    runtimeSessionId,
+    token,
+  };
+}
+
+function getHCaptcha(): HCaptchaApi | undefined {
+  return (window as typeof window & { hcaptcha?: HCaptchaApi }).hcaptcha;
+}
+
+async function loadHCaptcha(): Promise<HCaptchaApi> {
+  const loaded = getHCaptcha();
+  if (loaded) {
+    return loaded;
+  }
+
+  hCaptchaLoadPromise ??= new Promise<HCaptchaApi>((resolve, reject) => {
+    const script = document.createElement('script');
+    script.async = true;
+    script.defer = true;
+    script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+    script.onload = () => {
+      const hcaptcha = getHCaptcha();
+      if (hcaptcha) {
+        resolve(hcaptcha);
+        return;
+      }
+      reject(new Error('hCaptcha script loaded without hcaptcha API'));
+    };
+    script.onerror = () => {
+      hCaptchaLoadPromise = undefined;
+      reject(new Error('Failed to load hCaptcha script'));
+    };
+    document.head.appendChild(script);
+  });
+
+  return hCaptchaLoadPromise;
+}
+
+function getCaptchaTheme(): 'dark' | 'light' {
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark'
+      : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
+function createSignalCaptchaSolution(hcaptchaToken: string): string {
+  return [
+    SIGNAL_HCAPTCHA_SCHEME,
+    SIGNAL_HCAPTCHA_SITEKEY,
+    SIGNAL_HCAPTCHA_ACTION,
+    hcaptchaToken,
+  ].join('.');
+}
+
+async function requestWebCaptcha(): Promise<string> {
+  const overlay = document.createElement('div');
+  overlay.style.alignItems = 'center';
+  overlay.style.background = 'rgba(0, 0, 0, 0.45)';
+  overlay.style.display = 'flex';
+  overlay.style.inset = '0';
+  overlay.style.justifyContent = 'center';
+  overlay.style.position = 'fixed';
+  overlay.style.zIndex = '2147483647';
+
+  const dialog = document.createElement('div');
+  dialog.style.background = getCaptchaTheme() === 'dark' ? '#1f1f1f' : '#fff';
+  dialog.style.borderRadius = '10px';
+  dialog.style.boxShadow = '0 18px 48px rgba(0, 0, 0, 0.35)';
+  dialog.style.boxSizing = 'border-box';
+  dialog.style.color = getCaptchaTheme() === 'dark' ? '#f4f4f4' : '#1b1b1b';
+  dialog.style.maxWidth = '420px';
+  dialog.style.padding = '24px';
+  dialog.style.width = 'calc(100vw - 40px)';
+
+  const title = document.createElement('div');
+  title.textContent = 'Signal captcha required';
+  title.style.fontSize = '18px';
+  title.style.fontWeight = '600';
+  title.style.marginBottom = '8px';
+
+  const description = document.createElement('div');
+  description.textContent =
+    'Complete this captcha to continue sending messages.';
+  description.style.fontSize = '14px';
+  description.style.lineHeight = '20px';
+  description.style.marginBottom = '18px';
+
+  const captchaContainer = document.createElement('div');
+  captchaContainer.style.minHeight = '78px';
+
+  const buttonRow = document.createElement('div');
+  buttonRow.style.display = 'flex';
+  buttonRow.style.justifyContent = 'flex-end';
+  buttonRow.style.marginTop = '18px';
+
+  const cancelButton = document.createElement('button');
+  cancelButton.textContent = 'Cancel';
+  cancelButton.type = 'button';
+  cancelButton.style.background = 'transparent';
+  cancelButton.style.border = '0';
+  cancelButton.style.color =
+    getCaptchaTheme() === 'dark' ? '#a8c7ff' : '#1a73e8';
+  cancelButton.style.cursor = 'pointer';
+  cancelButton.style.font = 'inherit';
+  cancelButton.style.padding = '8px 10px';
+
+  buttonRow.appendChild(cancelButton);
+  dialog.append(title, description, captchaContainer, buttonRow);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  return new Promise<string>((resolve, reject) => {
+    let widgetId: string | undefined;
+    let isSettled = false;
+
+    const cleanup = () => {
+      if (widgetId) {
+        getHCaptcha()?.remove?.(widgetId);
+      }
+      overlay.remove();
+    };
+
+    const settle = (callback: () => void) => {
+      if (isSettled) {
+        return;
+      }
+      isSettled = true;
+      cleanup();
+      callback();
+    };
+
+    cancelButton.onclick = () => {
+      settle(() => reject(new Error('Signal captcha challenge was cancelled')));
+    };
+
+    void loadHCaptcha()
+      .then(hcaptcha => {
+        if (isSettled) {
+          return;
+        }
+        widgetId = hcaptcha.render(captchaContainer, {
+          callback: (hcaptchaToken: string) => {
+            settle(() => resolve(createSignalCaptchaSolution(hcaptchaToken)));
+          },
+          'error-callback': () => {
+            settle(() => reject(new Error('Signal captcha challenge failed')));
+          },
+          'expired-callback': () => {
+            settle(() => reject(new Error('Signal captcha challenge expired')));
+          },
+          sitekey: SIGNAL_HCAPTCHA_SITEKEY,
+          theme: getCaptchaTheme(),
+        });
+      })
+      .catch(error => {
+        settle(() =>
+          reject(
+            error instanceof Error
+              ? error
+              : new Error('Signal captcha challenge failed')
+          )
+        );
+      });
+  });
+}
+
+async function defaultMessageChallengeHandler({
+  runtimeSessionId,
+  token,
+}: WebMessageChallengeRequest): Promise<void> {
+  const captcha = await requestWebCaptcha();
+  if (!captcha) {
+    throw new Error('Signal captcha challenge was cancelled');
+  }
+
+  window.reduxActions?.network.setChallengeStatus('pending');
+  await submitMessageChallenge({
+    captcha,
+    runtimeSessionId,
+    token,
+  });
+}
+
+async function solveMessageChallengeIfNeeded(
+  error: unknown,
+  runtimeSessionId: string | undefined
+): Promise<boolean> {
+  const request = getMessageChallengeRequest(error, runtimeSessionId);
+  if (!request) {
+    return false;
+  }
+
+  if (request.options && !request.options.includes('captcha')) {
+    return false;
+  }
+
+  window.reduxActions?.network.setChallengeStatus('required');
+  try {
+    await (messageChallengeHandler ?? defaultMessageChallengeHandler)(request);
+    return true;
+  } finally {
+    window.reduxActions?.network.setChallengeStatus('idle');
+  }
+}
+
+async function fetchMessageJson<T>(
+  path: string,
+  init: RequestInit,
+  runtimeSessionId: string | undefined
+): Promise<T> {
+  try {
+    return await parseJsonResponse<T>(await fetch(apiUrl(path), init));
+  } catch (error) {
+    const solved = await solveMessageChallengeIfNeeded(error, runtimeSessionId);
+    if (!solved) {
+      throw error;
+    }
+  }
+
+  return parseJsonResponse<T>(await fetch(apiUrl(path), init));
 }
 
 async function parseSignalApiJsonResponse<T>(response: Response): Promise<T> {
@@ -151,7 +481,10 @@ export async function startProvisioningSession(
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ deviceName }),
+    body: JSON.stringify({
+      clientUserAgent: getSignalDesktopUserAgent(),
+      deviceName,
+    }),
   });
   return normalizeProvisioningSession(await parseJsonResponse(response));
 }
@@ -347,25 +680,28 @@ export async function sendDirectTextMessage({
   unpinMessage?: WebUnpinMessage;
   quote?: WebMessage['quote'];
 }>): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
-  const response = await fetch(apiUrl('/messages/send'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/send',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        body,
+        timestamp,
+        attachments,
+        isViewOnce,
+        pinMessage,
+        unpinMessage,
+        quote,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      body,
-      timestamp,
-      attachments,
-      isViewOnce,
-      pinMessage,
-      unpinMessage,
-      quote,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function submitMessageChallenge({
@@ -407,21 +743,24 @@ export async function sendDirectExpirationTimerUpdate({
   expireTimerVersion: number;
   timestamp: number;
 }>): Promise<WebMessage> {
-  const response = await fetch(apiUrl('/messages/expiration-timer'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/expiration-timer',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        expireTimer,
+        expireTimerVersion,
+        timestamp,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      expireTimer,
-      expireTimerVersion,
-      timestamp,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function writeProfile({
@@ -699,21 +1038,24 @@ export async function sendDirectDeleteForEveryone({
   deleteForEveryone: WebDeleteForEveryone;
   timestamp: number;
 }>): Promise<void> {
-  const response = await fetch(apiUrl('/messages/send'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  await fetchMessageJson(
+    '/messages/send',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        body: '',
+        timestamp,
+        deleteForEveryone,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      body: '',
-      timestamp,
-      deleteForEveryone,
-    }),
-  });
-  await parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function sendDirectUnpinMessage({
@@ -729,21 +1071,24 @@ export async function sendDirectUnpinMessage({
   unpinMessage: WebUnpinMessage;
   timestamp: number;
 }>): Promise<WebMessage> {
-  const response = await fetch(apiUrl('/messages/send'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/send',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        body: '',
+        timestamp,
+        unpinMessage,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      body: '',
-      timestamp,
-      unpinMessage,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 async function getImageMetadata(file: File): Promise<Partial<WebAttachment>> {
@@ -901,23 +1246,26 @@ export async function sendDirectReaction({
   targetTimestamp: number;
   timestamp: number;
 }>): Promise<{ ok: true; timestamp: number }> {
-  const response = await fetch(apiUrl('/messages/reaction'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/reaction',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        emoji,
+        remove,
+        targetAuthorAci,
+        targetTimestamp,
+        timestamp,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      emoji,
-      remove,
-      targetAuthorAci,
-      targetTimestamp,
-      timestamp,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function sendGroupReaction({
@@ -946,25 +1294,28 @@ export async function sendGroupReaction({
   targetTimestamp: number;
   timestamp: number;
 }>): Promise<{ ok: true; timestamp: number }> {
-  const response = await fetch(apiUrl('/messages/reaction'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/reaction',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        emoji,
+        groupId,
+        groupV2,
+        groupSendEndorsements,
+        recipients,
+        remove,
+        targetAuthorAci,
+        targetTimestamp,
+        timestamp,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      emoji,
-      groupId,
-      groupV2,
-      groupSendEndorsements,
-      recipients,
-      remove,
-      targetAuthorAci,
-      targetTimestamp,
-      timestamp,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function sendDirectEditMessage({
@@ -982,21 +1333,24 @@ export async function sendDirectEditMessage({
   targetTimestamp: number;
   timestamp: number;
 }>): Promise<{ ok: true; timestamp: number }> {
-  const response = await fetch(apiUrl('/messages/edit'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/edit',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        accessKey: normalizeDirectAccessKey(accessKey),
+        destinationServiceId,
+        body,
+        targetTimestamp,
+        timestamp,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      accessKey: normalizeDirectAccessKey(accessKey),
-      destinationServiceId,
-      body,
-      targetTimestamp,
-      timestamp,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function sendGroupTextMessage({
@@ -1031,28 +1385,31 @@ export async function sendGroupTextMessage({
   recipients?: ReadonlyArray<string>;
   unpinMessage?: WebUnpinMessage;
 }>): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
-  const response = await fetch(apiUrl('/messages/send-group'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/send-group',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        groupId,
+        body,
+        timestamp,
+        attachments,
+        deleteForEveryone,
+        groupV2,
+        groupSendEndorsements,
+        isViewOnce,
+        pinMessage,
+        quote,
+        recipients,
+        unpinMessage,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      groupId,
-      body,
-      timestamp,
-      attachments,
-      deleteForEveryone,
-      groupV2,
-      groupSendEndorsements,
-      isViewOnce,
-      pinMessage,
-      quote,
-      recipients,
-      unpinMessage,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function modifyGroupMember({
@@ -1216,19 +1573,22 @@ export async function sendMessageRequestResponseSync({
   timestamp: number;
   type: number;
 }> {
-  const response = await fetch(apiUrl('/messages/message-request-response'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  return fetchMessageJson(
+    '/messages/message-request-response',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: runtimeSessionId,
+        threadAci,
+        timestamp,
+        type,
+      }),
     },
-    body: JSON.stringify({
-      sessionId: runtimeSessionId,
-      threadAci,
-      timestamp,
-      type,
-    }),
-  });
-  return parseJsonResponse(response);
+    runtimeSessionId
+  );
 }
 
 export async function syncContacts({

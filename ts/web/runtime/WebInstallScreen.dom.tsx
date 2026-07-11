@@ -19,6 +19,7 @@ import {
 import {
   getProvisioningLinkedSession,
   getProvisioningSession,
+  getSignalDesktopDeviceName,
   startProvisioningSession,
 } from '../api.dom.ts';
 
@@ -27,7 +28,6 @@ type ProvisioningViewState =
   | Readonly<{ step: 'qr'; sessionId: string; url: string }>
   | Readonly<{ step: 'linking' }>
   | Readonly<{ step: 'error' }>;
-
 async function wait(ms: number): Promise<void> {
   await new Promise(resolve => {
     setTimeout(resolve, ms);
@@ -50,7 +50,9 @@ export function WebInstallScreen({
     async function run(): Promise<void> {
       setState({ step: 'loading' });
       try {
-        const session = await startProvisioningSession('Signal Web');
+        const session = await startProvisioningSession(
+          getSignalDesktopDeviceName()
+        );
         if (session.url) {
           setState({
             step: 'qr',

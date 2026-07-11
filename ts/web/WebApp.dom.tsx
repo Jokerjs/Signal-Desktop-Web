@@ -6,6 +6,7 @@ import qrCodeFactory from 'qrcode-generator';
 import {
   buildAttachmentAccessUrl,
   consumeMessageTransportStream,
+  getSignalDesktopDeviceName,
   getProvisioningLinkedSession,
   getProvisioningSession,
   sendDirectTextMessage,
@@ -57,7 +58,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoDownloadImages: true,
   apiBaseUrl: window.__MY_RENDER_CONFIG__?.apiBaseUrl ?? '',
 };
-
 const EMPTY_CHAT_SHELL: ChatShellState = {
   conversationLookup: {},
   messages: [],
@@ -364,7 +364,9 @@ function LoginScreen({
   const start = useCallback(async () => {
     setError(undefined);
     setStatus('正在创建扫码会话');
-    const session = await startProvisioningSession('Signal Web');
+    const session = await startProvisioningSession(
+      getSignalDesktopDeviceName()
+    );
     setSessionId(session.sessionId);
     setQrUrl(session.url);
     setStatus(session.url ? '等待手机扫码确认' : '等待服务端返回二维码');
@@ -629,7 +631,7 @@ export function WebApp() {
   const [transportSessionId, setTransportSessionId] = useState<string>();
   const [streamError, setStreamError] = useState<string>();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const transportSessionIdRef = useRef<string>();
+  const transportSessionIdRef = useRef<string | undefined>(undefined);
   const latestProtocolStateRevisionRef = useRef(0);
 
   useEffect(() => {
