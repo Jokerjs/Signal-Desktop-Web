@@ -1,13 +1,14 @@
 // Copyright 2026 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import './runtime/initEnvironment.dom.ts';
+
 import { createRoot } from 'react-dom/client';
 import { bindActionCreators } from 'redux';
 import type { Store } from 'redux';
 import { Buffer } from 'buffer';
 
 import zhCNMessages from '../../_locales/zh-CN/messages.json';
-import { Environment, setEnvironment } from '../environment.std.ts';
 import { HourCyclePreference } from '../types/I18N.std.ts';
 import { NavTab } from '../types/Nav.std.ts';
 import { AppViewType } from '../types/app.std.ts';
@@ -36,12 +37,13 @@ import {
   applyContactsBootstrap,
   createDesktopConversationState,
 } from './runtime/stateAdapter.dom.ts';
+import { buildAttachmentAccessUrl } from './api.dom.ts';
 import { setupWebGlobals } from './runtime/setupWebGlobals.dom.ts';
 import {
   syncLinkedSessionUserStorage,
   WebDesktopApp,
 } from './runtime/WebDesktopApp.dom.tsx';
-import type { ChatShellState } from './types.std.ts';
+import type { ChatShellState, WebAttachment, WebMessage } from './types.std.ts';
 import {
   getLinkedSessionUserId,
   clearWebPersistence,
@@ -57,6 +59,7 @@ import {
   loadWebSettings,
 } from './runtime/webSettings.dom.ts';
 import { loadWebChatFolders } from './runtime/webChatFolders.dom.ts';
+import { loadWebBlessedStickerPacks } from './runtime/webStickers.dom.ts';
 
 const EMPTY_SHELL: ChatShellState = {
   conversationLookup: {},
@@ -77,12 +80,14 @@ window.SignalContext = {
   ...minimalSignalContext,
 };
 
-setEnvironment(Environment.PackagedApp, false);
-
 const WEB_REMOTE_CONFIG = [
+  ['global.attachments.maxAutoDownloadSizeBytes', '209715200'],
+  ['global.attachments.maxBytes', '104857600'],
+  ['global.attachments.maxReceiveBytes', '131072000'],
   ['global.groupsv2.groupSizeHardLimit', '64'],
   ['global.groupsv2.maxGroupSize', '32'],
   ['global.pinnedChatLimit', '4'],
+  ['global.videoAttachments.transcodeTargetBytes', '104857600'],
 ] as const;
 
 function getWebRemoteConfigState(): ConfigMapType {
@@ -159,6 +164,122 @@ function bindActionCreatorsDeep<T>(
   ) as T;
 }
 
+function getWebStickerAttachmentPath(
+  attachment: WebAttachment | undefined
+): string | undefined {
+  if (!attachment) {
+    return undefined;
+  }
+  if (attachment.url) {
+    return attachment.url;
+  }
+  if (attachment.downloadUrl) {
+    return attachment.downloadUrl;
+  }
+  if (attachment.dataBase64 && attachment.contentType) {
+    return `data:${attachment.contentType};base64,${attachment.dataBase64}`;
+  }
+
+  try {
+    return buildAttachmentAccessUrl(attachment) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function getWebStickerStateFromMessages(
+  messages: ReadonlyArray<WebMessage>,
+  baseStickers: StateType['stickers']
+): StateType['stickers'] {
+  const packs = { ...baseStickers.packs };
+  const recentStickers = [...baseStickers.recentStickers];
+  const recentStickerKeys = new Set(
+    recentStickers.map(item => `${item.packId}:${item.stickerId}`)
+  );
+
+  for (const message of messages) {
+    const sticker = message.sticker;
+    if (
+      !sticker?.packId ||
+      !sticker.packKey ||
+      typeof sticker.stickerId !== 'number'
+    ) {
+      continue;
+    }
+
+    const stickerData = sticker.data as WebAttachment | undefined;
+    const path = getWebStickerAttachmentPath(stickerData);
+    if (!path) {
+      continue;
+    }
+
+    const existingPack = packs[sticker.packId];
+    const stickers = { ...(existingPack?.stickers ?? {}) };
+    stickers[sticker.stickerId] = {
+      emoji: sticker.emoji,
+      height: stickerData?.height ?? 512,
+      id: sticker.stickerId,
+      isCoverOnly: false,
+      packId: sticker.packId,
+      path,
+      size: stickerData?.size,
+      version: 2,
+      width: stickerData?.width ?? 512,
+    };
+
+    const timestamp = message.receivedAt ?? message.timestamp;
+    packs[sticker.packId] = {
+      ...existingPack,
+      author: existingPack?.author ?? '',
+      coverStickerId: existingPack?.coverStickerId ?? sticker.stickerId,
+      createdAt: existingPack?.createdAt ?? timestamp,
+      downloadAttempts: existingPack?.downloadAttempts ?? 0,
+      id: sticker.packId,
+      installedAt: existingPack?.installedAt ?? timestamp,
+      key: sticker.packKey,
+      lastUsed: Math.max(existingPack?.lastUsed ?? 0, timestamp),
+      status: 'installed',
+      stickerCount: Object.keys(stickers).length,
+      stickers,
+      storageNeedsSync: false,
+      title: existingPack?.title || 'Web stickers',
+    };
+
+    const recentStickerKey = `${sticker.packId}:${sticker.stickerId}`;
+    if (!recentStickerKeys.has(recentStickerKey)) {
+      recentStickerKeys.add(recentStickerKey);
+      recentStickers.push({
+        packId: sticker.packId,
+        stickerId: sticker.stickerId,
+      });
+    }
+  }
+
+  return {
+    ...baseStickers,
+    packs,
+    recentStickers,
+  };
+}
+
+function getInitialWebStickerState(
+  messages: ReadonlyArray<WebMessage>,
+  baseStickers: StateType['stickers']
+): StateType['stickers'] {
+  return getWebStickerStateFromMessages(messages, baseStickers);
+}
+
+async function hydrateWebBlessedStickerPacks(): Promise<void> {
+  try {
+    const blessedPacks = await loadWebBlessedStickerPacks();
+    for (const pack of Object.values(blessedPacks)) {
+      window.reduxActions?.stickers?.stickerPackAdded?.(pack);
+    }
+  } catch (error) {
+    console.error('Failed to load web blessed sticker packs', error);
+  }
+}
+
 async function buildInitialState(): Promise<{
   initialState: StateType;
   linkedSession: Awaited<
@@ -211,6 +332,9 @@ async function buildInitialState(): Promise<{
   const selectedConversationId = shell.selectedConversationId;
   const webSettings = loadWebSettings();
   const remoteConfig = getWebRemoteConfigState();
+  const stickers = storedSession
+    ? getInitialWebStickerState(shell.messages, baseState.stickers)
+    : baseState.stickers;
 
   return {
     linkedSession: storedSession,
@@ -230,6 +354,7 @@ async function buildInitialState(): Promise<{
         ...baseState.conversations,
         ...(desktopConversations ?? {}),
       } as StateType['conversations'],
+      stickers,
       chatFolders: getInitialChatFoldersState(
         storedSession ? loadWebChatFolders(sessionUserId) : []
       ),
@@ -355,6 +480,10 @@ async function start(): Promise<void> {
       store={store}
     />
   );
+
+  if (linkedSession) {
+    void hydrateWebBlessedStickerPacks();
+  }
 }
 
 void start();

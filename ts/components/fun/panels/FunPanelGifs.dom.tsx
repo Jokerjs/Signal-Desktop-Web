@@ -651,40 +651,55 @@ const Item = memo(function Item(props: {
   );
 
   const descriptionId = `FunGifsPanelItem__GifDescription--${props.gif.id}`;
-  const [src, setSrc] = useState<string | null>(() => {
-    const cached = readGifMediaFromCache(props.gif.previewMedia);
-    return cached != null ? URL.createObjectURL(cached) : null;
-  });
+  const [src, setSrc] = useState<string | null>(null);
 
   useEffect(() => {
-    if (src != null) {
-      return;
-    }
-
     const controller = new AbortController();
     const { signal } = controller;
+    const gif = props.gif;
+    const previewMedia = gif.previewMedia;
+    let objectUrl: string | undefined;
+    let didCancel = false;
+
+    const cached = readGifMediaFromCache(previewMedia);
+    if (cached != null) {
+      objectUrl = URL.createObjectURL(cached);
+      setSrc(objectUrl);
+    } else {
+      setSrc(null);
+    }
 
     async function download() {
-      const cdnUrl = props.gif.previewMedia.url;
-      const cdnUrlOrigin = getGifCdnUrlOrigin(props.gif.previewMedia.url);
+      if (cached != null) {
+        return;
+      }
+
+      const cdnUrl = previewMedia.url;
+      const cdnUrlOrigin = getGifCdnUrlOrigin(previewMedia.url);
 
       if (cdnUrlOrigin == null || !isGifCdnUrlOriginAllowed(cdnUrlOrigin)) {
-        onRemoveRecentGif(props.gif.id);
+        onRemoveRecentGif(gif.id);
         return;
       }
 
       try {
         const bytes = await fetchGiphyFile(cdnUrl, signal);
         const blob = new Blob([bytes]);
-        saveGifMediaToCache(props.gif.previewMedia, blob);
-        setSrc(URL.createObjectURL(blob));
+        saveGifMediaToCache(previewMedia, blob);
+        const downloadedObjectUrl = URL.createObjectURL(blob);
+        if (didCancel) {
+          URL.revokeObjectURL(downloadedObjectUrl);
+          return;
+        }
+        objectUrl = downloadedObjectUrl;
+        setSrc(downloadedObjectUrl);
       } catch (error) {
         if (isAbortError(error)) {
           return; // ignore
         }
 
         if (isTenorCdnUrlOrigin(cdnUrlOrigin)) {
-          onRemoveRecentGif(props.gif.id);
+          onRemoveRecentGif(gif.id);
           return;
         }
 
@@ -695,17 +710,13 @@ const Item = memo(function Item(props: {
     drop(download());
 
     return () => {
+      didCancel = true;
       controller.abort();
-    };
-  }, [props.gif, src, fetchGiphyFile, onRemoveRecentGif]);
-
-  useEffect(() => {
-    return () => {
-      if (src != null) {
-        URL.revokeObjectURL(src);
+      if (objectUrl != null) {
+        URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [src]);
+  }, [props.gif, fetchGiphyFile, onRemoveRecentGif]);
 
   return (
     <FunWaterfallItem

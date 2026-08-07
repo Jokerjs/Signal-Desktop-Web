@@ -1,8 +1,8 @@
 // Copyright 2025 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 import classNames from 'classnames';
-import type { CSSProperties, JSX } from 'react';
-import { useMemo, useState, useCallback, useRef } from 'react';
+import type { CSSProperties, JSX, SyntheticEvent } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import MANIFEST from '../../../build/jumbomoji.json';
 import type { FunImageAriaProps } from './types.dom.tsx';
 import { createLogger } from '../../logging/log.std.ts';
@@ -20,7 +20,8 @@ const MIN_JUMBOMOJI_SIZE = 33;
 
 function canLoadEmojiProtocol(): boolean {
   return (
-    window.location.protocol !== 'http:' && window.location.protocol !== 'https:'
+    window.location.protocol !== 'http:' &&
+    window.location.protocol !== 'https:'
   );
 }
 
@@ -34,13 +35,14 @@ function getEmojiJumboUrl(
   emoji: Emoji.Variant,
   size: number | undefined
 ): string | null {
+  const isWeb = !canLoadEmojiProtocol();
   if (size != null && size < MIN_JUMBOMOJI_SIZE) {
     return null;
   }
   if (KNOWN_JUMBOMOJI.has(emoji)) {
-    return canLoadEmojiProtocol()
-      ? `emoji://jumbo?emoji=${encodeURIComponent(emoji)}`
-      : getWebEmojiJumboUrl(emoji);
+    return isWeb
+      ? getWebEmojiJumboUrl(emoji)
+      : `emoji://jumbo?emoji=${encodeURIComponent(emoji)}`;
   }
   return null;
 }
@@ -94,14 +96,26 @@ export type FunStaticEmojiProps = FunImageAriaProps &
 
 export function FunStaticEmoji(props: FunStaticEmojiProps): JSX.Element {
   const [isLoaded, setIsLoaded] = useState(false);
-
-  const onLoad = useCallback(() => {
-    setIsLoaded(true);
-  }, []);
+  const [hasFailed, setHasFailed] = useState(false);
 
   const jumboImage = getEmojiJumboUrl(props.emoji, props.size);
+
+  useEffect(() => {
+    setIsLoaded(false);
+    setHasFailed(false);
+  }, [jumboImage]);
+
+  const onLoad = useCallback((event: SyntheticEvent<HTMLImageElement>) => {
+    setIsLoaded(event.currentTarget.naturalWidth > 0);
+  }, []);
+
+  const onError = useCallback(() => {
+    setHasFailed(true);
+    setIsLoaded(false);
+  }, []);
+
   let img: JSX.Element | undefined;
-  if (jumboImage != null) {
+  if (jumboImage != null && !hasFailed) {
     img = (
       <img
         width={props.size}
@@ -116,6 +130,7 @@ export function FunStaticEmoji(props: FunStaticEmojiProps): JSX.Element {
         style={{ display: isLoaded ? undefined : 'none' }}
         src={jumboImage}
         onLoad={onLoad}
+        onError={onError}
       />
     );
   }
@@ -177,6 +192,7 @@ export type FunInlineEmojiProps = FunImageAriaProps &
 
 export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
   const [isLoaded, setIsLoaded] = useState(false);
+  const [hasFailed, setHasFailed] = useState(false);
   const jumboRef = useRef<HTMLSpanElement | null>(null);
   const jumboImage = useMemo(() => {
     // Note: we don't pass size here because appearance of jumbomoji is decided
@@ -185,22 +201,41 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
   }, [props.emoji]);
   const isWebJumboImage = jumboImage != null && !canLoadEmojiProtocol();
 
-  const onLoad = useCallback(() => {
-    if (isWebJumboImage) {
+  useEffect(() => {
+    setIsLoaded(false);
+    setHasFailed(false);
+  }, [jumboImage]);
+
+  const onLoad = useCallback(
+    (event: SyntheticEvent<HTMLImageElement>) => {
+      if (event.currentTarget.naturalWidth === 0) {
+        setHasFailed(true);
+        setIsLoaded(false);
+        return;
+      }
+
+      if (isWebJumboImage) {
+        setIsLoaded(true);
+        return;
+      }
+
+      const jumbo = jumboRef.current;
+      if (jumbo == null || window.getComputedStyle(jumbo).display === 'none') {
+        return;
+      }
+
       setIsLoaded(true);
-      return;
-    }
+    },
+    [isWebJumboImage]
+  );
 
-    const jumbo = jumboRef.current;
-    if (jumbo == null || window.getComputedStyle(jumbo).display === 'none') {
-      return;
-    }
-
-    setIsLoaded(true);
-  }, [isWebJumboImage]);
+  const onError = useCallback(() => {
+    setHasFailed(true);
+    setIsLoaded(false);
+  }, []);
 
   let img: JSX.Element | undefined;
-  if (jumboImage) {
+  if (jumboImage && !hasFailed) {
     img = (
       <img
         className={classNames(
@@ -212,6 +247,7 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
         loading={isWebJumboImage ? 'eager' : 'lazy'}
         src={jumboImage}
         onLoad={onLoad}
+        onError={onError}
       />
     );
   }

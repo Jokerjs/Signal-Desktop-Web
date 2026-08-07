@@ -668,6 +668,7 @@ export async function sendDirectTextMessage({
   pinMessage,
   unpinMessage,
   quote,
+  sticker,
 }: Readonly<{
   runtimeSessionId?: string;
   accessKey?: string;
@@ -679,6 +680,7 @@ export async function sendDirectTextMessage({
   pinMessage?: WebPinMessage;
   unpinMessage?: WebUnpinMessage;
   quote?: WebMessage['quote'];
+  sticker?: WebMessage['sticker'];
 }>): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
   return fetchMessageJson(
     '/messages/send',
@@ -698,6 +700,7 @@ export async function sendDirectTextMessage({
         pinMessage,
         unpinMessage,
         quote,
+        sticker,
       }),
     },
     runtimeSessionId
@@ -1366,6 +1369,7 @@ export async function sendGroupTextMessage({
   pinMessage,
   quote,
   recipients,
+  sticker,
   unpinMessage,
 }: Readonly<{
   runtimeSessionId?: string;
@@ -1383,6 +1387,7 @@ export async function sendGroupTextMessage({
   pinMessage?: WebPinMessage;
   quote?: WebMessage['quote'];
   recipients?: ReadonlyArray<string>;
+  sticker?: WebMessage['sticker'];
   unpinMessage?: WebUnpinMessage;
 }>): Promise<WebMessage & { attachments?: ReadonlyArray<WebAttachment> }> {
   return fetchMessageJson(
@@ -1405,6 +1410,7 @@ export async function sendGroupTextMessage({
         pinMessage,
         quote,
         recipients,
+        sticker,
         unpinMessage,
       }),
     },

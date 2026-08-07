@@ -44,6 +44,8 @@ import {
 } from '../../AttachmentCrypto.node.ts';
 import type { PlaintextSourceType } from '../../AttachmentCrypto.node.ts';
 import {
+  decryptAttachmentV1,
+  deriveStickerPackKey,
   PaddedLengths,
   encryptProfile,
   encryptProfileItemWithPadding,
@@ -119,6 +121,10 @@ import {
 } from './WebSignalSendBridge.node.ts';
 import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 import {
+  getGifCdnUrlOrigin,
+  isGiphyCdnUrlOrigin,
+} from '../../util/gifCdnUrls.dom.ts';
+import {
   createGroupConversation,
   enrichGroupConversations,
   fetchLatestGroupStateConversation,
@@ -174,6 +180,67 @@ const productionConfig = require('../../../config/production.json') as {
   serverUrl: string;
   storageUrl: string;
   cdn: Record<string, string>;
+};
+
+const WEB_BLESSED_STICKER_PACKS: Record<
+  string,
+  { key: string; status: 'downloaded' }
+> = {
+  // Rocky Talk
+  '42fb75e1827c0c945cfb5ca0975db03c': {
+    key: '7uJ+K593PgpV6iTDQLe+hYcRpuK9m27nBEND4OQovmU=',
+    status: 'downloaded',
+  },
+  // My Daily Life 1
+  ccc89a05dc077856b57351e90697976c: {
+    key: 'RXMOYPCdVWYRUiN0RTemt9nqmc7qy3eh+9aAG5YH+88=',
+    status: 'downloaded',
+  },
+  // Zozo the French Bulldog
+  fb535407d2f6497ec074df8b9c51dd1d: {
+    key: 'F+lxwTQDViJ4HS7iSeZHO3dFg3ULaMEbuCt1CcaLbf0=',
+    status: 'downloaded',
+  },
+  // Croco's Feelings
+  '3044281a51307306e5442f2e9070953a': {
+    key: 'xMqqhDl+GmMKWWD1SguCdTyIpeUuDe/mFbpN2A8TDL8=',
+    status: 'downloaded',
+  },
+  // My Daily Life 2
+  a2414255948558316f37c1d36c64cd28: {
+    key: '/aEpNxltI28cqeEZalZULh0c72/4TivgOChxf6IK02Y=',
+    status: 'downloaded',
+  },
+  // Cozy Season
+  '684d2b7bcfc2eec6f57f2e7be0078e0f': {
+    key: 'hm4Ny0obJfKwTfJwzXQnI+SmVVwKGrw/PzDcxaIBDFU=',
+    status: 'downloaded',
+  },
+  // Chug the Mouse
+  f19548e5afa38d1ce4f5c3191eba5e30: {
+    key: 'LLMHZ0D2aapExsBjKQskmn0ApLAu2PnppbkCo38bvEE=',
+    status: 'downloaded',
+  },
+  // Bandit the Cat
+  '9acc9e8aba563d26a4994e69263e3b25': {
+    key: 'Wm3/OUjCjvubeq+T7MN1xp/DFueAd+0mhnoU0QoPahI=',
+    status: 'downloaded',
+  },
+  // Swoon / Hands
+  e61fa0867031597467ccc036cc65d403: {
+    key: 'E657GnQHMYKA6bOMEmHe044OcTi5+WSmzLtz5A9zeps=',
+    status: 'downloaded',
+  },
+  // Swoon / Faces
+  cca32f5b905208b7d0f1e17f23fdc185: {
+    key: 'i/jpX3pFver+DI9bAC7wGrlbjxtbqsQBnM1ra+Cxg3o=',
+    status: 'downloaded',
+  },
+  // Day by Day
+  cfc50156556893ef9838069d3890fe49: {
+    key: 'X1vqt9OCRDywCh5I65Upe2uMrf0GMeXQ2dyUnmmZ/0s=',
+    status: 'downloaded',
+  },
 };
 
 function getDefaultCdnUrl(): string {
@@ -1606,8 +1673,18 @@ function sendCors(req: IncomingMessage, res: ServerResponse): void {
   } else if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,HEAD,POST,PUT,DELETE,OPTIONS'
+  );
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type,Authorization,Range'
+  );
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Accept-Ranges,Content-Length,Content-Range,Content-Type'
+  );
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
 }
 
@@ -1715,10 +1792,9 @@ function verifyOptionalResourceDigest({
   }
 }
 
-async function getEmojiSheetProto(
-  sheet: string
+async function getOptionalResource(
+  resourceName: string
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const resourceName = `emoji-sheet-${sheet}.proto`;
   const resource = optionalResources[resourceName];
   if (!resource) {
     throw new Error(`${resourceName}: optional resource not found`);
@@ -1757,6 +1833,12 @@ async function getEmojiSheetProto(
   });
   writeFileSync(localPath, data);
   return toArrayBufferUint8Array(data);
+}
+
+async function getEmojiSheetProto(
+  sheet: string
+): Promise<Uint8Array<ArrayBuffer>> {
+  return getOptionalResource(`emoji-sheet-${sheet}.proto`);
 }
 
 async function getEmojiSheetImages(
@@ -1817,6 +1899,14 @@ async function handleEmojiJumbo(
   }
 
   sendBytes(req, res, 200, image, 'image/webp');
+}
+
+async function handleEmojiLargeFont(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const font = await getOptionalResource('emoji-font.woff2');
+  sendBytes(req, res, 200, font, 'font/woff2');
 }
 
 function getSessionResponse(session: ProvisioningSession): JsonRecord {
@@ -2009,6 +2099,30 @@ function parseWebAttachments(value: unknown): ReadonlyArray<WebAttachment> {
       error: getOptionalString(item.error),
     };
   });
+}
+
+function parseWebSticker(value: unknown): WebMessage['sticker'] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const packId = getOptionalString(value.packId);
+  const packKey = getOptionalString(value.packKey);
+  const stickerId = getOptionalNumber(value.stickerId);
+  const data = isRecord(value.data)
+    ? parseWebAttachments([value.data])[0]
+    : undefined;
+  if (!packId || !packKey || stickerId == null || !data) {
+    return undefined;
+  }
+
+  return {
+    packId,
+    packKey,
+    stickerId,
+    emoji: getOptionalString(value.emoji),
+    data,
+  } as WebMessage['sticker'];
 }
 
 function parseWebQuote(value: unknown): WebMessage['quote'] | undefined {
@@ -2974,6 +3088,289 @@ async function proxyToUpstream(
   }
   res.end();
   return true;
+}
+
+function isAllowedGiphyProxyTarget(target: URL): boolean {
+  if (
+    target.origin === 'https://api.giphy.com' &&
+    target.pathname.startsWith('/v1/gifs/')
+  ) {
+    return true;
+  }
+
+  const origin = getGifCdnUrlOrigin(target.toString());
+  return origin != null && isGiphyCdnUrlOrigin(origin);
+}
+
+async function handleGiphyProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL
+): Promise<void> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    sendText(req, res, 405, 'Method not allowed');
+    return;
+  }
+
+  const rawTarget = url.searchParams.get('url');
+  if (!rawTarget) {
+    sendText(req, res, 400, 'Missing url');
+    return;
+  }
+
+  let target: URL;
+  try {
+    target = new URL(rawTarget);
+  } catch {
+    sendText(req, res, 400, 'Invalid url');
+    return;
+  }
+
+  if (!isAllowedGiphyProxyTarget(target)) {
+    sendText(req, res, 403, 'Unsupported GIPHY proxy target');
+    return;
+  }
+
+  const headers: Record<string, string> = {};
+  if (typeof req.headers.range === 'string') {
+    headers.Range = req.headers.range;
+  }
+
+  const response = await fetch(target, {
+    method: req.method,
+    headers,
+  });
+  const contentLength = response.headers.get('content-length');
+  const contentRange = response.headers.get('content-range');
+  const shouldForwardContentLength =
+    req.method === 'HEAD' || headers.Range != null || contentRange != null;
+
+  sendCors(req, res);
+  res.writeHead(response.status, {
+    'Accept-Ranges': response.headers.get('accept-ranges') ?? 'bytes',
+    'Cache-Control': 'public, max-age=3600',
+    ...(shouldForwardContentLength && contentLength
+      ? { 'Content-Length': contentLength }
+      : null),
+    ...(contentRange ? { 'Content-Range': contentRange } : null),
+    'Content-Type':
+      response.headers.get('content-type') ?? 'application/octet-stream',
+  });
+
+  if (req.method !== 'HEAD' && response.body) {
+    for await (const chunk of response.body) {
+      res.write(chunk);
+    }
+  }
+  res.end();
+}
+
+type WebStickerDownload = Readonly<{
+  emoji?: string;
+  height: number;
+  id: number;
+  isCoverOnly: boolean;
+  packId: string;
+  path: string;
+  size?: number;
+  version: 2;
+  width: number;
+}>;
+
+type WebStickerPackDownload = Readonly<{
+  author: string;
+  coverStickerId: number;
+  createdAt: number;
+  downloadAttempts: number;
+  id: string;
+  installedAt: number;
+  key: string;
+  lastUsed: number;
+  status: 'installed';
+  stickerCount: number;
+  stickers: Record<string, WebStickerDownload>;
+  storageNeedsSync: false;
+  title: string;
+}>;
+
+let webBlessedStickerPacksCache:
+  | ReadonlyArray<WebStickerPackDownload>
+  | undefined;
+const webBlessedStickerCache = new Map<string, Uint8Array<ArrayBuffer>>();
+
+async function fetchStickerCiphertext(
+  path: string
+): Promise<Uint8Array<ArrayBuffer>> {
+  const response = await fetch(new URL(path, getDefaultCdnUrl()));
+  if (!response.ok) {
+    throw new Error(
+      `fetchStickerCiphertext: ${path} failed with status ${response.status}`
+    );
+  }
+
+  const buffer = await response.arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+function decryptWebSticker(
+  packKey: string,
+  ciphertext: Uint8Array<ArrayBuffer>
+): Uint8Array<ArrayBuffer> {
+  return decryptAttachmentV1(
+    ciphertext,
+    deriveStickerPackKey(Bytes.fromBase64(packKey))
+  );
+}
+
+async function downloadWebStickerPack(
+  packId: string,
+  packKey: string
+): Promise<WebStickerPackDownload> {
+  const manifestCiphertext = await fetchStickerCiphertext(
+    `/stickers/${encodeURIComponent(packId)}/manifest.proto`
+  );
+  const manifestPlaintext = decryptWebSticker(packKey, manifestCiphertext);
+  const proto = Proto.StickerPack.decode(manifestPlaintext);
+  const firstStickerProto = proto.stickers[0];
+  const coverProto = proto.cover || firstStickerProto;
+  const coverStickerId = coverProto?.id;
+
+  if (coverProto == null || coverStickerId == null) {
+    throw new Error(`downloadWebStickerPack: ${packId} has no cover sticker`);
+  }
+
+  const stickers: Record<string, WebStickerDownload> = {};
+  const coverStickerInList = proto.stickers.find(
+    sticker => sticker.id === coverStickerId
+  );
+  const coverIncludedInList = coverStickerInList != null;
+
+  const addSticker = (
+    stickerProto: Proto.StickerPack.Sticker.Params,
+    isCoverOnly: boolean,
+    emojiOverride?: string | null
+  ): void => {
+    const stickerId = stickerProto.id;
+    if (stickerId == null) {
+      return;
+    }
+
+    const emoji = emojiOverride ?? stickerProto.emoji;
+    stickers[stickerId] = {
+      emoji:
+        emoji != null
+          ? Emoji.unsafeCastMaybeInvalidStringToVariant(emoji)
+          : undefined,
+      height: 512,
+      id: stickerId,
+      isCoverOnly,
+      packId,
+      path: `/stickers/blessed/${encodeURIComponent(packId)}/${stickerId}.webp`,
+      version: 2,
+      width: 512,
+    };
+  };
+
+  addSticker(
+    coverProto,
+    !coverIncludedInList,
+    coverProto.emoji ?? coverStickerInList?.emoji
+  );
+  for (const stickerProto of proto.stickers) {
+    if (stickerProto.id !== coverStickerId) {
+      addSticker(stickerProto, false);
+    }
+  }
+
+  const nowMs = now();
+  return {
+    author: proto.author ?? '',
+    coverStickerId,
+    createdAt: nowMs,
+    downloadAttempts: 1,
+    id: packId,
+    installedAt: nowMs,
+    key: packKey,
+    lastUsed: nowMs,
+    status: 'installed',
+    stickerCount: proto.stickers.length,
+    stickers,
+    storageNeedsSync: false,
+    title: proto.title ?? '',
+  };
+}
+
+async function handleBlessedSticker(
+  req: IncomingMessage,
+  res: ServerResponse,
+  packId: string,
+  stickerId: number
+): Promise<void> {
+  if (req.method !== 'GET') {
+    sendText(req, res, 405, 'Method not allowed');
+    return;
+  }
+
+  const blessedPack = WEB_BLESSED_STICKER_PACKS[packId];
+  if (!blessedPack) {
+    sendText(req, res, 404, 'Sticker pack not found');
+    return;
+  }
+
+  const cacheKey = `${packId}:${stickerId}`;
+  let stickerPlaintext = webBlessedStickerCache.get(cacheKey);
+  if (!stickerPlaintext) {
+    const stickerCiphertext = await fetchStickerCiphertext(
+      `/stickers/${encodeURIComponent(packId)}/full/${stickerId}`
+    );
+    stickerPlaintext = decryptWebSticker(blessedPack.key, stickerCiphertext);
+    webBlessedStickerCache.set(cacheKey, stickerPlaintext);
+  }
+
+  sendCors(req, res);
+  res.writeHead(200, {
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Content-Length': String(stickerPlaintext.byteLength),
+    'Content-Type': 'image/webp',
+  });
+  res.end(Buffer.from(stickerPlaintext));
+}
+
+async function getWebBlessedStickerPacks(): Promise<
+  ReadonlyArray<WebStickerPackDownload>
+> {
+  if (webBlessedStickerPacksCache) {
+    return webBlessedStickerPacksCache;
+  }
+
+  const packs = new Array<WebStickerPackDownload>();
+  for (const [packId, { key }] of Object.entries(WEB_BLESSED_STICKER_PACKS)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      packs.push(await downloadWebStickerPack(packId, key));
+    } catch (error) {
+      console.warn(
+        `getWebBlessedStickerPacks: failed to download ${packId}`,
+        errorToLogString(error)
+      );
+    }
+  }
+  webBlessedStickerPacksCache = packs;
+  return packs;
+}
+
+async function handleBlessedStickerPacks(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  if (req.method !== 'GET') {
+    sendText(req, res, 405, 'Method not allowed');
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    packs: await getWebBlessedStickerPacks(),
+  });
 }
 
 async function getTransferArchive(
@@ -4915,6 +5312,7 @@ async function handleSendMessage(
   const accessKey = normalizeDirectAccessKey(body.accessKey);
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const attachments = parseWebAttachments(body.attachments);
+  const sticker = parseWebSticker(body.sticker);
   const deleteForEveryone = parseWebDeleteForEveryone(body.deleteForEveryone);
   const pinMessage = parseWebPinMessage(body.pinMessage);
   const unpinMessage = parseWebUnpinMessage(body.unpinMessage);
@@ -4939,6 +5337,7 @@ async function handleSendMessage(
   if (
     !messageBody?.trim() &&
     attachments.length === 0 &&
+    !sticker &&
     !pinMessage &&
     !unpinMessage &&
     !deleteForEveryone
@@ -4968,6 +5367,7 @@ async function handleSendMessage(
           linkedPayload: streamSession.linkedPayload,
           pinMessage,
           quote,
+          sticker,
           timestamp,
           unauthChat: accessKey
             ? await getBackupUnauthConnection(streamSession)
@@ -5997,6 +6397,7 @@ async function handleSendGroupMessage(
   const groupId = typeof body.groupId === 'string' ? body.groupId : undefined;
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const attachments = parseWebAttachments(body.attachments);
+  const sticker = parseWebSticker(body.sticker);
   const deleteForEveryone = parseWebDeleteForEveryone(body.deleteForEveryone);
   const pinMessage = parseWebPinMessage(body.pinMessage);
   const quote = parseWebQuote(body.quote);
@@ -6040,6 +6441,7 @@ async function handleSendGroupMessage(
   if (
     !messageBody?.trim() &&
     attachments.length === 0 &&
+    !sticker &&
     !deleteForEveryone &&
     !pinMessage &&
     !unpinMessage
@@ -6081,6 +6483,7 @@ async function handleSendGroupMessage(
             pinMessage,
             quote,
             recipients,
+            sticker,
             timestamp,
             unpinMessage,
             unauthChat,
@@ -8012,6 +8415,41 @@ async function handleRequest(
 
   if (req.method === 'GET' && url.pathname === '/emoji/jumbo') {
     await handleEmojiJumbo(req, res, url);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/emoji/font/large') {
+    await handleEmojiLargeFont(req, res);
+    return;
+  }
+
+  if (
+    (req.method === 'GET' || req.method === 'HEAD') &&
+    url.pathname === '/proxy/giphy'
+  ) {
+    await handleGiphyProxy(req, res, url);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/stickers/blessed-packs') {
+    await handleBlessedStickerPacks(req, res);
+    return;
+  }
+
+  const blessedStickerMatch =
+    /^\/stickers\/blessed\/([^/]+)\/(\d+)\.webp$/.exec(url.pathname);
+  if (blessedStickerMatch) {
+    const [, rawPackId, rawStickerId] = blessedStickerMatch;
+    if (rawPackId == null || rawStickerId == null) {
+      sendText(req, res, 400, 'Invalid sticker path');
+      return;
+    }
+    await handleBlessedSticker(
+      req,
+      res,
+      decodeURIComponent(rawPackId),
+      Number(rawStickerId)
+    );
     return;
   }
 

@@ -405,12 +405,23 @@ export function useFunVirtualGrid({
         // Always include the header
         indexes.add(section.headerIndex);
 
-        if (section.firstRowIndex > end || section.lastRowIndex < start) {
+        const isHeaderInRange =
+          section.headerIndex >= start && section.headerIndex <= end;
+
+        if (
+          !isHeaderInRange &&
+          (section.firstRowIndex > end || section.lastRowIndex < start)
+        ) {
           continue;
         }
 
-        const sectionStart = Math.max(start, section.firstRowIndex);
-        const sectionEnd = Math.min(end, section.lastRowIndex);
+        const sectionStart = isHeaderInRange
+          ? section.firstRowIndex
+          : Math.max(start, section.firstRowIndex);
+        const sectionEnd = Math.min(
+          isHeaderInRange ? section.firstRowIndex + overscan : end,
+          section.lastRowIndex
+        );
 
         // Ensure the first row is included
         if (sectionStart > section.firstRowIndex) {
@@ -433,7 +444,7 @@ export function useFunVirtualGrid({
 
       return Array.from(indexes).sort((a, b) => a - b);
     },
-    [list, focusedRowIndex]
+    [list, focusedRowIndex, overscan]
   );
 
   const getItemKey = useCallback(

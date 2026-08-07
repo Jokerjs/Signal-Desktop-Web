@@ -26,7 +26,6 @@ import type {
 } from '../../model-types.d.ts';
 import type { StateType } from '../../state/reducer.preload.ts';
 import type { MessageForwardDraft } from '../../types/ForwardDraft.std.ts';
-import { SmartFunProvider } from '../../state/smart/FunProvider.preload.tsx';
 import { SmartNavTabs } from '../../state/smart/NavTabs.preload.tsx';
 import { SmartGlobalModalContainer } from '../../state/smart/GlobalModalContainer.preload.tsx';
 import { SmartLightbox } from '../../state/smart/Lightbox.preload.tsx';
@@ -103,6 +102,7 @@ import type {
 } from '../types.std.ts';
 import { WebInstallScreen } from './WebInstallScreen.dom.tsx';
 import { WebChatsTab } from './WebChatsTab.dom.tsx';
+import { WebFunProvider } from './WebFunProvider.preload.tsx';
 import {
   applyRemoteUnpinMessage,
   applyRemotePinnedMessage,
@@ -1117,7 +1117,7 @@ function WebDesktopAppBody({
   const theme = useSelector(getTheme);
 
   return (
-    <SmartFunProvider>
+    <WebFunProvider>
       <SmartVoiceNotesPlaybackProvider>
         <App
           state={appState}
@@ -1156,7 +1156,7 @@ function WebDesktopAppBody({
           viewStory={() => undefined}
         />
       </SmartVoiceNotesPlaybackProvider>
-    </SmartFunProvider>
+    </WebFunProvider>
   );
 }
 

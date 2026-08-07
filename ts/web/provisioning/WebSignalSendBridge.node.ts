@@ -177,6 +177,7 @@ type DirectTextSendOptions = Readonly<{
   pinMessage?: WebPinMessage;
   unpinMessage?: WebUnpinMessage;
   quote?: WebMessage['quote'];
+  sticker?: WebMessage['sticker'];
 }>;
 
 type GroupTextSendOptions = Readonly<{
@@ -197,6 +198,7 @@ type GroupTextSendOptions = Readonly<{
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   quote?: WebMessage['quote'];
+  sticker?: WebMessage['sticker'];
   unpinMessage?: WebUnpinMessage;
 }>;
 
@@ -1982,6 +1984,28 @@ function maybeCreateAttachmentPointer(
   }
 }
 
+function createSticker(
+  sticker: WebMessage['sticker'] | undefined
+): Proto.DataMessage.Sticker.Params | null {
+  const data = sticker?.data as WebAttachment | undefined;
+  if (
+    !sticker?.packId ||
+    !sticker.packKey ||
+    typeof sticker.stickerId !== 'number' ||
+    !data
+  ) {
+    return null;
+  }
+
+  return {
+    packId: Bytes.fromHex(sticker.packId),
+    packKey: Bytes.fromBase64(sticker.packKey),
+    stickerId: sticker.stickerId,
+    emoji: sticker.emoji ?? null,
+    data: createAttachmentPointer(data),
+  };
+}
+
 function createPinMessage(
   pinMessage: WebPinMessage | undefined
 ): Proto.DataMessage.PinMessage.Params | null {
@@ -2090,6 +2114,7 @@ function createDataMessage({
   isViewOnce = false,
   pinMessage,
   quote,
+  sticker,
   timestamp,
   unpinMessage,
 }: Readonly<{
@@ -2103,6 +2128,7 @@ function createDataMessage({
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   quote?: WebMessage['quote'];
+  sticker?: WebMessage['sticker'];
   timestamp: number;
   unpinMessage?: WebUnpinMessage;
 }>): Proto.DataMessage.Params {
@@ -2114,7 +2140,7 @@ function createDataMessage({
     body: body.length > 0 ? body : null,
     bodyRanges: null,
     groupV2: groupV2 ?? null,
-    sticker: null,
+    sticker: createSticker(sticker),
     reaction: null,
     preview: null,
     contact: null,
@@ -2178,6 +2204,7 @@ function createTextContent(
   unpinMessage?: WebUnpinMessage,
   isViewOnce?: boolean,
   groupV2?: Proto.GroupContextV2.Params,
+  sticker?: WebMessage['sticker'],
   expirationTimerUpdate?: Readonly<{
     expireTimer?: number;
     expireTimerVersion?: number;
@@ -2198,6 +2225,7 @@ function createTextContent(
           isViewOnce,
           pinMessage,
           quote,
+          sticker,
           timestamp,
           unpinMessage,
         }),
@@ -6284,6 +6312,7 @@ export async function sendDirectTextMessage({
   linkedPayload,
   pinMessage,
   quote,
+  sticker,
   timestamp,
   unauthChat,
   unpinMessage,
@@ -6301,6 +6330,7 @@ export async function sendDirectTextMessage({
     unpinMessage,
     isViewOnce,
     undefined,
+    sticker,
     { expireTimer, expireTimerVersion, flags }
   );
   let messages = await encryptForDestination({
@@ -6464,6 +6494,7 @@ export async function sendDirectTextMessage({
     flags,
     pinMessage,
     quote,
+    sticker,
     unpinMessage,
     sourceServiceId: getLinkedAci(linkedPayload),
   };
@@ -6683,6 +6714,7 @@ export async function sendGroupTextMessage({
   pinMessage,
   quote,
   recipients,
+  sticker,
   timestamp,
   unpinMessage,
   unauthChat,
@@ -6700,7 +6732,8 @@ export async function sendGroupTextMessage({
     quote,
     unpinMessage,
     isViewOnce,
-    groupContext
+    groupContext,
+    sticker
   );
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
@@ -6851,6 +6884,7 @@ export async function sendGroupTextMessage({
     attachments,
     isViewOnce,
     quote,
+    sticker,
     groupV2: {
       id: groupId,
       masterKey: groupV2.masterKey,

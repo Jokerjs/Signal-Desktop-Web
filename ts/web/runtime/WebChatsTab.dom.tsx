@@ -11,11 +11,13 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type Dispatch,
   type JSX,
   type MutableRefObject,
   type SetStateAction,
 } from 'react';
+import { createKeybindingsHandler } from 'tinykeys';
 import { useSelector } from 'react-redux';
 import classNames from 'classnames';
 import { v4 as generateUuid } from 'uuid';
@@ -38,6 +40,7 @@ import { MediaEditor } from '../../components/MediaEditor.dom.tsx';
 import { FunPickerButton } from '../../components/fun/FunButton.dom.tsx';
 import { FunPicker } from '../../components/fun/FunPicker.dom.tsx';
 import type { FunEmojiSelection } from '../../components/fun/panels/FunPanelEmojis.dom.tsx';
+import type { FunGifSelection } from '../../components/fun/panels/FunPanelGifs.dom.tsx';
 import type { FunStickerSelection } from '../../components/fun/panels/FunPanelStickers.dom.tsx';
 import type { NavTabPanelProps } from '../../components/NavTabs.dom.tsx';
 import type { WidthBreakpoint } from '../../components/_util.std.ts';
@@ -83,6 +86,7 @@ import {
   canForward,
   getPropsForQuote,
 } from '../../state/selectors/message.preload.ts';
+import { getPacks as getStickerPacks } from '../../state/selectors/stickers.std.ts';
 import {
   getActivePanel,
   getIsPanelAnimating,
@@ -101,7 +105,12 @@ import { ConversationPanel } from '../../state/smart/ConversationPanel.preload.t
 import { SmartTimeline } from '../../state/smart/Timeline.preload.tsx';
 import type { PeakType } from '../../types/Audio.dom.tsx';
 import { ToastType } from '../../types/Toast.dom.tsx';
-import { AUDIO_MPEG, IMAGE_JPEG, IMAGE_PNG } from '../../types/MIME.std.ts';
+import {
+  AUDIO_MPEG,
+  IMAGE_JPEG,
+  IMAGE_PNG,
+  IMAGE_WEBP,
+} from '../../types/MIME.std.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import { AudioRecorder } from '../../services/audioRecorder.dom.ts';
 import { getAddedByForGroup } from '../../util/getAddedByForGroup.preload.ts';
@@ -120,7 +129,10 @@ import {
   toDesktopMessage,
 } from './stateAdapter.dom.ts';
 import { setWebRuntimeChatShell } from './setupWebGlobals.dom.ts';
+import { fetchWebGiphyFile } from './webGiphy.dom.ts';
 import { getWebAttachmentContentType } from '../attachmentMime.std.ts';
+
+type WebSticker = NonNullable<WebMessage['sticker']>;
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
   const bytes = new Uint8Array(arrayBuffer);
@@ -247,7 +259,15 @@ async function getVideoDraftMetadata(
   });
 }
 
-async function fileToDraftAttachment(file: File): Promise<WebAttachment> {
+async function fileToDraftAttachment(
+  file: File,
+  options: Readonly<{
+    flags?: number | null;
+    height?: number;
+    skipVideoScreenshot?: boolean;
+    width?: number;
+  }> = {}
+): Promise<WebAttachment> {
   const url = URL.createObjectURL(file);
   const contentType = getWebAttachmentContentType(file);
   const kind = getAttachmentKind(file);
@@ -257,9 +277,12 @@ async function fileToDraftAttachment(file: File): Promise<WebAttachment> {
   > =
     kind === 'image'
       ? await getImageDimensions(url)
-      : kind === 'video'
+      : kind === 'video' && !options.skipVideoScreenshot
         ? await getVideoDraftMetadata(file, url)
-        : {};
+        : {
+            height: options.height,
+            width: options.width,
+          };
   const displayUrl =
     kind === 'video' && mediaMetadata.thumbnailUrl
       ? mediaMetadata.thumbnailUrl
@@ -270,6 +293,7 @@ async function fileToDraftAttachment(file: File): Promise<WebAttachment> {
     clientUuid: generateUuid(),
     contentType,
     fileName: kind === 'image' || kind === 'video' ? undefined : file.name,
+    flags: options.flags ?? undefined,
     kind,
     path: displayUrl,
     previewUrl: kind === 'video' ? url : undefined,
@@ -294,6 +318,37 @@ function getWebQuoteForSend(
     ...quotedMessage.quote,
     type: Proto.DataMessage.Quote.Type.NORMAL,
   } as unknown as WebMessage['quote'];
+}
+
+function mergeAttachmentForLocalDisplay(
+  remoteAttachment: WebAttachment,
+  localAttachment: WebAttachment | undefined
+): WebAttachment {
+  if (!localAttachment) {
+    return remoteAttachment;
+  }
+
+  const remoteThumbnail = remoteAttachment.thumbnail;
+  const localThumbnail = localAttachment.thumbnail;
+  return {
+    ...remoteAttachment,
+    path: localAttachment.path,
+    previewUrl: localAttachment.previewUrl,
+    thumbnail: remoteThumbnail
+      ? mergeAttachmentForLocalDisplay(remoteThumbnail, localThumbnail)
+      : localThumbnail,
+    thumbnailUrl: localAttachment.thumbnailUrl,
+    url: localAttachment.url,
+  };
+}
+
+function mergeAttachmentsForLocalDisplay(
+  remoteAttachments: ReadonlyArray<WebAttachment>,
+  localAttachments: ReadonlyArray<WebAttachment>
+): ReadonlyArray<WebAttachment> {
+  return remoteAttachments.map((attachment, index) =>
+    mergeAttachmentForLocalDisplay(attachment, localAttachments[index])
+  );
 }
 
 type WebRelinkDialogProps = Readonly<{
@@ -324,8 +379,9 @@ type WebLeftPaneRuntimeContextValue = Readonly<{
   onRelinkDevice: () => void;
 }>;
 
-const WebLeftPaneRuntimeContext =
-  createContext<WebLeftPaneRuntimeContextValue | undefined>(undefined);
+const WebLeftPaneRuntimeContext = createContext<
+  WebLeftPaneRuntimeContextValue | undefined
+>(undefined);
 
 function useWebLeftPaneRuntimeContext(): WebLeftPaneRuntimeContextValue {
   const context = useContext(WebLeftPaneRuntimeContext);
@@ -336,8 +392,7 @@ function useWebLeftPaneRuntimeContext(): WebLeftPaneRuntimeContextValue {
 const WebLeftPane = memo(function WebLeftPane(
   props: NavTabPanelProps
 ): JSX.Element {
-  const { forceRelinkDialog, onRelinkDevice } =
-    useWebLeftPaneRuntimeContext();
+  const { forceRelinkDialog, onRelinkDevice } = useWebLeftPaneRuntimeContext();
   const { conversations, pinnedConversations } = useSelector(getLeftPaneLists);
   const leftPaneLayoutKey = useMemo(
     () =>
@@ -352,10 +407,7 @@ const WebLeftPane = memo(function WebLeftPane(
   );
   const renderRelinkDialogOverride = useCallback(
     (dialogProps: Omit<WebRelinkDialogProps, 'onRelinkDevice'>) => (
-      <WebRelinkDialog
-        {...dialogProps}
-        onRelinkDevice={onRelinkDevice}
-      />
+      <WebRelinkDialog {...dialogProps} onRelinkDevice={onRelinkDevice} />
     ),
     [onRelinkDevice]
   );
@@ -389,8 +441,9 @@ type WebConversationRuntimeContextValue = Readonly<{
   setShell: Dispatch<SetStateAction<ChatShellState>>;
 }>;
 
-const WebConversationRuntimeContext =
-  createContext<WebConversationRuntimeContextValue | undefined>(undefined);
+const WebConversationRuntimeContext = createContext<
+  WebConversationRuntimeContextValue | undefined
+>(undefined);
 
 function useWebConversationRuntimeContext(): WebConversationRuntimeContextValue {
   const context = useContext(WebConversationRuntimeContext);
@@ -453,6 +506,7 @@ function WebCompositionArea({
   const defaultConversationColor = useSelector(getDefaultConversationColor);
   const selectedMessageIds = useSelector(getSelectedMessageIds);
   const messageLookup = useSelector(getMessages);
+  const stickerPacks = useSelector(getStickerPacks);
   const composerStateForConversationIdSelector = useSelector(
     getComposerStateForConversationIdSelector
   );
@@ -471,6 +525,7 @@ function WebCompositionArea({
   const [funPickerOpen, setFunPickerOpen] = useState(false);
   const [large, setLarge] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const isSendingRef = useRef(false);
   const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
   const [isRecordingVoiceNote, setIsRecordingVoiceNote] = useState(false);
   const [voicePeaks, setVoicePeaks] = useState<ReadonlyArray<PeakType>>([]);
@@ -691,15 +746,19 @@ function WebCompositionArea({
     (
       message: string,
       timestamp: number,
-      attachmentOverride?: ReadonlyArray<WebAttachment>
+      attachmentOverride?: ReadonlyArray<WebAttachment>,
+      stickerOverride?: WebMessage['sticker']
     ): boolean => {
-      if (isSending) {
+      if (isSendingRef.current) {
         return false;
       }
       const body = message.trim();
       const attachments = attachmentOverride ?? pendingAttachments;
       const credentials = linkedSession.credentials;
-      if ((!body && attachments.length === 0) || !credentials) {
+      if (
+        (!body && attachments.length === 0 && !stickerOverride) ||
+        !credentials
+      ) {
         return false;
       }
 
@@ -713,6 +772,7 @@ function WebCompositionArea({
         linkedSession
       );
 
+      isSendingRef.current = true;
       setIsSending(true);
       const isEditSubmission = draftEditMessage != null;
 
@@ -886,6 +946,7 @@ function WebCompositionArea({
             receivedAt: timestamp,
             sourceServiceId: credentials.aci,
             status: 'queued',
+            sticker: stickerOverride,
             timestamp,
             quote,
           };
@@ -961,16 +1022,39 @@ function WebCompositionArea({
           }
 
           const remoteAttachments = await uploadAttachmentsForSend(attachments);
+          let remoteSticker: WebMessage['sticker'] | undefined;
+          if (stickerOverride) {
+            const stickerData = stickerOverride.data as
+              | WebAttachment
+              | undefined;
+            if (!stickerData) {
+              throw new Error(
+                'Web sticker send failed: sticker data is missing'
+              );
+            }
+            const [uploadedStickerData] = await uploadAttachmentsForSend([
+              stickerData,
+            ]);
+            if (!uploadedStickerData) {
+              throw new Error('Web sticker send failed: sticker upload failed');
+            }
+            remoteSticker = {
+              ...stickerOverride,
+              data: uploadedStickerData as WebSticker['data'],
+            };
+          }
 
           const sent = isSendTargetGroupConversation
             ? await (async () => {
                 return sendGroupTextMessage({
                   attachments: remoteAttachments,
                   runtimeSessionId: messageRuntimeSessionId,
-                  groupId: conversationForSend.groupId ?? conversationForSend.id,
+                  groupId:
+                    conversationForSend.groupId ?? conversationForSend.id,
                   body,
                   isViewOnce: isViewOnceActive,
                   quote,
+                  sticker: remoteSticker,
                   timestamp,
                   groupV2:
                     conversationForSend.masterKey &&
@@ -996,6 +1080,7 @@ function WebCompositionArea({
                 isViewOnce: isViewOnceActive,
                 timestamp,
                 quote,
+                sticker: remoteSticker,
               });
 
           const normalized: WebMessage = {
@@ -1005,17 +1090,36 @@ function WebCompositionArea({
             direction: 'outgoing',
             timestamp,
             status: sent.status ?? 'sent',
-            attachments: sent.attachments ?? remoteAttachments,
+            attachments: mergeAttachmentsForLocalDisplay(
+              sent.attachments ?? remoteAttachments,
+              attachments
+            ),
+            sticker:
+              sent.sticker && sent.sticker.data && stickerOverride?.data
+                ? {
+                    ...sent.sticker,
+                    data: mergeAttachmentForLocalDisplay(
+                      sent.sticker.data as WebAttachment,
+                      stickerOverride.data as WebAttachment
+                    ) as WebSticker['data'],
+                  }
+                : (stickerOverride ?? remoteSticker),
             quote: sent.quote ?? quote,
             isViewOnce: sent.isViewOnce ?? isViewOnceActive,
           };
           let didReplaceLocalMessage = false;
+          let didRemoveLocalMessage = false;
           setShell(current => {
             const currentConversation =
               current.conversationLookup[conversationId] ?? conversationForSend;
             didReplaceLocalMessage = current.messages.some(
               item => item.id === normalized.id
             );
+            didRemoveLocalMessage =
+              normalized.id !== localMessageId &&
+              current.messages.some(item => item.id === localMessageId);
+            const didAlreadyCountMessage =
+              didReplaceLocalMessage || didRemoveLocalMessage;
             const lastMessage = getWebConversationLastMessage(
               normalized,
               credentials.aci
@@ -1032,17 +1136,20 @@ function WebCompositionArea({
               lastUpdated: timestamp,
               messageCount:
                 (currentConversation.messageCount ?? 0) +
-                (didReplaceLocalMessage ? 0 : 1),
+                (didAlreadyCountMessage ? 0 : 1),
               sentMessageCount:
                 (currentConversation.sentMessageCount ?? 0) +
-                (didReplaceLocalMessage ? 0 : 1),
+                (didAlreadyCountMessage ? 0 : 1),
               snippet: previewText || currentConversation.snippet,
               timestamp,
             };
             const nextShell = {
               ...current,
               messages: [
-                ...current.messages.filter(item => item.id !== normalized.id),
+                ...current.messages.filter(
+                  item =>
+                    item.id !== normalized.id && item.id !== localMessageId
+                ),
                 normalized,
               ].sort(compareWebMessages),
               conversationLookup: {
@@ -1064,13 +1171,19 @@ function WebCompositionArea({
             return nextShell;
           });
           registerMessageInCache(normalized);
-          if (didReplaceLocalMessage) {
+          if (didReplaceLocalMessage && normalized.id === localMessageId) {
             window.reduxActions?.conversations?.messageChanged?.(
               normalized.id,
               normalized.conversationId,
               toDesktopMessage(normalized)
             );
           } else {
+            if (didRemoveLocalMessage) {
+              window.reduxActions?.conversations?.messageDeleted?.(
+                localMessageId,
+                conversationId
+              );
+            }
             window.reduxActions?.conversations?.messagesAdded?.({
               conversationId: normalized.conversationId,
               isActive: document.visibilityState === 'visible',
@@ -1079,8 +1192,18 @@ function WebCompositionArea({
               messages: [toDesktopMessage(normalized)],
             });
           }
-          if (sent.attachments && attachments.length > 0) {
-            revokePendingAttachmentUrls(attachments);
+          if (attachments.length > 0) {
+            submittedAttachmentIds.forEach(attachmentId => {
+              if (attachmentId) {
+                pendingAttachmentFilesRef.current.delete(attachmentId);
+              }
+            });
+          }
+          const stickerData = stickerOverride?.data as
+            | WebAttachment
+            | undefined;
+          if (stickerData?.id) {
+            pendingAttachmentFilesRef.current.delete(stickerData.id);
           }
           if (!attachmentOverride && submittedAttachmentIds.size > 0) {
             setPendingAttachments(current =>
@@ -1114,6 +1237,7 @@ function WebCompositionArea({
             receivedAt: timestamp,
             sourceServiceId: credentials.aci,
             status: 'error',
+            sticker: stickerOverride,
             timestamp,
           };
           setShell(current => {
@@ -1144,6 +1268,7 @@ function WebCompositionArea({
           setDirty(Boolean(body) || attachments.length > 0);
           console.error('Failed to send web message', error);
         } finally {
+          isSendingRef.current = false;
           setIsSending(false);
         }
       })();
@@ -1155,7 +1280,6 @@ function WebCompositionArea({
       conversation,
       discardEditMessage,
       draftEditMessage,
-      isSending,
       linkedSession,
       messageRuntimeSessionId,
       pendingAttachments,
@@ -1342,17 +1466,78 @@ function WebCompositionArea({
     inputApi.current?.insertEmoji(emojiSelection);
   }, []);
 
-  const handleSticker = useCallback((stickerSelection: FunStickerSelection) => {
-    console.warn(
-      'Web sticker selection is available, but sticker protocol send is not wired to the bridge yet',
-      stickerSelection
-    );
-  }, []);
+  const handleSticker = useCallback(
+    (stickerSelection: FunStickerSelection) => {
+      const pack = stickerPacks[stickerSelection.stickerPackId];
+      const sticker = pack?.stickers[stickerSelection.stickerId];
+      if (!pack || !sticker) {
+        console.warn('Web sticker selection is missing sticker pack data', {
+          stickerPackId: stickerSelection.stickerPackId,
+          stickerId: stickerSelection.stickerId,
+        });
+        return;
+      }
 
-  const handleAttachmentChange = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(event.currentTarget.files ?? []);
-      event.currentTarget.value = '';
+      setFunPickerOpen(false);
+      setIsUploadingAttachment(true);
+      void (async () => {
+        let attachment: WebAttachment | undefined;
+        try {
+          const response = await fetch(stickerSelection.stickerUrl);
+          if (!response.ok) {
+            throw new Error(
+              `Web sticker fetch failed with status ${response.status}`
+            );
+          }
+
+          const blob = await response.blob();
+          const contentType = blob.type || IMAGE_WEBP;
+          const file = new File(
+            [blob],
+            `sticker-${stickerSelection.stickerPackId}-${stickerSelection.stickerId}.webp`,
+            { type: contentType }
+          );
+          attachment = await fileToDraftAttachment(file, {
+            height: sticker.height,
+            width: sticker.width,
+          });
+          if (attachment.id) {
+            pendingAttachmentFilesRef.current.set(attachment.id, file);
+          }
+
+          const didSend = send('', Date.now(), [], {
+            packId: stickerSelection.stickerPackId,
+            stickerId: stickerSelection.stickerId,
+            packKey: pack.key,
+            emoji: sticker.emoji,
+            data: attachment,
+          } as WebMessage['sticker']);
+          if (!didSend) {
+            revokePendingAttachmentUrls([attachment]);
+          }
+        } catch (error) {
+          if (attachment) {
+            revokePendingAttachmentUrls([attachment]);
+          }
+          console.error('Failed to send web sticker message', error);
+        } finally {
+          setIsUploadingAttachment(false);
+        }
+      })();
+    },
+    [revokePendingAttachmentUrls, send, stickerPacks]
+  );
+
+  const stageFiles = useCallback(
+    (
+      files: ReadonlyArray<File>,
+      options: Readonly<{
+        flags?: number | null;
+        height?: number;
+        skipVideoScreenshot?: boolean;
+        width?: number;
+      }> = {}
+    ) => {
       if (files.length === 0) {
         return;
       }
@@ -1360,7 +1545,9 @@ function WebCompositionArea({
       setIsUploadingAttachment(true);
       void (async () => {
         try {
-          const drafts = await Promise.all(files.map(fileToDraftAttachment));
+          const drafts = await Promise.all(
+            files.map(file => fileToDraftAttachment(file, options))
+          );
           drafts.forEach((attachment, index) => {
             const file = files[index];
             if (attachment.id && file) {
@@ -1377,6 +1564,70 @@ function WebCompositionArea({
       })();
     },
     []
+  );
+
+  const handleAttachmentChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.currentTarget.files ?? []);
+      event.currentTarget.value = '';
+      stageFiles(files);
+    },
+    [stageFiles]
+  );
+
+  const handlePaste = useCallback(
+    (event: ClipboardEvent<HTMLDivElement>) => {
+      const { clipboardData } = event;
+      const files = Array.from(clipboardData.items)
+        .filter(item => item.kind === 'file')
+        .map(item => item.getAsFile())
+        .filter((file): file is File => file != null);
+
+      if (files.length === 0) {
+        return;
+      }
+
+      stageFiles(files);
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [stageFiles]
+  );
+
+  const handleGif = useCallback(
+    (gifSelection: FunGifSelection) => {
+      setFunPickerOpen(false);
+      setIsUploadingAttachment(true);
+      void (async () => {
+        try {
+          const blob = await fetchWebGiphyFile(
+            gifSelection.gif.attachmentMedia.url
+          );
+          const file = new File([blob], 'gif.mp4', {
+            type: 'video/mp4',
+          });
+          const attachment = await fileToDraftAttachment(file, {
+            flags: Proto.AttachmentPointer.Flags.GIF,
+            height: gifSelection.gif.attachmentMedia.height,
+            skipVideoScreenshot: true,
+            width: gifSelection.gif.attachmentMedia.width,
+          });
+          if (attachment.id) {
+            pendingAttachmentFilesRef.current.set(attachment.id, file);
+          }
+          setIsUploadingAttachment(false);
+          const didSend = send('', Date.now(), [attachment]);
+          if (!didSend) {
+            setPendingAttachments(current => [...current, attachment]);
+            setDirty(true);
+          }
+        } catch (error) {
+          console.error('Failed to stage web GIF attachment', error);
+          setIsUploadingAttachment(false);
+        }
+      })();
+    },
+    [send]
   );
 
   const removePendingAttachment = useCallback(
@@ -1471,7 +1722,7 @@ function WebCompositionArea({
   }
 
   return (
-    <div className="CompositionArea">
+    <div className="CompositionArea" onPaste={handlePaste}>
       {attachmentToEdit?.url ? (
         <MediaEditor
           draftBodyRanges={null}
@@ -1635,7 +1886,7 @@ function WebCompositionArea({
               onOpenChange={setFunPickerOpen}
               onSelectEmoji={handleEmoji}
               onSelectSticker={handleSticker}
-              onSelectGif={() => undefined}
+              onSelectGif={handleGif}
               onAddStickerPack={null}
               theme={theme}
             >
@@ -1835,7 +2086,9 @@ function renderWebCompositionArea(conversationId: string): JSX.Element {
 }
 
 function renderWebConversationHeader(conversationId: string): JSX.Element {
-  return <SmartConversationHeader id={conversationId} hideOutgoingCallButtons />;
+  return (
+    <SmartConversationHeader id={conversationId} hideOutgoingCallButtons />
+  );
 }
 
 function renderWebTimeline(conversationId: string): JSX.Element {
@@ -1854,7 +2107,7 @@ const WebConversation = memo(function WebConversation({
   const selectedMessageIds = useSelector(getSelectedMessageIds);
   const isSelectMode = selectedMessageIds != null;
   const { processAttachments } = useComposerActions();
-  const { toggleSelectMode } = useConversationsActions();
+  const { onConversationClosed, toggleSelectMode } = useConversationsActions();
   const hasOpenModal = useSelector(isShowingAnyModal);
   const activePanel = useSelector(getActivePanel);
   const isPanelAnimating = useSelector(getIsPanelAnimating);
@@ -1862,6 +2115,32 @@ const WebConversation = memo(function WebConversation({
   const onExitSelectMode = useCallback(() => {
     toggleSelectMode(false);
   }, [toggleSelectMode]);
+  const closeCurrentConversation = useCallback(() => {
+    if (hasOpenModal) {
+      return;
+    }
+
+    onConversationClosed(selectedConversationId, 'keyboard shortcut close');
+  }, [hasOpenModal, onConversationClosed, selectedConversationId]);
+  useEffect(() => {
+    const onKeyDown = createKeybindingsHandler({
+      '$mod+Shift+C': event => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeCurrentConversation();
+      },
+      '$mod+W': event => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeCurrentConversation();
+      },
+    });
+
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [closeCurrentConversation]);
   useWebConversationRenderDebug('WebConversation', {
     activePanel,
     isPanelAnimating,

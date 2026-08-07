@@ -51,6 +51,8 @@ type DesktopMessage = Record<string, unknown> & {
   timestamp: number;
 };
 
+type WebNotificationData = ReturnType<typeof getNotificationDataForMessage>;
+
 export type DesktopMessageMetrics = Readonly<{
   newest?: Readonly<{ id: string; received_at: number; sent_at?: number }>;
   oldest?: Readonly<{ id: string; received_at: number; sent_at?: number }>;
@@ -576,7 +578,7 @@ export function getWebMessagePreviewText(message: WebMessage): string {
     return '';
   }
 
-  return getNotificationDataForMessage(toDesktopMessage(message)).text ?? '';
+  return getWebNotificationData(message).text ?? '';
 }
 
 export function getWebConversationLastMessage(
@@ -591,7 +593,7 @@ export function getWebConversationLastMessage(
   }
 
   const desktopMessage = toDesktopMessage(message);
-  const notificationData = getNotificationDataForMessage(desktopMessage);
+  const notificationData = getWebNotificationData(message, desktopMessage);
   const author =
     desktopMessage.type === 'outgoing'
       ? window.SignalContext.i18n('icu:you')
@@ -608,6 +610,74 @@ export function getWebConversationLastMessage(
     status: getMessagePropStatus(desktopMessage, ourConversationId),
     text: notificationData.text ?? '',
   };
+}
+
+function getWebFallbackNotificationData(
+  message: WebMessage
+): WebNotificationData {
+  const { i18n } = window.SignalContext;
+  const attachment = message.bodyAttachment ?? message.attachments?.[0];
+  const bodyRanges = message.bodyRanges;
+
+  if (attachment) {
+    const contentType = getWebAttachmentContentTypeFromParts(attachment);
+    if (contentType.startsWith('image/')) {
+      return {
+        bodyRanges,
+        text: message.body || i18n('icu:message--getNotificationText--photo'),
+      };
+    }
+    if (contentType.startsWith('video/')) {
+      return {
+        bodyRanges,
+        text: message.body || i18n('icu:message--getNotificationText--video'),
+      };
+    }
+    if (attachment.flags === Proto.AttachmentPointer.Flags.VOICE_MESSAGE) {
+      return {
+        bodyRanges,
+        text:
+          message.body ||
+          i18n('icu:message--getNotificationText--voice-message'),
+      };
+    }
+    if (contentType.startsWith('audio/')) {
+      return {
+        bodyRanges,
+        text:
+          message.body ||
+          i18n('icu:message--getNotificationText--audio-message'),
+      };
+    }
+    return {
+      bodyRanges,
+      text: message.body || i18n('icu:message--getNotificationText--file'),
+    };
+  }
+
+  if (message.sticker) {
+    return {
+      text: i18n('icu:message--getNotificationText--stickers'),
+    };
+  }
+
+  return {
+    bodyRanges,
+    text: message.body ?? '',
+  };
+}
+
+function getWebNotificationData(
+  message: WebMessage,
+  desktopMessage?: MessageAttributesType
+): WebNotificationData {
+  if (window.reduxStore?.getState == null) {
+    return getWebFallbackNotificationData(message);
+  }
+
+  return getNotificationDataForMessage(
+    desktopMessage ?? toDesktopMessage(message)
+  );
 }
 
 function deriveConversationPreviews(
@@ -888,6 +958,21 @@ function toDesktopAttachmentOrUndefined(
   return attachment ? toDesktopAttachment(attachment) : undefined;
 }
 
+function toDesktopStickerAttachmentOrUndefined(
+  attachment: WebAttachment | undefined
+): Record<string, unknown> | undefined {
+  if (!attachment) {
+    return undefined;
+  }
+
+  const projected = toDesktopAttachment(attachment);
+  const accessUrl = getProjectedAttachmentAccessUrl(attachment);
+  return {
+    ...projected,
+    path: accessUrl ?? projected.path,
+  };
+}
+
 function toDesktopQuote(quote: WebMessage['quote']): unknown {
   if (!quote) {
     return undefined;
@@ -920,7 +1005,7 @@ function toDesktopSticker(sticker: WebMessage['sticker']): unknown {
 
   return {
     ...sticker,
-    data: toDesktopAttachmentOrUndefined(
+    data: toDesktopStickerAttachmentOrUndefined(
       sticker.data as WebAttachment | undefined
     ),
   };

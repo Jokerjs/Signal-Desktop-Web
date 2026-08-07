@@ -57,10 +57,36 @@ body {
   border: 0;
   margin-inline-start: 6px;
   background: #5e5e5e;
-  -webkit-mask: url("images/icons/v3/x/x.svg") no-repeat center;
+  -webkit-mask: url('images/icons/v3/x/x.svg') no-repeat center;
   -webkit-mask-size: 14px;
 }
 
 .UsernameMegaphone {
   display: none;
+}
+
+.FunGrid__Cell,
+.FunStaticEmoji,
+.FunInlineEmoji {
+  content-visibility: visible;
+}
+
+.FunStaticEmoji.FunStaticEmoji__Text,
+.ql-editor span.FunStaticEmoji.FunStaticEmoji__Text.FunStaticEmoji--Blot {
+  contain: strict;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  content-visibility: visible;
+  font-family:
+    'Signal Web Emoji Large', 'Signal Emoji Small', 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
+  font-style: normal;
+  letter-spacing: inherit;
+  max-width: inherit;
+}
+
+.ql-editor span.FunStaticEmoji.FunStaticEmoji--Blot {
+  vertical-align: baseline;
 }
