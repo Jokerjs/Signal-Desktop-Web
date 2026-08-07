@@ -3,9 +3,7 @@
 
 import { z } from 'zod';
 
-import { fetchInSegments } from '../../components/fun/data/segments.std.ts';
 import type { PaginatedGifResults } from '../../components/fun/panels/FunPanelGifs.dom.tsx';
-import type { fetchBytesViaProxy } from '../../textsecure/WebAPI.preload.ts';
 import {
   getGifCdnUrlOrigin,
   isGifCdnUrlOriginAllowed,
@@ -148,30 +146,6 @@ async function fetchJsonViaWebGiphyProxy(
   return response.json();
 }
 
-async function fetchBytesViaWebGiphyProxy(
-  params: Parameters<typeof fetchBytesViaProxy>[0]
-): ReturnType<typeof fetchBytesViaProxy> {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(params.headers ?? {})) {
-    if (typeof value === 'string') {
-      headers.set(name, value);
-    } else {
-      headers.set(name, value.join(','));
-    }
-  }
-
-  const response = await fetchViaWebGiphyProxy(params.url, {
-    headers: Object.fromEntries(headers),
-    method: params.method,
-    signal: params.signal,
-  });
-  return {
-    data: new Uint8Array(await response.arrayBuffer()),
-    contentType: response.headers.get('Content-Type'),
-    response: response as never,
-  };
-}
-
 export async function fetchWebGiphySearch(
   query: string,
   limit: number,
@@ -220,7 +194,7 @@ export async function fetchWebGiphyTrending(
   return normalizeGiphyResults(results);
 }
 
-export function fetchWebGiphyFile(
+export async function fetchWebGiphyFile(
   giphyCdnUrl: string,
   signal?: AbortSignal
 ): Promise<Blob> {
@@ -233,5 +207,12 @@ export function fetchWebGiphyFile(
       `fetchWebGiphyFile: Blocked unsupported url origin: ${origin}`
     );
   }
-  return fetchInSegments(giphyCdnUrl, fetchBytesViaWebGiphyProxy, signal);
+
+  // Web reverse proxies do not consistently preserve HEAD Content-Length or
+  // Range response headers. A regular GET avoids depending on those headers.
+  const response = await fetchViaWebGiphyProxy(giphyCdnUrl, {
+    method: 'GET',
+    signal,
+  });
+  return response.blob();
 }

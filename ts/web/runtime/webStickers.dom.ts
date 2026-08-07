@@ -39,10 +39,14 @@ const WebBlessedStickerPacksResponseSchema = z.object({
   packs: z.array(WebStickerPackSchema),
 });
 
+function getWebStickerUrl(path: string): URL {
+  return new URL(path.replace(/^\/+/, ''), getRenderApiBaseUrl());
+}
+
 export async function loadWebBlessedStickerPacks(): Promise<
   StateType['stickers']['packs']
 > {
-  const url = new URL('stickers/blessed-packs', getRenderApiBaseUrl());
+  const url = getWebStickerUrl('stickers/blessed-packs');
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(
@@ -63,7 +67,7 @@ export async function loadWebBlessedStickerPacks(): Promise<
             stickerId,
             {
               ...sticker,
-              path: new URL(sticker.path, getRenderApiBaseUrl()).toString(),
+              path: getWebStickerUrl(sticker.path).toString(),
             },
           ])
         ),
