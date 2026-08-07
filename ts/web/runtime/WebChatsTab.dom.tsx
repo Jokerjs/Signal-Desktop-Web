@@ -1612,13 +1612,25 @@ function WebCompositionArea({
             skipVideoScreenshot: true,
             width: gifSelection.gif.attachmentMedia.width,
           });
-          if (attachment.id) {
-            pendingAttachmentFilesRef.current.set(attachment.id, file);
+          const localObjectUrl = attachment.url;
+          // Older Chromium rejects some GIPHY MP4 blob URLs. Let the
+          // optimistic message wait for the uploaded attachment URL instead.
+          const attachmentForSend: WebAttachment = {
+            ...attachment,
+            path: undefined,
+            previewUrl: undefined,
+            url: undefined,
+          };
+          if (localObjectUrl?.startsWith('blob:')) {
+            URL.revokeObjectURL(localObjectUrl);
+          }
+          if (attachmentForSend.id) {
+            pendingAttachmentFilesRef.current.set(attachmentForSend.id, file);
           }
           setIsUploadingAttachment(false);
-          const didSend = send('', Date.now(), [attachment]);
+          const didSend = send('', Date.now(), [attachmentForSend]);
           if (!didSend) {
-            setPendingAttachments(current => [...current, attachment]);
+            setPendingAttachments(current => [...current, attachmentForSend]);
             setDirty(true);
           }
         } catch (error) {
