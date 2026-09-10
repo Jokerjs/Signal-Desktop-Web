@@ -22,6 +22,7 @@ const LINKED_SESSION_STORAGE_KEY_BASE = 'render.linkedSession';
 const CHAT_SHELL_STORAGE_KEY_BASE = 'render.chatShellState';
 const CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE = 'render.contactsBootstrap';
 const LEGACY_LINKED_SESSION_STORAGE_KEY = 'my.render.linkedSession';
+const linkedSessionPersistenceQueues = new Map<string, Promise<void>>();
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -83,7 +84,10 @@ export async function openRenderPersistenceDatabase(): Promise<
   });
 }
 
-export function getUserScopedStorageKey(userId: string, baseKey: string): string {
+export function getUserScopedStorageKey(
+  userId: string,
+  baseKey: string
+): string {
   return `user:${encodeURIComponent(userId)}:${baseKey}`;
 }
 
@@ -154,20 +158,22 @@ export function isLinkedSessionReady(
   linkedSession: LinkedSessionRecord | undefined
 ): boolean {
   return Boolean(
-      linkedSession?.credentials?.username &&
-      linkedSession.credentials.password &&
-      linkedSession.credentials.number &&
-      linkedSession.storageServiceKey &&
-      typeof linkedSession.linkedPayload.aciRegistrationId === 'number' &&
-      Boolean(linkedSession.linkedPayload.aciSignedPreKeyRecordBase64) &&
-      Boolean(linkedSession.linkedPayload.pniSignedPreKeyRecordBase64) &&
-      Boolean(linkedSession.linkedPayload.aciPqLastResortPreKeyRecordBase64) &&
-      Boolean(linkedSession.linkedPayload.pniPqLastResortPreKeyRecordBase64) &&
-      linkedSession.linkedPayload.protocolPersistenceVersion === 1
+    linkedSession?.credentials?.username &&
+    linkedSession.credentials.password &&
+    linkedSession.credentials.number &&
+    linkedSession.storageServiceKey &&
+    typeof linkedSession.linkedPayload.aciRegistrationId === 'number' &&
+    Boolean(linkedSession.linkedPayload.aciSignedPreKeyRecordBase64) &&
+    Boolean(linkedSession.linkedPayload.pniSignedPreKeyRecordBase64) &&
+    Boolean(linkedSession.linkedPayload.aciPqLastResortPreKeyRecordBase64) &&
+    Boolean(linkedSession.linkedPayload.pniPqLastResortPreKeyRecordBase64) &&
+    linkedSession.linkedPayload.protocolPersistenceVersion === 1
   );
 }
 
-function parseStoredLinkedSession(raw: string | null): LinkedSessionRecord | undefined {
+function parseStoredLinkedSession(
+  raw: string | null
+): LinkedSessionRecord | undefined {
   if (!raw) {
     return undefined;
   }
@@ -227,7 +233,9 @@ export function loadLinkedSessionRecordFromStorage():
   }
 }
 
-function removeLinkedSessionRecordFromLocalStorage(userId: string | undefined): void {
+function removeLinkedSessionRecordFromLocalStorage(
+  userId: string | undefined
+): void {
   if (userId) {
     window.localStorage.removeItem(
       getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE)
@@ -252,42 +260,69 @@ export function persistLinkedSessionToStorage(
       return;
     }
 
-    window.localStorage.setItem(ACTIVE_LINKED_SESSION_USER_ID_STORAGE_KEY, userId);
+    window.localStorage.setItem(
+      ACTIVE_LINKED_SESSION_USER_ID_STORAGE_KEY,
+      userId
+    );
     removeLinkedSessionRecordFromLocalStorage(userId);
-  } catch {
-  }
+  } catch {}
 }
 
 export async function persistLinkedSessionRecordToIndexedDb(
   linkedSession: LinkedSessionRecord | undefined
 ): Promise<void> {
-  const database = await openRenderPersistenceDatabase();
-  if (!database) {
-    return;
-  }
-  try {
-    const transaction = database.transaction(SESSION_STORE_NAME, 'readwrite');
-    const sessionStore = transaction.objectStore(SESSION_STORE_NAME);
-    if (!linkedSession) {
-      sessionStore.delete(CURRENT_LINKED_SESSION_ID);
-      await transactionToPromise(transaction);
-      return;
-    }
+  const queueKey =
+    getLinkedSessionUserId(linkedSession) ??
+    getActiveLinkedSessionUserIdFromStorage() ??
+    CURRENT_LINKED_SESSION_ID;
+  const previous =
+    linkedSessionPersistenceQueues.get(queueKey) ?? Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const database = await openRenderPersistenceDatabase();
+      if (!database) {
+        return;
+      }
+      try {
+        const transaction = database.transaction(
+          SESSION_STORE_NAME,
+          'readwrite'
+        );
+        const sessionStore = transaction.objectStore(SESSION_STORE_NAME);
+        if (!linkedSession) {
+          sessionStore.delete(CURRENT_LINKED_SESSION_ID);
+          await transactionToPromise(transaction);
+          return;
+        }
 
-    const userId = getLinkedSessionUserId(linkedSession);
-    if (!userId) {
-      await transactionToPromise(transaction);
-      return;
-    }
+        const userId = getLinkedSessionUserId(linkedSession);
+        if (!userId) {
+          await transactionToPromise(transaction);
+          return;
+        }
 
-    sessionStore.delete(CURRENT_LINKED_SESSION_ID);
-    sessionStore.put({
-      ...linkedSession,
-      id: getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE),
+        sessionStore.delete(CURRENT_LINKED_SESSION_ID);
+        sessionStore.put({
+          ...linkedSession,
+          id: getUserScopedStorageKey(userId, LINKED_SESSION_STORAGE_KEY_BASE),
+        });
+        await transactionToPromise(transaction);
+      } finally {
+        database.close();
+      }
     });
-    await transactionToPromise(transaction);
+  const settled = operation.then(
+    () => undefined,
+    () => undefined
+  );
+  linkedSessionPersistenceQueues.set(queueKey, settled);
+  try {
+    await operation;
   } finally {
-    database.close();
+    if (linkedSessionPersistenceQueues.get(queueKey) === settled) {
+      linkedSessionPersistenceQueues.delete(queueKey);
+    }
   }
 }
 
@@ -346,26 +381,25 @@ function removeChatShellStateFromLocalStorage(sessionAci: string): void {
     const scopedKey = getScopedChatShellStorageKey(sessionAci);
     window.localStorage.removeItem(scopedKey);
     window.localStorage.removeItem(sessionAci);
-  } catch {
-  }
+  } catch {}
 }
 
 function isChatShellState(value: unknown): value is ChatShellState {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      'conversationLookup' in value &&
-      'messages' in value &&
-      Array.isArray((value as { messages?: unknown }).messages)
+    typeof value === 'object' &&
+    'conversationLookup' in value &&
+    'messages' in value &&
+    Array.isArray((value as { messages?: unknown }).messages)
   );
 }
 
 function isStoredChatShellState(value: unknown): value is StoredChatShellState {
   return Boolean(
     value &&
-      typeof value === 'object' &&
-      'state' in value &&
-      isChatShellState((value as { state?: unknown }).state)
+    typeof value === 'object' &&
+    'state' in value &&
+    isChatShellState((value as { state?: unknown }).state)
   );
 }
 
@@ -465,7 +499,10 @@ export async function persistChatShellStateToStorage(
     return;
   }
   try {
-    const transaction = database.transaction(CHAT_SHELL_STORE_NAME, 'readwrite');
+    const transaction = database.transaction(
+      CHAT_SHELL_STORE_NAME,
+      'readwrite'
+    );
     transaction.objectStore(CHAT_SHELL_STORE_NAME).put({
       version: 4,
       sessionAci: getScopedChatShellStorageKey(normalizedSessionAci),
@@ -535,7 +572,8 @@ export async function clearChatShellStateForSession(
     return;
   }
 
-  const chatShellStorageKey = getScopedChatShellStorageKey(normalizedSessionAci);
+  const chatShellStorageKey =
+    getScopedChatShellStorageKey(normalizedSessionAci);
   const contactsBootstrapStorageKey = getUserScopedStorageKey(
     normalizedSessionAci,
     CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE
@@ -543,8 +581,7 @@ export async function clearChatShellStateForSession(
   removeChatShellStateFromLocalStorage(normalizedSessionAci);
   try {
     window.localStorage.removeItem(contactsBootstrapStorageKey);
-  } catch {
-  }
+  } catch {}
 
   const database = await openRenderPersistenceDatabase();
   if (!database) {
@@ -574,9 +611,14 @@ export async function clearWebPersistence(): Promise<void> {
   const activeUserId = getActiveLinkedSessionUserIdFromStorage();
   try {
     if (activeUserId) {
-      window.localStorage.removeItem(getScopedChatShellStorageKey(activeUserId));
       window.localStorage.removeItem(
-        getUserScopedStorageKey(activeUserId, CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE)
+        getScopedChatShellStorageKey(activeUserId)
+      );
+      window.localStorage.removeItem(
+        getUserScopedStorageKey(
+          activeUserId,
+          CONTACTS_BOOTSTRAP_STORAGE_KEY_BASE
+        )
       );
       window.localStorage.removeItem(activeUserId);
     }
@@ -591,15 +633,15 @@ export async function clearWebPersistence(): Promise<void> {
       }
     }
     window.sessionStorage.clear();
-  } catch {
-  }
+  } catch {}
   persistLinkedSessionToStorage(undefined);
   if (window.caches) {
     try {
       const cacheNames = await window.caches.keys();
-      await Promise.all(cacheNames.map(cacheName => window.caches.delete(cacheName)));
-    } catch {
-    }
+      await Promise.all(
+        cacheNames.map(cacheName => window.caches.delete(cacheName))
+      );
+    } catch {}
   }
   const database = await openRenderPersistenceDatabase();
   if (!database) {
@@ -607,7 +649,11 @@ export async function clearWebPersistence(): Promise<void> {
   }
   try {
     const transaction = database.transaction(
-      [SESSION_STORE_NAME, CHAT_SHELL_STORE_NAME, CONTACTS_BOOTSTRAP_STORE_NAME],
+      [
+        SESSION_STORE_NAME,
+        CHAT_SHELL_STORE_NAME,
+        CONTACTS_BOOTSTRAP_STORE_NAME,
+      ],
       'readwrite'
     );
     transaction.objectStore(SESSION_STORE_NAME).clear();

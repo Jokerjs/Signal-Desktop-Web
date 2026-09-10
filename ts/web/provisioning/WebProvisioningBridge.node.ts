@@ -105,6 +105,7 @@ import {
   exportProtocolState,
   getLinkedPayloadProtocolKeyIds,
   getWebSignalSendDiagnostics,
+  isMissingWebPreKeyError,
   maybeUpdateWebPreKeys,
   sendAttachmentBackfillRequestSync,
   sendDecryptionErrorMessage,
@@ -317,7 +318,7 @@ const BACKUP_IMPORT_CONCURRENCY = Number(
   process.env.SIGNAL_WEB_BACKUP_IMPORT_CONCURRENCY ?? 2
 );
 const MAX_JSON_BODY_BYTES = Number(
-  process.env.SIGNAL_WEB_MAX_JSON_BODY_BYTES ?? 8 * 1024 * 1024
+  process.env.SIGNAL_WEB_MAX_JSON_BODY_BYTES ?? 200 * 1024 * 1024
 );
 const emojiToSheet = new Map<string, string>();
 const emojiSheetCache = new Map<string, Map<string, Uint8Array<ArrayBuffer>>>();
@@ -474,6 +475,7 @@ type MessageStreamSession = {
   lastDecryptionErrorRetryError?: string;
   receiveChain?: Promise<void>;
   decryptionErrorRetryChain?: Promise<void>;
+  protocolReady?: Promise<void>;
   queueEmptyCount: number;
   sendAttemptCount: number;
   lastSendAttemptAt?: number;
@@ -1148,7 +1150,19 @@ function getActiveStreamAcis(): Set<string> {
 }
 
 function getProtectedStreamAcis(timestamp: number): Set<string> {
-  const protectedAcis = getActiveStreamAcis();
+  const protectedAcis = new Set<string>();
+  for (const streamSession of streamSessions.values()) {
+    if (
+      streamSession.status !== 'open' &&
+      streamSession.status !== 'connecting'
+    ) {
+      continue;
+    }
+    const aci = getStreamSessionAci(streamSession);
+    if (aci) {
+      protectedAcis.add(aci);
+    }
+  }
   for (const [aci, expiresAt] of recentlyClosedStreamAcis) {
     if (expiresAt <= timestamp) {
       recentlyClosedStreamAcis.delete(aci);
@@ -1375,6 +1389,7 @@ function queueDecryptionErrorRetry({
   sendAck,
   streamSession,
   timestamp,
+  missingWebPreKey,
   writeEvent,
 }: Readonly<{
   activeLinkedPayload: LinkedPayloadWithProtocol;
@@ -1383,6 +1398,7 @@ function queueDecryptionErrorRetry({
   sendAck: (statusCode: number) => void;
   streamSession: MessageStreamSession;
   timestamp: number;
+  missingWebPreKey: boolean;
   writeEvent: (event: unknown) => void;
 }>): void {
   const previousRetry =
@@ -1405,6 +1421,20 @@ function queueDecryptionErrorRetry({
       }
 
       try {
+        if (missingWebPreKey) {
+          try {
+            await maybeUpdateWebPreKeys({
+              chat: connection,
+              force: true,
+              linkedPayload: activeLinkedPayload,
+            });
+          } catch (refreshError) {
+            console.warn(
+              'message stream could not refresh prekeys after missing local prekey',
+              errorToLogString(refreshError)
+            );
+          }
+        }
         const envelopeForRetry = Proto.Envelope.decode(envelope);
         const retrySourceServiceId = fromServiceIdBinaryOrString(
           envelopeForRetry.sourceServiceIdBinary,
@@ -4652,6 +4682,10 @@ async function handleMessageStream(
   let connection: AuthenticatedChatConnection | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let didCloseStream = false;
+  let resolveProtocolReady: (() => void) | undefined;
+  const protocolReady = new Promise<void>(resolve => {
+    resolveProtocolReady = resolve;
+  });
   const streamAci =
     linkedPayload?.credentials?.aci ?? linkedPayload?.account.aci;
 
@@ -4679,11 +4713,14 @@ async function handleMessageStream(
     sendAttemptCount: 0,
     clientUserAgent,
     linkedPayload,
+    protocolReady,
     closeStream: () => {
       if (didCloseStream) {
         return;
       }
       didCloseStream = true;
+      resolveProtocolReady?.();
+      resolveProtocolReady = undefined;
       if (heartbeat) {
         clearInterval(heartbeat);
         heartbeat = undefined;
@@ -4706,7 +4743,6 @@ async function handleMessageStream(
       streamSessions.delete(sessionId);
       sessionOperationQueues.delete(sessionId);
       sessionOperationQueueSizes.delete(sessionId);
-      cleanupRuntimeState('stream-close');
       if (!res.destroyed && !res.writableEnded) {
         res.end();
       }
@@ -4832,6 +4868,9 @@ async function handleMessageStream(
                 });
                 sendAck(500);
                 return;
+              }
+              if (streamSession.protocolReady) {
+                await streamSession.protocolReady;
               }
               await decryptIncomingSignalEnvelope({
                 chat: connection,
@@ -5068,6 +5107,7 @@ async function handleMessageStream(
                     activeLinkedPayload,
                     connection,
                     envelope,
+                    missingWebPreKey: isMissingWebPreKeyError(error),
                     sendAck,
                     streamSession,
                     timestamp,
@@ -5120,6 +5160,26 @@ async function handleMessageStream(
       }
     );
     streamSession.connection = connection;
+    let didUpdatePreKeys = false;
+    try {
+      if (linkedPayload) {
+        didUpdatePreKeys = await maybeUpdateWebPreKeys({
+          chat: connection,
+          linkedPayload,
+        });
+      }
+    } catch (error) {
+      console.warn(
+        'handleMessageStream: failed to update web prekeys',
+        errorToLogString(error)
+      );
+    } finally {
+      resolveProtocolReady?.();
+      resolveProtocolReady = undefined;
+    }
+    if (didUpdatePreKeys) {
+      emitProtocolState(streamSession);
+    }
     streamSession.signalKeepalive?.stop();
     streamSession.signalKeepalive = startSignalChatKeepalive({
       connection,
@@ -5172,23 +5232,6 @@ async function handleMessageStream(
         errorToLogString(error)
       );
     });
-    if (linkedPayload) {
-      void maybeUpdateWebPreKeys({
-        chat: connection,
-        linkedPayload,
-      })
-        .then(updated => {
-          if (updated) {
-            emitProtocolState(streamSession);
-          }
-        })
-        .catch(error => {
-          console.warn(
-            'handleMessageStream: failed to update web prekeys',
-            errorToLogString(error)
-          );
-        });
-    }
     if (importBackup) {
       const readyConnection = connection;
       void limitBackupImport(() =>
@@ -5309,6 +5352,8 @@ async function handleSendMessage(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const destinationE164 =
+    typeof body.destinationE164 === 'string' ? body.destinationE164 : undefined;
   const accessKey = normalizeDirectAccessKey(body.accessKey);
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const attachments = parseWebAttachments(body.attachments);
@@ -5363,6 +5408,7 @@ async function handleSendMessage(
           chat: streamSession.connection,
           deleteForEveryone,
           destinationServiceId: checkedDestinationServiceId,
+          destinationE164,
           isViewOnce,
           linkedPayload: streamSession.linkedPayload,
           pinMessage,
@@ -5467,6 +5513,8 @@ async function handleSendExpirationTimer(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const destinationE164 =
+    typeof body.destinationE164 === 'string' ? body.destinationE164 : undefined;
   const accessKey = normalizeDirectAccessKey(body.accessKey);
   const expireTimer =
     typeof body.expireTimer === 'number' && body.expireTimer > 0
@@ -5500,6 +5548,7 @@ async function handleSendExpirationTimer(
         const message = await sendDirectExpirationTimerUpdate({
           accessKey,
           chat: streamSession.connection,
+          destinationE164,
           destinationServiceId,
           expireTimer,
           expireTimerVersion,
@@ -5958,6 +6007,8 @@ async function handleSendReaction(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const destinationE164 =
+    typeof body.destinationE164 === 'string' ? body.destinationE164 : undefined;
   const accessKey = normalizeDirectAccessKey(body.accessKey);
   const groupId = typeof body.groupId === 'string' ? body.groupId : undefined;
   const rawGroupV2 =
@@ -6046,6 +6097,7 @@ async function handleSendReaction(
           await sendDirectReaction({
             accessKey,
             chat: streamSession.connection,
+            destinationE164,
             destinationServiceId,
             emoji,
             linkedPayload: streamSession.linkedPayload,
@@ -6326,6 +6378,8 @@ async function handleSendEdit(
     typeof body.destinationServiceId === 'string'
       ? body.destinationServiceId
       : undefined;
+  const destinationE164 =
+    typeof body.destinationE164 === 'string' ? body.destinationE164 : undefined;
   const accessKey = normalizeDirectAccessKey(body.accessKey);
   const messageBody = typeof body.body === 'string' ? body.body : undefined;
   const targetTimestamp =
@@ -6358,6 +6412,7 @@ async function handleSendEdit(
           accessKey,
           body: messageBody,
           chat: streamSession.connection,
+          destinationE164,
           destinationServiceId,
           linkedPayload: streamSession.linkedPayload,
           targetTimestamp,

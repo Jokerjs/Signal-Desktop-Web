@@ -64,6 +64,7 @@ import {
   fromAciUuidBytesOrString,
   fromServiceIdBinaryOrString,
   toAciObject,
+  toServiceIdObject,
 } from '../../util/ServiceId.node.ts';
 import {
   fromServiceIdObject,
@@ -111,6 +112,7 @@ import type {
   WebUnpinMessage,
   WebUnpinMessageEvent,
 } from '../types.std.ts';
+import { isProtocolNamespaceForDevice } from '../protocolState.std.ts';
 
 export type WebSendLinkedPayload = Readonly<{
   account: Readonly<{
@@ -164,6 +166,7 @@ type DirectTextSendOptions = Readonly<{
   accessKey?: string;
   body: string;
   chat: AuthenticatedChatConnection;
+  destinationE164?: string;
   destinationServiceId: string;
   linkedPayload: WebSendLinkedPayload;
   timestamp: number;
@@ -217,6 +220,7 @@ type GroupUpdateSendOptions = Readonly<{
 type DirectReactionSendOptions = Readonly<{
   accessKey?: string;
   chat: AuthenticatedChatConnection;
+  destinationE164?: string;
   destinationServiceId: string;
   emoji?: string;
   linkedPayload: WebSendLinkedPayload;
@@ -293,6 +297,7 @@ type DirectEditSendOptions = Readonly<{
   accessKey?: string;
   body: string;
   chat: AuthenticatedChatConnection;
+  destinationE164?: string;
   destinationServiceId: string;
   linkedPayload: WebSendLinkedPayload;
   targetTimestamp: number;
@@ -524,9 +529,20 @@ function loadProtocolKyberPreKeys(
   );
 }
 
+async function waitForProtocolOperationQueue(
+  previous: Promise<unknown>
+): Promise<void> {
+  try {
+    await previous;
+  } catch (error) {
+    void error;
+  }
+}
+
 class WebSessionStore extends SessionStore {
   readonly #namespace: string;
   readonly #sessions = new Map<string, SessionRecord>();
+  readonly #operationQueues = new Map<string, Promise<void>>();
 
   public constructor(namespace: string, protocol: ProtocolState | undefined) {
     super();
@@ -554,6 +570,56 @@ class WebSessionStore extends SessionStore {
     return addresses
       .map(address => this.#sessions.get(getProtocolAddressKey(address)))
       .filter(record => record != null);
+  }
+
+  public async runSessionOperation<T>(
+    address: ProtocolAddress,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const addressKey = getProtocolAddressKey(address);
+    const previous = this.#operationQueues.get(addressKey) ?? Promise.resolve();
+    let releaseCurrent: (() => void) | undefined;
+    const current = new Promise<void>(resolve => {
+      releaseCurrent = resolve;
+    });
+    const queued = (async () => {
+      await waitForProtocolOperationQueue(previous);
+      await current;
+    })();
+    this.#operationQueues.set(addressKey, queued);
+
+    await waitForProtocolOperationQueue(previous);
+    try {
+      return await operation();
+    } finally {
+      releaseCurrent?.();
+      if (this.#operationQueues.get(addressKey) === queued) {
+        this.#operationQueues.delete(addressKey);
+      }
+    }
+  }
+
+  public async runSessionOperations<T>(
+    addresses: ReadonlyArray<ProtocolAddress>,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const uniqueAddresses = [
+      ...new Map(
+        addresses.map(address => [getProtocolAddressKey(address), address])
+      ).values(),
+    ].sort((left, right) =>
+      getProtocolAddressKey(left).localeCompare(getProtocolAddressKey(right))
+    );
+
+    const runAtIndex = (index: number): Promise<T> => {
+      const address = uniqueAddresses[index];
+      if (!address) {
+        return operation();
+      }
+      return this.runSessionOperation(address, () => runAtIndex(index + 1));
+    };
+
+    return runAtIndex(0);
   }
 
   public getKnownSessionsForServiceId(
@@ -584,14 +650,18 @@ class WebSessionStore extends SessionStore {
     return result;
   }
 
-  public removeSessionsForServiceId(
+  public async removeSessionsForServiceId(
     serviceId: string,
     deviceIds: ReadonlyArray<number>
-  ): void {
-    for (const deviceId of deviceIds) {
-      const addressKey = `${serviceId}.${deviceId}`;
-      this.#sessions.delete(addressKey);
-    }
+  ): Promise<void> {
+    await Promise.all(
+      deviceIds.map(async deviceId => {
+        const address = ProtocolAddress.new(serviceId, deviceId);
+        await this.runSessionOperation(address, async () => {
+          this.#sessions.delete(getProtocolAddressKey(address));
+        });
+      })
+    );
   }
 
   public async archiveSessionOnRatchetKeyMatch(
@@ -601,26 +671,32 @@ class WebSessionStore extends SessionStore {
     if (!ratchetKey) {
       return false;
     }
-    const record = await this.getSession(address);
-    if (!record || !record.currentRatchetKeyMatches(ratchetKey)) {
-      return false;
-    }
-    record.archiveCurrentState();
-    await this.saveSession(address, record);
-    return true;
+    return this.runSessionOperation(address, async () => {
+      const record = await this.getSession(address);
+      if (!record || !record.currentRatchetKeyMatches(ratchetKey)) {
+        return false;
+      }
+      record.archiveCurrentState();
+      await this.saveSession(address, record);
+      return true;
+    });
   }
 
-  public removeAllKnownSessionsForServiceId(
+  public async removeAllKnownSessionsForServiceId(
     serviceId: string,
     localDeviceId: number
-  ): void {
-    for (const { address } of this.getKnownSessionsForServiceId(
+  ): Promise<void> {
+    const addresses = this.getKnownSessionsForServiceId(
       serviceId,
       localDeviceId
-    )) {
-      const addressKey = getProtocolAddressKey(address);
-      this.#sessions.delete(addressKey);
-    }
+    ).map(({ address }) => address);
+    await Promise.all(
+      addresses.map(async address => {
+        await this.runSessionOperation(address, async () => {
+          this.#sessions.delete(getProtocolAddressKey(address));
+        });
+      })
+    );
   }
 
   public exportRecords(): Array<ProtocolSessionRecord> {
@@ -635,6 +711,7 @@ class WebSessionStore extends SessionStore {
 class WebSenderKeyStore extends SenderKeyStore {
   readonly #namespace: string;
   readonly #senderKeys = new Map<string, SenderKeyRecord>();
+  readonly #operationQueues = new Map<string, Promise<void>>();
 
   public constructor(namespace: string, protocol: ProtocolState | undefined) {
     super();
@@ -660,6 +737,33 @@ class WebSenderKeyStore extends SenderKeyStore {
         getSenderKeyPersistenceKey(sender, distributionId)
       ) ?? null
     );
+  }
+
+  public async runSenderKeyOperation<T>(
+    sender: ProtocolAddress,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const senderKey = getProtocolAddressKey(sender);
+    const previous = this.#operationQueues.get(senderKey) ?? Promise.resolve();
+    let releaseCurrent: (() => void) | undefined;
+    const current = new Promise<void>(resolve => {
+      releaseCurrent = resolve;
+    });
+    const queued = (async () => {
+      await waitForProtocolOperationQueue(previous);
+      await current;
+    })();
+    this.#operationQueues.set(senderKey, queued);
+
+    await waitForProtocolOperationQueue(previous);
+    try {
+      return await operation();
+    } finally {
+      releaseCurrent?.();
+      if (this.#operationQueues.get(senderKey) === queued) {
+        this.#operationQueues.delete(senderKey);
+      }
+    }
   }
 
   public exportRecords(): Array<ProtocolSenderKeyRecord> {
@@ -695,6 +799,21 @@ class WebPreKeyStore extends PreKeyStore {
 
   override async removePreKey(id: number): Promise<void> {
     this.#records.delete(id);
+  }
+
+  public get size(): number {
+    return this.#records.size;
+  }
+
+  public mergeProtocol(protocol: ProtocolState | undefined): void {
+    for (const [keyId, record] of loadProtocolPreKeys(
+      this.#namespace,
+      protocol
+    )) {
+      if (!this.#records.has(keyId)) {
+        this.#records.set(keyId, record);
+      }
+    }
   }
 
   public exportRecords(): Array<ProtocolPreKeyRecord> {
@@ -792,6 +911,22 @@ class WebKyberPreKeyStore extends KyberPreKeyStore {
     return undefined;
   }
 
+  public get size(): number {
+    return [...this.#records.values()].filter(entry => !entry.isLastResort)
+      .length;
+  }
+
+  public mergeProtocol(protocol: ProtocolState | undefined): void {
+    for (const [keyId, entry] of loadProtocolKyberPreKeys(
+      this.#namespace,
+      protocol
+    )) {
+      if (!this.#records.has(keyId)) {
+        this.#records.set(keyId, entry);
+      }
+    }
+  }
+
   public exportRecords(): Array<ProtocolKyberPreKeyRecord> {
     return [...this.#records].map(([keyId, entry]) => ({
       namespace: this.#namespace,
@@ -869,10 +1004,7 @@ type WebProtocolStore = Readonly<{
   signedPreKeyStore: WebSignedPreKeyStore;
 }>;
 
-type WebProtocolStoreEntry = Readonly<{
-  externalProtocolSignature?: string;
-  store: WebProtocolStore;
-}>;
+type WebProtocolStoreEntry = Readonly<{ store: WebProtocolStore }>;
 
 const protocolStores = new Map<string, WebProtocolStoreEntry>();
 const senderKeyInfoStores = new Map<string, Map<string, WebSenderKeyInfo>>();
@@ -938,6 +1070,23 @@ const MAX_SENT_PROTO_RECORDS = 500;
 const SENT_PROTO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SENDER_CERTIFICATE_REFRESH_BUFFER_MS = 60 * 60 * 1000;
 const SENDER_KEY_INFO_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+export function isMissingWebPreKeyError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let index = 0; index < 8; index += 1) {
+    if (!(current instanceof Error)) {
+      return false;
+    }
+    if (
+      current.message.includes('WebKyberPreKeyStore.getKyberPreKey:') ||
+      current.message.includes('WebPreKeyStore.getPreKey:')
+    ) {
+      return true;
+    }
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 function isActiveAciKey(
   activeAcis: ReadonlySet<string>,
@@ -1341,45 +1490,6 @@ function deserializeKyberPreKeyRecord(base64: string): KyberPreKeyRecord {
   return KyberPreKeyRecord.deserialize(Bytes.fromBase64(base64));
 }
 
-function getProtocolStoreExternalSignature(
-  namespace: string,
-  protocol: ProtocolState | undefined
-): string | undefined {
-  if (!protocol) {
-    return undefined;
-  }
-
-  const sessions = protocol.sessions
-    .filter(isProtocolSessionRecord)
-    .filter(record => record.namespace === namespace)
-    .map(record => [record.addressKey, record.recordBase64] as const)
-    .sort(([left], [right]) => left.localeCompare(right));
-  const senderKeys = protocol.senderKeys
-    .filter(isProtocolSenderKeyRecord)
-    .filter(record => record.namespace === namespace)
-    .map(record => [record.senderKey, record.recordBase64] as const)
-    .sort(([left], [right]) => left.localeCompare(right));
-  const preKeys = protocol.preKeys
-    .filter(isProtocolPreKeyRecord)
-    .filter(record => record.namespace === namespace)
-    .map(record => [record.keyId, record.recordBase64] as const)
-    .sort(([left], [right]) => left - right);
-  const kyberPreKeys = protocol.kyberPreKeys
-    .filter(isProtocolKyberPreKeyRecord)
-    .filter(record => record.namespace === namespace)
-    .map(
-      record =>
-        [
-          record.keyId,
-          Boolean(record.isLastResort),
-          record.recordBase64,
-        ] as const
-    )
-    .sort(([left], [right]) => left - right);
-
-  return JSON.stringify({ kyberPreKeys, preKeys, sessions, senderKeys });
-}
-
 export function getLinkedPayloadProtocolKeyIds(
   linkedPayload: WebSendLinkedPayload | undefined
 ): Record<string, unknown> | undefined {
@@ -1467,16 +1577,10 @@ function getProtocolStoreForServiceId(
     signedPreKeyRecord.id(),
     pqLastResortPreKeyRecord.id(),
   ].join(':');
-  const externalProtocolSignature = getProtocolStoreExternalSignature(
-    storeKey,
-    linkedPayload.protocol
-  );
   const existing = protocolStores.get(storeKey);
-  if (
-    existing &&
-    (externalProtocolSignature == null ||
-      externalProtocolSignature === existing.externalProtocolSignature)
-  ) {
+  if (existing) {
+    existing.store.preKeyStore.mergeProtocol(linkedPayload.protocol);
+    existing.store.kyberPreKeyStore.mergeProtocol(linkedPayload.protocol);
     return existing.store;
   }
 
@@ -1502,7 +1606,7 @@ function getProtocolStoreForServiceId(
     sessionStore: new WebSessionStore(storeKey, linkedPayload.protocol),
     signedPreKeyStore: new WebSignedPreKeyStore([signedPreKeyRecord]),
   };
-  protocolStores.set(storeKey, { externalProtocolSignature, store });
+  protocolStores.set(storeKey, { store });
   return store;
 }
 
@@ -1571,8 +1675,13 @@ export function exportProtocolState(
   linkedPayload: WebSendLinkedPayload
 ): ProtocolState {
   const aci = getLinkedAci(linkedPayload);
+  const deviceId = linkedPayload.credentials?.deviceId;
   const stores = [...protocolStores.entries()]
-    .filter(([storeKey]) => storeKey.startsWith(`${aci}:`))
+    .filter(([storeKey]) =>
+      Number.isInteger(deviceId)
+        ? isProtocolNamespaceForDevice(storeKey, aci, deviceId)
+        : storeKey.startsWith(`${aci}:`)
+    )
     .map(([, entry]) => entry.store);
 
   return {
@@ -1806,11 +1915,18 @@ async function maybeUpdateWebPreKeysForIdentity({
   }
 
   const request = (async () => {
+    const serviceId = getWebPreKeyIdentityServiceId(linkedPayload, identity);
+    if (!serviceId) {
+      return false;
+    }
+    const store = getProtocolStoreForServiceId(linkedPayload, serviceId);
     const lastCheckedAt = preKeyMaintenanceLastCheckedAt.get(maintenanceKey);
     if (
       !force &&
       lastCheckedAt &&
-      Date.now() - lastCheckedAt < WEB_PRE_KEY_CHECK_INTERVAL_MS
+      Date.now() - lastCheckedAt < WEB_PRE_KEY_CHECK_INTERVAL_MS &&
+      store.preKeyStore.size >= WEB_PRE_KEY_MINIMUM &&
+      store.kyberPreKeyStore.size >= WEB_PRE_KEY_MINIMUM
     ) {
       return false;
     }
@@ -1819,21 +1935,19 @@ async function maybeUpdateWebPreKeysForIdentity({
     const shouldUpdatePreKeys =
       counts.count < WEB_PRE_KEY_MINIMUM ||
       counts.count > WEB_PRE_KEY_MAX_COUNT ||
+      store.preKeyStore.size < WEB_PRE_KEY_MINIMUM ||
+      store.preKeyStore.size < counts.count ||
       force;
     const shouldUpdatePqPreKeys =
       counts.pqCount < WEB_PRE_KEY_MINIMUM ||
       counts.pqCount > WEB_PRE_KEY_MAX_COUNT ||
+      store.kyberPreKeyStore.size < WEB_PRE_KEY_MINIMUM ||
+      store.kyberPreKeyStore.size < counts.pqCount ||
       force;
     if (!shouldUpdatePreKeys && !shouldUpdatePqPreKeys) {
       preKeyMaintenanceLastCheckedAt.set(maintenanceKey, Date.now());
       return false;
     }
-
-    const serviceId = getWebPreKeyIdentityServiceId(linkedPayload, identity);
-    if (!serviceId) {
-      return false;
-    }
-    const store = getProtocolStoreForServiceId(linkedPayload, serviceId);
     const identityKeyPair = await store.identityStore.getIdentityKeyPair();
     const preKeyStartId = getRandomWebPreKeyStartId();
     const pqPreKeyStartId = getRandomWebPreKeyStartId();
@@ -1866,14 +1980,6 @@ async function maybeUpdateWebPreKeysForIdentity({
         })
       : undefined;
 
-    await uploadWebPreKeys({
-      chat,
-      identity,
-      maintenanceKey,
-      pqPreKeys: pqPreKeyRecords,
-      preKeys: preKeyRecords,
-    });
-
     await Promise.all([
       ...(preKeyRecords ?? []).map(item =>
         store.preKeyStore.savePreKey(item.keyId, item.record)
@@ -1882,6 +1988,13 @@ async function maybeUpdateWebPreKeysForIdentity({
         store.kyberPreKeyStore.saveKyberPreKey(item.keyId, item.record)
       ),
     ]);
+    await uploadWebPreKeys({
+      chat,
+      identity,
+      maintenanceKey,
+      pqPreKeys: pqPreKeyRecords,
+      preKeys: preKeyRecords,
+    });
     preKeyMaintenanceLastCheckedAt.set(maintenanceKey, Date.now());
     return true;
   })();
@@ -2296,6 +2409,7 @@ function createSentSyncContent({
   attachments = [],
   body,
   deleteForEveryone,
+  destinationE164,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
@@ -2310,6 +2424,7 @@ function createSentSyncContent({
   attachments?: ReadonlyArray<WebAttachment>;
   body: string;
   deleteForEveryone?: WebDeleteForEveryone;
+  destinationE164?: string;
   destinationServiceId?: string;
   expireTimer?: number;
   expireTimerVersion?: number;
@@ -2321,15 +2436,19 @@ function createSentSyncContent({
   timestamp: number;
   unpinMessage?: WebUnpinMessage;
 }>): Uint8Array<ArrayBuffer> {
+  const destination = destinationServiceId
+    ? toServiceIdObject(destinationServiceId as ServiceIdString)
+    : undefined;
   return padMessage(
     Proto.Content.encode({
       content: {
         syncMessage: {
           content: {
             sent: {
-              destinationE164: null,
-              destinationServiceId: destinationServiceId ?? null,
-              destinationServiceIdBinary: null,
+              destinationE164: destinationE164 ?? null,
+              destinationServiceId: null,
+              destinationServiceIdBinary:
+                destination?.getServiceIdBinary() ?? null,
               editMessage: null,
               expirationStartTimestamp: null,
               isRecipientUpdate: false,
@@ -2366,6 +2485,7 @@ function createSentSyncContent({
 }
 
 function createSentReactionSyncContent({
+  destinationE164,
   destinationServiceId,
   emoji,
   groupV2,
@@ -2374,6 +2494,7 @@ function createSentReactionSyncContent({
   targetTimestamp,
   timestamp,
 }: Readonly<{
+  destinationE164?: string;
   destinationServiceId?: string;
   emoji?: string;
   groupV2?: Proto.GroupContextV2.Params;
@@ -2382,15 +2503,19 @@ function createSentReactionSyncContent({
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
+  const destination = destinationServiceId
+    ? toServiceIdObject(destinationServiceId as ServiceIdString)
+    : undefined;
   return padMessage(
     Proto.Content.encode({
       content: {
         syncMessage: {
           content: {
             sent: {
-              destinationE164: null,
-              destinationServiceId: destinationServiceId ?? null,
-              destinationServiceIdBinary: null,
+              destinationE164: destinationE164 ?? null,
+              destinationServiceId: null,
+              destinationServiceIdBinary:
+                destination?.getServiceIdBinary() ?? null,
               editMessage: null,
               expirationStartTimestamp: null,
               isRecipientUpdate: false,
@@ -2422,24 +2547,29 @@ function createSentReactionSyncContent({
 
 function createSentEditSyncContent({
   body,
+  destinationE164,
   destinationServiceId,
   targetTimestamp,
   timestamp,
 }: Readonly<{
   body: string;
+  destinationE164?: string;
   destinationServiceId: string;
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
+  const destination = toServiceIdObject(
+    destinationServiceId as ServiceIdString
+  );
   return padMessage(
     Proto.Content.encode({
       content: {
         syncMessage: {
           content: {
             sent: {
-              destinationE164: null,
-              destinationServiceId,
-              destinationServiceIdBinary: null,
+              destinationE164: destinationE164 ?? null,
+              destinationServiceId: null,
+              destinationServiceIdBinary: destination.getServiceIdBinary(),
               editMessage: {
                 dataMessage: createDataMessage({ body, timestamp }),
                 targetSentTimestamp: BigInt(targetTimestamp),
@@ -3489,29 +3619,48 @@ async function decryptEnvelopeContent({
     if (messageType === CiphertextMessageType.Plaintext) {
       plaintext = PlaintextContent.deserialize(ciphertext).body();
     } else if (messageType === CiphertextMessageType.PreKey) {
-      plaintext = await signalDecryptPreKey(
-        PreKeySignalMessage.deserialize(ciphertext),
-        ProtocolAddress.new(sourceServiceId, sourceDevice),
-        ProtocolAddress.new(destinationServiceId, ourDeviceId),
-        protocolStore.sessionStore,
-        protocolStore.identityStore,
-        protocolStore.preKeyStore,
-        protocolStore.signedPreKeyStore,
-        protocolStore.kyberPreKeyStore
+      const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+      const destinationAddress = ProtocolAddress.new(
+        destinationServiceId,
+        ourDeviceId
+      );
+      plaintext = await protocolStore.sessionStore.runSessionOperation(
+        sourceAddress,
+        () =>
+          signalDecryptPreKey(
+            PreKeySignalMessage.deserialize(ciphertext),
+            sourceAddress,
+            destinationAddress,
+            protocolStore.sessionStore,
+            protocolStore.identityStore,
+            protocolStore.preKeyStore,
+            protocolStore.signedPreKeyStore,
+            protocolStore.kyberPreKeyStore
+          )
       );
     } else if (messageType === CiphertextMessageType.Whisper) {
-      plaintext = await signalDecrypt(
-        SignalMessage.deserialize(ciphertext),
-        ProtocolAddress.new(sourceServiceId, sourceDevice),
-        ProtocolAddress.new(destinationServiceId, ourDeviceId),
-        protocolStore.sessionStore,
-        protocolStore.identityStore
+      const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+      const destinationAddress = ProtocolAddress.new(
+        destinationServiceId,
+        ourDeviceId
+      );
+      plaintext = await protocolStore.sessionStore.runSessionOperation(
+        sourceAddress,
+        () =>
+          signalDecrypt(
+            SignalMessage.deserialize(ciphertext),
+            sourceAddress,
+            destinationAddress,
+            protocolStore.sessionStore,
+            protocolStore.identityStore
+          )
       );
     } else if (messageType === CiphertextMessageType.SenderKey) {
-      plaintext = await groupDecrypt(
-        ProtocolAddress.new(sourceServiceId, sourceDevice),
-        protocolStore.senderKeyStore,
-        ciphertext
+      const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+      plaintext = await protocolStore.senderKeyStore.runSenderKeyOperation(
+        sourceAddress,
+        () =>
+          groupDecrypt(sourceAddress, protocolStore.senderKeyStore, ciphertext)
       );
     } else {
       throw new Error(
@@ -3527,23 +3676,41 @@ async function decryptEnvelopeContent({
     if (type === Proto.Envelope.Type.PLAINTEXT_CONTENT) {
       plaintext = PlaintextContent.deserialize(ciphertext).body();
     } else if (type === Proto.Envelope.Type.PREKEY_MESSAGE) {
-      plaintext = await signalDecryptPreKey(
-        PreKeySignalMessage.deserialize(ciphertext),
-        ProtocolAddress.new(sourceServiceId, sourceDevice),
-        ProtocolAddress.new(destinationServiceId, ourDeviceId),
-        protocolStore.sessionStore,
-        protocolStore.identityStore,
-        protocolStore.preKeyStore,
-        protocolStore.signedPreKeyStore,
-        protocolStore.kyberPreKeyStore
+      const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+      const destinationAddress = ProtocolAddress.new(
+        destinationServiceId,
+        ourDeviceId
+      );
+      plaintext = await protocolStore.sessionStore.runSessionOperation(
+        sourceAddress,
+        () =>
+          signalDecryptPreKey(
+            PreKeySignalMessage.deserialize(ciphertext),
+            sourceAddress,
+            destinationAddress,
+            protocolStore.sessionStore,
+            protocolStore.identityStore,
+            protocolStore.preKeyStore,
+            protocolStore.signedPreKeyStore,
+            protocolStore.kyberPreKeyStore
+          )
       );
     } else if (type === Proto.Envelope.Type.DOUBLE_RATCHET) {
-      plaintext = await signalDecrypt(
-        SignalMessage.deserialize(ciphertext),
-        ProtocolAddress.new(sourceServiceId, sourceDevice),
-        ProtocolAddress.new(destinationServiceId, ourDeviceId),
-        protocolStore.sessionStore,
-        protocolStore.identityStore
+      const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+      const destinationAddress = ProtocolAddress.new(
+        destinationServiceId,
+        ourDeviceId
+      );
+      plaintext = await protocolStore.sessionStore.runSessionOperation(
+        sourceAddress,
+        () =>
+          signalDecrypt(
+            SignalMessage.deserialize(ciphertext),
+            sourceAddress,
+            destinationAddress,
+            protocolStore.sessionStore,
+            protocolStore.identityStore
+          )
       );
     } else {
       throw new Error(
@@ -3583,10 +3750,13 @@ async function maybeProcessSenderKeyDistributionMessage({
     return false;
   }
 
-  await processSenderKeyDistributionMessage(
-    ProtocolAddress.new(sourceServiceId, sourceDevice),
-    SenderKeyDistributionMessage.deserialize(distributionMessage),
-    protocolStore.senderKeyStore
+  const sourceAddress = ProtocolAddress.new(sourceServiceId, sourceDevice);
+  await protocolStore.senderKeyStore.runSenderKeyOperation(sourceAddress, () =>
+    processSenderKeyDistributionMessage(
+      sourceAddress,
+      SenderKeyDistributionMessage.deserialize(distributionMessage),
+      protocolStore.senderKeyStore
+    )
   );
   return true;
 }
@@ -5214,12 +5384,18 @@ async function createSessionsFromUnauthServerKeys({
     ) {
       continue;
     }
-    await processPreKeyBundle(
-      preKeyBundle,
-      ProtocolAddress.new(destinationServiceId, preKeyBundle.deviceId()),
-      localAddress,
-      sessionStore,
-      identityStore
+    const destinationAddress = ProtocolAddress.new(
+      destinationServiceId,
+      preKeyBundle.deviceId()
+    );
+    await sessionStore.runSessionOperation(destinationAddress, () =>
+      processPreKeyBundle(
+        preKeyBundle,
+        destinationAddress,
+        localAddress,
+        sessionStore,
+        identityStore
+      )
     );
   }
 }
@@ -5293,12 +5469,14 @@ async function createSessionsFromServerKeys({
         KEMPublicKey.deserialize(Bytes.fromBase64(pqPreKey.publicKey)),
         Bytes.fromBase64(pqPreKey.signature)
       );
-      await processPreKeyBundle(
-        preKeyBundle,
-        destinationAddress,
-        localAddress,
-        sessionStore,
-        identityStore
+      await sessionStore.runSessionOperation(destinationAddress, () =>
+        processPreKeyBundle(
+          preKeyBundle,
+          destinationAddress,
+          localAddress,
+          sessionStore,
+          identityStore
+        )
       );
     }
   }
@@ -5380,13 +5558,16 @@ async function encryptForDestination({
 
   const encrypted = new Array<SingleOutboundUnsealedMessage>();
   for (const { address: destinationAddress, record } of knownSessions) {
-    const ciphertext: CiphertextMessage = await signalEncrypt(
-      plaintext,
-      destinationAddress,
-      localAddress,
-      sessionStore,
-      identityStore
-    );
+    const ciphertext: CiphertextMessage =
+      await sessionStore.runSessionOperation(destinationAddress, () =>
+        signalEncrypt(
+          plaintext,
+          destinationAddress,
+          localAddress,
+          sessionStore,
+          identityStore
+        )
+      );
     encrypted.push({
       deviceId: destinationAddress.deviceId(),
       registrationId: record.remoteRegistrationId(),
@@ -5757,13 +5938,19 @@ async function trySendGroupWithSenderKey({
     senderKeyInfo.memberDevices,
     currentDevices
   );
+  const distributionId = senderKeyInfo.distributionId;
   const senderAddress = ProtocolAddress.new(ourAci, ourDeviceId);
   if (newDevices.length > 0) {
-    const distributionMessage = await SenderKeyDistributionMessage.create(
-      senderAddress,
-      senderKeyInfo.distributionId,
-      protocolStore.senderKeyStore
-    );
+    const distributionMessage =
+      await protocolStore.senderKeyStore.runSenderKeyOperation(
+        senderAddress,
+        () =>
+          SenderKeyDistributionMessage.create(
+            senderAddress,
+            distributionId,
+            protocolStore.senderKeyStore
+          )
+      );
     const serviceIds = [...new Set(newDevices.map(device => device.serviceId))];
     await sendSenderKeyDistributionMessages({
       chat,
@@ -5790,12 +5977,17 @@ async function trySendGroupWithSenderKey({
 
   let ciphertextMessage: CiphertextMessage;
   try {
-    ciphertextMessage = await groupEncrypt(
-      senderAddress,
-      senderKeyInfo.distributionId,
-      protocolStore.senderKeyStore,
-      plaintext
-    );
+    ciphertextMessage =
+      await protocolStore.senderKeyStore.runSenderKeyOperation(
+        senderAddress,
+        () =>
+          groupEncrypt(
+            senderAddress,
+            distributionId,
+            protocolStore.senderKeyStore,
+            plaintext
+          )
+      );
   } catch (error) {
     if (!isMissingSenderKeyStateError(error)) {
       throw error;
@@ -5804,7 +5996,7 @@ async function trySendGroupWithSenderKey({
     console.warn(
       'trySendGroupWithSenderKey: missing local sender key state, falling back to per-recipient group send',
       JSON.stringify({
-        distributionId: senderKeyInfo.distributionId,
+        distributionId,
         groupId,
         cause: getErrorSummary(error),
       })
@@ -5822,11 +6014,15 @@ async function trySendGroupWithSenderKey({
   );
   let payload: Uint8Array<ArrayBuffer>;
   try {
-    payload = await sealedSenderMultiRecipientEncrypt(
-      unidentifiedSenderContent,
+    payload = await protocolStore.sessionStore.runSessionOperations(
       recipients,
-      protocolStore.identityStore,
-      protocolStore.sessionStore
+      () =>
+        sealedSenderMultiRecipientEncrypt(
+          unidentifiedSenderContent,
+          recipients,
+          protocolStore.identityStore,
+          protocolStore.sessionStore
+        )
     );
   } catch (error) {
     senderKeyInfoStore.delete(groupId);
@@ -5964,6 +6160,77 @@ function getMismatchedDevicesEntries(
   }));
 }
 
+async function sendSyncMessageToOwnDevices({
+  chat,
+  createMessages,
+  getWarningSummary,
+  linkedPayload,
+  logLabel,
+  timestamp,
+  urgent,
+}: Readonly<{
+  chat: AuthenticatedChatConnection;
+  createMessages: () => Promise<ReadonlyArray<SingleOutboundUnsealedMessage>>;
+  getWarningSummary: (
+    messages: ReadonlyArray<SingleOutboundUnsealedMessage>
+  ) => Record<string, unknown>;
+  linkedPayload: WebSendLinkedPayload;
+  logLabel: string;
+  timestamp: number;
+  urgent: boolean;
+}>): Promise<void> {
+  const ourAci = getLinkedAci(linkedPayload);
+  let messages: ReadonlyArray<SingleOutboundUnsealedMessage> | undefined;
+
+  try {
+    messages = await createMessages();
+    await chat.sendSyncMessage({
+      contents: messages,
+      timestamp,
+      urgent,
+    });
+    return;
+  } catch (error) {
+    if (!messages) {
+      console.warn(logLabel, JSON.stringify({ cause: getErrorSummary(error) }));
+      return;
+    }
+    const mismatchedEntries = getMismatchedDevicesEntries(error, ourAci);
+    if (!mismatchedEntries) {
+      console.warn(
+        logLabel,
+        JSON.stringify({
+          ...getWarningSummary(messages),
+          cause: getErrorSummary(error),
+        })
+      );
+      return;
+    }
+
+    try {
+      await handleWebMismatchedDevices({
+        chat,
+        entries: mismatchedEntries,
+        linkedPayload,
+      });
+      messages = await createMessages();
+      await chat.sendSyncMessage({
+        contents: messages,
+        timestamp,
+        urgent,
+      });
+    } catch (retryError) {
+      console.warn(
+        logLabel,
+        JSON.stringify({
+          ...getWarningSummary(messages),
+          cause: getErrorSummary(retryError),
+        })
+      );
+    }
+  }
+}
+
 async function handleWebMismatchedDevices({
   chat,
   accessKey,
@@ -5995,19 +6262,19 @@ async function handleWebMismatchedDevices({
       entry.staleDevices.length === 0;
 
     if (shouldFetchAll) {
-      sessionStore.removeAllKnownSessionsForServiceId(
+      await sessionStore.removeAllKnownSessionsForServiceId(
         entry.serviceId,
         entry.serviceId === getLinkedAci(linkedPayload) ? ourDeviceId : -1
       );
     }
     if (entry.extraDevices.length > 0) {
-      sessionStore.removeSessionsForServiceId(
+      await sessionStore.removeSessionsForServiceId(
         entry.serviceId,
         entry.extraDevices
       );
     }
     if (entry.staleDevices.length > 0) {
-      sessionStore.removeSessionsForServiceId(
+      await sessionStore.removeSessionsForServiceId(
         entry.serviceId,
         entry.staleDevices
       );
@@ -6304,6 +6571,7 @@ export async function sendDirectTextMessage({
   body,
   chat,
   deleteForEveryone,
+  destinationE164,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
@@ -6430,40 +6698,44 @@ export async function sendDirectTextMessage({
       urgent: true,
     });
 
-    try {
-      const syncMessages = await encryptForDestination({
-        chat,
-        destinationServiceId: ourAci,
-        linkedPayload,
-        plaintext: createSentSyncContent({
-          attachments,
-          body,
-          deleteForEveryone,
-          destinationServiceId,
-          expireTimer,
-          expireTimerVersion,
-          flags,
-          isViewOnce,
-          pinMessage,
-          quote,
-          timestamp,
-          unpinMessage,
+    await sendSyncMessageToOwnDevices({
+      chat,
+      createMessages: () =>
+        encryptForDestination({
+          chat,
+          destinationServiceId: ourAci,
+          linkedPayload,
+          plaintext: createSentSyncContent({
+            attachments,
+            body,
+            deleteForEveryone,
+            destinationE164,
+            destinationServiceId,
+            expireTimer,
+            expireTimerVersion,
+            flags,
+            isViewOnce,
+            pinMessage,
+            quote,
+            timestamp,
+            unpinMessage,
+          }),
         }),
-      });
-      await chat.sendSyncMessage({
-        contents: syncMessages,
-        timestamp,
-        urgent: true,
-      });
-    } catch (error) {
-      console.warn(
+      getWarningSummary: syncMessages => ({
+        destinationServiceId,
+        devices: syncMessages.map(message => ({
+          deviceId: message.deviceId,
+          registrationId: message.registrationId,
+          type: message.contents.type(),
+          contentLength: message.contents.serialize().byteLength,
+        })),
+      }),
+      linkedPayload,
+      logLabel:
         'sendDirectTextMessage: sent to destination, but failed to sync sent message',
-        JSON.stringify({
-          destinationServiceId,
-          cause: getErrorSummary(error),
-        })
-      );
-    }
+      timestamp,
+      urgent: true,
+    });
   }
 
   return {
@@ -6503,6 +6775,7 @@ export async function sendDirectTextMessage({
 export async function sendDirectExpirationTimerUpdate({
   accessKey,
   chat,
+  destinationE164,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
@@ -6512,6 +6785,7 @@ export async function sendDirectExpirationTimerUpdate({
 }: Readonly<{
   accessKey?: string;
   chat: AuthenticatedChatConnection;
+  destinationE164?: string;
   destinationServiceId: string;
   expireTimer?: number;
   expireTimerVersion: number;
@@ -6523,6 +6797,7 @@ export async function sendDirectExpirationTimerUpdate({
     accessKey,
     body: '',
     chat,
+    destinationE164,
     destinationServiceId,
     expireTimer,
     expireTimerVersion,
@@ -6899,6 +7174,7 @@ export async function sendGroupTextMessage({
 export async function sendDirectReaction({
   accessKey,
   chat,
+  destinationE164,
   destinationServiceId,
   emoji,
   linkedPayload,
@@ -6976,21 +7252,37 @@ export async function sendDirectReaction({
   }
 
   try {
-    const syncMessages = await encryptForDestination({
+    await sendSyncMessageToOwnDevices({
       chat,
-      destinationServiceId: ourAci,
-      linkedPayload,
-      plaintext: createSentReactionSyncContent({
+      createMessages: () =>
+        encryptForDestination({
+          chat,
+          destinationServiceId: ourAci,
+          linkedPayload,
+          plaintext: createSentReactionSyncContent({
+            destinationE164,
+            destinationServiceId,
+            emoji,
+            remove,
+            targetAuthorAci,
+            targetTimestamp,
+            timestamp,
+          }),
+        }),
+      getWarningSummary: syncMessages => ({
         destinationServiceId,
-        emoji,
-        remove,
         targetAuthorAci,
         targetTimestamp,
-        timestamp,
+        devices: syncMessages.map(message => ({
+          deviceId: message.deviceId,
+          registrationId: message.registrationId,
+          type: message.contents.type(),
+          contentLength: message.contents.serialize().byteLength,
+        })),
       }),
-    });
-    await chat.sendSyncMessage({
-      contents: syncMessages,
+      linkedPayload,
+      logLabel:
+        'sendDirectReaction: sent to destination, but failed to sync sent reaction',
       timestamp,
       urgent: true,
     });
@@ -7153,6 +7445,7 @@ export async function sendDirectEditMessage({
   accessKey,
   body,
   chat,
+  destinationE164,
   destinationServiceId,
   linkedPayload,
   targetTimestamp,
@@ -7224,33 +7517,37 @@ export async function sendDirectEditMessage({
     });
   }
 
-  try {
-    const syncMessages = await encryptForDestination({
-      chat,
-      destinationServiceId: ourAci,
-      linkedPayload,
-      plaintext: createSentEditSyncContent({
-        body,
-        destinationServiceId,
-        targetTimestamp,
-        timestamp,
+  await sendSyncMessageToOwnDevices({
+    chat,
+    createMessages: () =>
+      encryptForDestination({
+        chat,
+        destinationServiceId: ourAci,
+        linkedPayload,
+        plaintext: createSentEditSyncContent({
+          body,
+          destinationE164,
+          destinationServiceId,
+          targetTimestamp,
+          timestamp,
+        }),
       }),
-    });
-    await chat.sendSyncMessage({
-      contents: syncMessages,
-      timestamp,
-      urgent: true,
-    });
-  } catch (error) {
-    console.warn(
+    getWarningSummary: syncMessages => ({
+      destinationServiceId,
+      targetTimestamp,
+      devices: syncMessages.map(message => ({
+        deviceId: message.deviceId,
+        registrationId: message.registrationId,
+        type: message.contents.type(),
+        contentLength: message.contents.serialize().byteLength,
+      })),
+    }),
+    linkedPayload,
+    logLabel:
       'sendDirectEditMessage: sent to destination, but failed to sync sent edit',
-      JSON.stringify({
-        destinationServiceId,
-        targetTimestamp,
-        cause: getErrorSummary(error),
-      })
-    );
-  }
+    timestamp,
+    urgent: true,
+  });
 
   return { ok: true, timestamp };
 }

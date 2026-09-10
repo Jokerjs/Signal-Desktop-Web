@@ -2982,6 +2982,7 @@ class WebConversationModel {
     const sent = await sendDirectExpirationTimerUpdate({
       runtimeSessionId: currentMessageRuntimeSessionId,
       accessKey: getDirectSendAccessKey(this.attributes as WebConversation),
+      destinationE164: (this.attributes as WebConversation).e164,
       destinationServiceId,
       expireTimer,
       expireTimerVersion: nextVersion,
@@ -3167,6 +3168,7 @@ class WebConversationModel {
       : await sendDirectTextMessage({
           runtimeSessionId: currentMessageRuntimeSessionId,
           accessKey: getDirectSendAccessKey(this.attributes as WebConversation),
+          destinationE164: (this.attributes as WebConversation).e164,
           destinationServiceId: String(this.attributes.serviceId ?? this.id),
           body,
           timestamp,

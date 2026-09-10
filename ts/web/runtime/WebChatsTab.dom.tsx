@@ -907,6 +907,7 @@ function WebCompositionArea({
             await sendDirectEditMessage({
               runtimeSessionId: messageRuntimeSessionId,
               accessKey: getDirectSendAccessKey(conversationForSend),
+              destinationE164: conversationForSend.e164,
               destinationServiceId:
                 conversationForSend.serviceId ?? conversationForSend.id,
               body,
@@ -1075,6 +1076,7 @@ function WebCompositionArea({
                 attachments: remoteAttachments,
                 runtimeSessionId: messageRuntimeSessionId,
                 accessKey: getDirectSendAccessKey(conversationForSend),
+                destinationE164: conversationForSend.e164,
                 destinationServiceId,
                 body,
                 isViewOnce: isViewOnceActive,

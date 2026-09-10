@@ -3416,6 +3416,7 @@ export function WebDesktopApp({
                   : await sendDirectTextMessage({
                       runtimeSessionId: messageRuntimeSessionId,
                       accessKey: getDirectSendAccessKey(conversation),
+                      destinationE164: conversation.e164,
                       destinationServiceId:
                         conversation.serviceId ?? conversation.id,
                       body,
@@ -3500,6 +3501,7 @@ export function WebDesktopApp({
           await sendDirectTextMessage({
             runtimeSessionId: messageRuntimeSessionId,
             accessKey: getDirectSendAccessKey(conversation),
+            destinationE164: conversation.e164,
             destinationServiceId: conversation.serviceId ?? conversation.id,
             body: '',
             pinMessage,
@@ -3653,6 +3655,7 @@ export function WebDesktopApp({
               await sendDirectReaction({
                 runtimeSessionId: messageRuntimeSessionId,
                 accessKey: getDirectSendAccessKey(conversation),
+                destinationE164: conversation.e164,
                 destinationServiceId: conversation.serviceId ?? conversation.id,
                 emoji: reaction.emoji,
                 remove: reaction.remove,

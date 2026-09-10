@@ -17,6 +17,7 @@ import type {
   WebConversation,
   WebAccount,
 } from './types.std.ts';
+import { pruneProtocolStateForDevice } from './protocolState.std.ts';
 import { getWebAttachmentContentType } from './attachmentMime.std.ts';
 import { HTTPError } from '../types/HTTPError.std.ts';
 import { ZERO_ACCESS_KEY } from '../types/SealedSender.std.ts';
@@ -105,6 +106,9 @@ function getLinkedSessionRequestBody(
   linkedSession: LinkedSessionRecord,
   includeProtocol = false
 ): Record<string, unknown> {
+  const linkedAci =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci ?? undefined;
+  const linkedDeviceId = linkedSession.credentials?.deviceId;
   return {
     username: linkedSession.credentials?.username,
     password: linkedSession.credentials?.password,
@@ -114,7 +118,13 @@ function getLinkedSessionRequestBody(
     number: linkedSession.credentials?.number,
     storageServiceKey: linkedSession.storageServiceKey,
     linkedPayload: linkedSession.linkedPayload,
-    protocol: includeProtocol ? linkedSession.protocol : undefined,
+    protocol: includeProtocol
+      ? pruneProtocolStateForDevice(
+          linkedSession.protocol,
+          linkedAci,
+          linkedDeviceId
+        )
+      : undefined,
     clientUserAgent: getSignalDesktopUserAgent(),
   };
 }
@@ -661,6 +671,7 @@ export async function sendDirectTextMessage({
   runtimeSessionId,
   accessKey,
   destinationServiceId,
+  destinationE164,
   body,
   timestamp,
   attachments,
@@ -672,6 +683,7 @@ export async function sendDirectTextMessage({
 }: Readonly<{
   runtimeSessionId?: string;
   accessKey?: string;
+  destinationE164?: string;
   destinationServiceId: string;
   body: string;
   timestamp: number;
@@ -692,6 +704,7 @@ export async function sendDirectTextMessage({
       body: JSON.stringify({
         sessionId: runtimeSessionId,
         accessKey: normalizeDirectAccessKey(accessKey),
+        destinationE164,
         destinationServiceId,
         body,
         timestamp,
@@ -734,6 +747,7 @@ export async function submitMessageChallenge({
 export async function sendDirectExpirationTimerUpdate({
   runtimeSessionId,
   accessKey,
+  destinationE164,
   destinationServiceId,
   expireTimer,
   expireTimerVersion,
@@ -741,6 +755,7 @@ export async function sendDirectExpirationTimerUpdate({
 }: Readonly<{
   runtimeSessionId?: string;
   accessKey?: string;
+  destinationE164?: string;
   destinationServiceId: string;
   expireTimer?: number;
   expireTimerVersion: number;
@@ -756,6 +771,7 @@ export async function sendDirectExpirationTimerUpdate({
       body: JSON.stringify({
         sessionId: runtimeSessionId,
         accessKey: normalizeDirectAccessKey(accessKey),
+        destinationE164,
         destinationServiceId,
         expireTimer,
         expireTimerVersion,
@@ -1234,6 +1250,7 @@ export async function sendDirectReaction({
   runtimeSessionId,
   accessKey,
   destinationServiceId,
+  destinationE164,
   emoji,
   remove,
   targetAuthorAci,
@@ -1242,6 +1259,7 @@ export async function sendDirectReaction({
 }: Readonly<{
   runtimeSessionId?: string;
   accessKey?: string;
+  destinationE164?: string;
   destinationServiceId: string;
   emoji?: string;
   remove: boolean;
@@ -1259,6 +1277,7 @@ export async function sendDirectReaction({
       body: JSON.stringify({
         sessionId: runtimeSessionId,
         accessKey: normalizeDirectAccessKey(accessKey),
+        destinationE164,
         destinationServiceId,
         emoji,
         remove,
@@ -1325,12 +1344,14 @@ export async function sendDirectEditMessage({
   runtimeSessionId,
   accessKey,
   destinationServiceId,
+  destinationE164,
   body,
   targetTimestamp,
   timestamp,
 }: Readonly<{
   runtimeSessionId?: string;
   accessKey?: string;
+  destinationE164?: string;
   destinationServiceId: string;
   body: string;
   targetTimestamp: number;
@@ -1346,6 +1367,7 @@ export async function sendDirectEditMessage({
       body: JSON.stringify({
         sessionId: runtimeSessionId,
         accessKey: normalizeDirectAccessKey(accessKey),
+        destinationE164,
         destinationServiceId,
         body,
         targetTimestamp,

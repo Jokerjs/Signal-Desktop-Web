@@ -853,6 +853,7 @@ export function WebApp() {
       const sent = await sendDirectTextMessage({
         runtimeSessionId: transportSessionId,
         accessKey: getDirectSendAccessKey(selectedConversation),
+        destinationE164: selectedConversation.e164,
         destinationServiceId,
         body,
         timestamp: localMessage.timestamp,
