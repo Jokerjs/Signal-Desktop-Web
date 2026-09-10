@@ -2418,6 +2418,7 @@ function createSentSyncContent({
   isViewOnce = false,
   pinMessage,
   quote,
+  sticker,
   timestamp,
   unpinMessage,
 }: Readonly<{
@@ -2433,6 +2434,7 @@ function createSentSyncContent({
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   quote?: WebMessage['quote'];
+  sticker?: WebMessage['sticker'];
   timestamp: number;
   unpinMessage?: WebUnpinMessage;
 }>): Uint8Array<ArrayBuffer> {
@@ -2463,6 +2465,7 @@ function createSentSyncContent({
                 isViewOnce,
                 pinMessage,
                 quote,
+                sticker,
                 timestamp,
                 unpinMessage,
               }),
@@ -6717,6 +6720,7 @@ export async function sendDirectTextMessage({
             isViewOnce,
             pinMessage,
             quote,
+            sticker,
             timestamp,
             unpinMessage,
           }),
@@ -7124,6 +7128,7 @@ export async function sendGroupTextMessage({
         isViewOnce,
         pinMessage,
         quote,
+        sticker,
         timestamp,
         unpinMessage,
       }),
