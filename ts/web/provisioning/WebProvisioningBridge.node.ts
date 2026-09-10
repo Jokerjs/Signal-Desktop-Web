@@ -509,6 +509,7 @@ type MessageStreamSession = {
   lastBackupUnauthKeepaliveStatus?: number;
   streamCloseCount?: number;
   streamOpenCount?: number;
+  streamClosed?: boolean;
   targetOperationStats?: Map<string, TargetOperationStats>;
   transportReconnectHintCount?: number;
   cdsiAuth?: {
@@ -1374,12 +1375,38 @@ function cleanupRuntimeState(reason: string): void {
   }
 }
 
-function shouldRedeliverAfterDecryptionRetryError(error: unknown): boolean {
+function isChatConnectionClosedError(error: unknown): boolean {
   return (
     LibSignalErrorBase.is(error, LibSignalErrorCode.ChatServiceInactive) ||
     LibSignalErrorBase.is(error, LibSignalErrorCode.IoError) ||
     LibSignalErrorBase.is(error, LibSignalErrorCode.Cancelled)
   );
+}
+
+function sendChatServerAckSafely(
+  ack: { send: (statusCode: number) => void },
+  statusCode: number,
+  context: string
+): void {
+  try {
+    ack.send(statusCode);
+  } catch (error) {
+    if (!isChatConnectionClosedError(error)) {
+      console.warn(context, error);
+    }
+  }
+}
+
+function isMessageStreamStopping(streamSession: MessageStreamSession): boolean {
+  return (
+    streamSession.streamClosed === true ||
+    streamSession.status === 'closed' ||
+    streamSession.status === 'error'
+  );
+}
+
+function shouldRedeliverAfterDecryptionRetryError(error: unknown): boolean {
+  return isChatConnectionClosedError(error);
 }
 
 function queueDecryptionErrorRetry({
@@ -1406,6 +1433,9 @@ function queueDecryptionErrorRetry({
   const currentRetry = previousRetry
     .catch(() => undefined)
     .then(async () => {
+      if (isMessageStreamStopping(streamSession)) {
+        return;
+      }
       if (!connection) {
         writeEvent({
           type: 'error',
@@ -1434,6 +1464,9 @@ function queueDecryptionErrorRetry({
               errorToLogString(refreshError)
             );
           }
+        }
+        if (isMessageStreamStopping(streamSession)) {
+          return;
         }
         const envelopeForRetry = Proto.Envelope.decode(envelope);
         const retrySourceServiceId = fromServiceIdBinaryOrString(
@@ -1484,6 +1517,14 @@ function queueDecryptionErrorRetry({
         streamSession.lastDecryptionErrorRetryError =
           errorToLogString(retryError);
         streamSession.updatedAt = now();
+        if (isChatConnectionClosedError(retryError)) {
+          streamSession.lastTransportError =
+            streamSession.lastDecryptionErrorRetryError;
+          streamSession.lastTransportStatusAt = now();
+          streamSession.status = 'error';
+          streamSession.closeStream?.();
+          return;
+        }
         console.warn(
           'message stream failed to send decryption error retry request',
           retryError
@@ -1502,11 +1543,30 @@ function queueDecryptionErrorRetry({
         );
       }
     });
-  const nextRetryChain = currentRetry.finally(() => {
-    if (streamSession.decryptionErrorRetryChain === nextRetryChain) {
-      streamSession.decryptionErrorRetryChain = undefined;
-    }
-  });
+  const nextRetryChain = currentRetry
+    .catch(retryChainError => {
+      streamSession.lastDecryptionErrorRetryError =
+        errorToLogString(retryChainError);
+      streamSession.updatedAt = now();
+      if (isChatConnectionClosedError(retryChainError)) {
+        streamSession.lastTransportError =
+          streamSession.lastDecryptionErrorRetryError;
+        streamSession.lastTransportStatusAt = now();
+        streamSession.status = 'error';
+        streamSession.closeStream?.();
+        return;
+      }
+      console.warn(
+        'message stream decryption error retry processing failed',
+        retryChainError
+      );
+      sendAck(500);
+    })
+    .finally(() => {
+      if (streamSession.decryptionErrorRetryChain === nextRetryChain) {
+        streamSession.decryptionErrorRetryChain = undefined;
+      }
+    });
   streamSession.decryptionErrorRetryChain = nextRetryChain;
   void streamSession.decryptionErrorRetryChain;
 }
@@ -2993,7 +3053,11 @@ async function startProvisioningSession(
           session.status = 'qr-ready';
           touch(session);
           recordSessionEvent(session, 'qr-ready');
-          ack.send(200);
+          sendChatServerAckSafely(
+            ack,
+            200,
+            'provisioning session failed to acknowledge address'
+          );
         },
         onReceivedEnvelope(body, ack) {
           session.status = 'linking';
@@ -3002,7 +3066,11 @@ async function startProvisioningSession(
           try {
             const provisionEnvelope = Proto.ProvisionEnvelope.decode(body);
             const envelope = cipher.decrypt(provisionEnvelope);
-            ack.send(200);
+            sendChatServerAckSafely(
+              ack,
+              200,
+              'provisioning session failed to acknowledge envelope'
+            );
             recordSessionEvent(session, 'envelope-decrypted');
             void linkDeviceFromEnvelope({ session, envelope })
               .then(linkedPayload => {
@@ -3025,7 +3093,11 @@ async function startProvisioningSession(
                 );
               });
           } catch (error) {
-            ack.send(500);
+            sendChatServerAckSafely(
+              ack,
+              500,
+              'provisioning session failed to acknowledge envelope error'
+            );
             session.status = 'error';
             session.error =
               error instanceof Error
@@ -4703,6 +4775,7 @@ async function handleMessageStream(
     updatedAt: now(),
     username,
     status: 'connecting',
+    streamClosed: false,
     lastStreamStartedAt: now(),
     lastTransportStatusAt: now(),
     backupImportStatus: 'idle',
@@ -4719,6 +4792,7 @@ async function handleMessageStream(
         return;
       }
       didCloseStream = true;
+      streamSession.streamClosed = true;
       resolveProtocolReady?.();
       resolveProtocolReady = undefined;
       if (heartbeat) {
@@ -4835,18 +4909,39 @@ async function handleMessageStream(
           streamSession.incomingEnvelopeCount += 1;
           streamSession.updatedAt = now();
           let didAck = false;
-          const sendAck = (statusCode: number) => {
+          const sendAck = (statusCode: number): void => {
             if (didAck) {
               return;
             }
             didAck = true;
-            ack.send(statusCode);
+            if (isMessageStreamStopping(streamSession)) {
+              return;
+            }
+            try {
+              ack.send(statusCode);
+            } catch (error) {
+              streamSession.lastTransportError = errorToLogString(error);
+              streamSession.lastTransportStatusAt = now();
+              streamSession.updatedAt = now();
+              if (isChatConnectionClosedError(error)) {
+                streamSession.status = 'error';
+                streamSession.closeStream?.();
+              } else {
+                console.warn(
+                  'message stream failed to send server message ACK',
+                  error
+                );
+              }
+            }
           };
           const previousReceive =
             streamSession.receiveChain ?? Promise.resolve();
           const currentReceive = previousReceive
             .catch(() => undefined)
             .then(async () => {
+              if (isMessageStreamStopping(streamSession)) {
+                return;
+              }
               const writePersistedEnvelopeEvent = (
                 event: MessageStreamEvent
               ) => {
@@ -4871,6 +4966,9 @@ async function handleMessageStream(
               }
               if (streamSession.protocolReady) {
                 await streamSession.protocolReady;
+              }
+              if (isMessageStreamStopping(streamSession)) {
+                return;
               }
               await decryptIncomingSignalEnvelope({
                 chat: connection,
@@ -4908,6 +5006,9 @@ async function handleMessageStream(
                     retryRequest,
                     storageManifestFetchLatest,
                   }) => {
+                    if (isMessageStreamStopping(streamSession)) {
+                      return;
+                    }
                     streamSession.lastReceiveError = undefined;
                     streamSession.updatedAt = now();
                     emitProtocolState(streamSession);
@@ -4924,7 +5025,11 @@ async function handleMessageStream(
                     }
                     let conversation: WebConversation | undefined;
                     let outputMessage = message;
-                    if (message?.groupV2 && connection) {
+                    if (
+                      message?.groupV2 &&
+                      connection &&
+                      !isMessageStreamStopping(streamSession)
+                    ) {
                       try {
                         conversation = await enrichConversationForGroupMessage({
                           connection,
@@ -4939,11 +5044,21 @@ async function handleMessageStream(
                           }
                         );
                       } catch (error) {
-                        console.warn(
-                          'message stream failed to enrich group conversation',
-                          error
-                        );
+                        if (isChatConnectionClosedError(error)) {
+                          streamSession.status = 'error';
+                          streamSession.closeStream?.();
+                          return;
+                        }
+                        if (!isMessageStreamStopping(streamSession)) {
+                          console.warn(
+                            'message stream failed to enrich group conversation',
+                            error
+                          );
+                        }
                       }
+                    }
+                    if (isMessageStreamStopping(streamSession)) {
+                      return;
                     }
                     if (outputMessage) {
                       streamSession.decodedMessageCount += 1;
@@ -5023,7 +5138,11 @@ async function handleMessageStream(
                     if (pollTerminate) {
                       writePersistedEnvelopeEvent(pollTerminate);
                     }
-                    if (storageManifestFetchLatest && connection) {
+                    if (
+                      storageManifestFetchLatest &&
+                      connection &&
+                      !isMessageStreamStopping(streamSession)
+                    ) {
                       void syncStorageContacts({
                         allowInsecureTls: ALLOW_INSECURE_STORAGE_TLS,
                         chat: connection,
@@ -5032,6 +5151,9 @@ async function handleMessageStream(
                         storageUrl: productionConfig.storageUrl,
                       })
                         .then(syncResult => {
+                          if (isMessageStreamStopping(streamSession)) {
+                            return;
+                          }
                           streamSession.updatedAt = now();
                           mergeStreamConversations(streamSession, [
                             ...syncResult.contactsBootstrap.conversations,
@@ -5049,6 +5171,9 @@ async function handleMessageStream(
                           });
                         })
                         .catch(error => {
+                          if (isMessageStreamStopping(streamSession)) {
+                            return;
+                          }
                           streamSession.lastReceiveError =
                             errorToLogString(error);
                           streamSession.updatedAt = now();
@@ -5115,11 +5240,26 @@ async function handleMessageStream(
                   });
                 });
             });
-          const nextReceiveChain = currentReceive.finally(() => {
-            if (streamSession.receiveChain === nextReceiveChain) {
-              streamSession.receiveChain = undefined;
-            }
-          });
+          const nextReceiveChain = currentReceive
+            .catch(error => {
+              streamSession.lastReceiveError = errorToLogString(error);
+              streamSession.updatedAt = now();
+              if (isChatConnectionClosedError(error)) {
+                streamSession.lastTransportError =
+                  streamSession.lastReceiveError;
+                streamSession.lastTransportStatusAt = now();
+                streamSession.status = 'error';
+                streamSession.closeStream?.();
+              } else if (!isMessageStreamStopping(streamSession)) {
+                console.warn('message stream receive processing failed', error);
+                sendAck(500);
+              }
+            })
+            .finally(() => {
+              if (streamSession.receiveChain === nextReceiveChain) {
+                streamSession.receiveChain = undefined;
+              }
+            });
           streamSession.receiveChain = nextReceiveChain;
           void streamSession.receiveChain;
         },
@@ -7982,7 +8122,11 @@ async function handleContactsSync(
       false,
       {
         onIncomingMessage(_envelope, _timestamp, ack) {
-          ack.send(200);
+          sendChatServerAckSafely(
+            ack,
+            200,
+            'contacts sync failed to acknowledge incoming message'
+          );
         },
         onQueueEmpty() {},
         onConnectionInterrupted() {},
