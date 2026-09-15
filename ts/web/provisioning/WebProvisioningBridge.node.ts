@@ -3,7 +3,13 @@
 
 import { Buffer } from 'node:buffer';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { readdir, rm, stat } from 'node:fs/promises';
 import https from 'node:https';
 import {
@@ -12,7 +18,8 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PassThrough, Readable, Transform, Writable } from 'node:stream';
 import {
   ErrorCode as LibSignalErrorCode,
@@ -599,6 +606,10 @@ type BackupMediaLocation = BackupArchiveInfo &
 
 const PORT = Number(process.env.SIGNAL_WEB_PROVISIONING_PORT ?? 3100);
 const HOST = process.env.SIGNAL_WEB_PROVISIONING_HOST ?? '0.0.0.0';
+const WEB_STATIC_ROOT = resolve(
+  process.env.SIGNAL_WEB_STATIC_ROOT ??
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../../web-dist')
+);
 const LINK_AND_SYNC = process.env.SIGNAL_WEB_LINK_AND_SYNC !== '0';
 const UPSTREAM_API_BASE_URL = process.env.SIGNAL_WEB_UPSTREAM_API_BASE_URL;
 const CDN_BASE_URL = process.env.SIGNAL_WEB_CDN_BASE_URL;
@@ -8587,6 +8598,99 @@ async function handleAttachment(
   await writeTransitTierAttachment();
 }
 
+const WEB_STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ttf': 'font/ttf',
+  '.webp': 'image/webp',
+  '.woff2': 'font/woff2',
+  '.wasm': 'application/wasm',
+  '.wav': 'audio/wav',
+  '.webm': 'video/webm',
+  '.ogg': 'audio/ogg',
+};
+
+async function serveWebStaticFile(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL
+): Promise<boolean> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return false;
+  }
+
+  let requestedPath: string;
+  try {
+    requestedPath = decodeURIComponent(url.pathname);
+  } catch {
+    sendText(req, res, 400, 'Invalid static asset path');
+    return true;
+  }
+
+  const relativeRequestPath = requestedPath.replace(/^\/+/, '');
+  const requestedFile = resolve(
+    WEB_STATIC_ROOT,
+    relativeRequestPath || 'index.html'
+  );
+  const relativeRequestedFile = relative(WEB_STATIC_ROOT, requestedFile);
+  if (
+    relativeRequestedFile.startsWith('..') ||
+    isAbsolute(relativeRequestedFile)
+  ) {
+    sendText(req, res, 400, 'Invalid static asset path');
+    return true;
+  }
+
+  let filePath = requestedFile;
+  let fileStats;
+  try {
+    fileStats = await stat(filePath);
+    if (!fileStats.isFile()) {
+      throw new Error('Static path is not a file');
+    }
+  } catch {
+    filePath = resolve(WEB_STATIC_ROOT, 'index.html');
+    try {
+      fileStats = await stat(filePath);
+      if (!fileStats.isFile()) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  const extension = extname(filePath).toLowerCase();
+  const isHtml = extension === '.html';
+  sendCors(req, res);
+  res.writeHead(200, {
+    'Content-Type':
+      WEB_STATIC_CONTENT_TYPES[extension] ?? 'application/octet-stream',
+    'Content-Length': String(fileStats.size),
+    'Cache-Control': isHtml
+      ? 'no-store, no-cache, must-revalidate'
+      : 'public, max-age=31536000, immutable',
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return true;
+  }
+
+  await new Promise<void>((resolvePromise, reject) => {
+    const stream = createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('end', resolvePromise);
+    stream.pipe(res);
+  });
+  return true;
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse
@@ -9007,6 +9111,10 @@ async function handleRequest(
 
   if (req.method === 'GET' && url.pathname === '/health') {
     sendJson(req, res, 200, { ok: true });
+    return;
+  }
+
+  if (await serveWebStaticFile(req, res, url)) {
     return;
   }
 

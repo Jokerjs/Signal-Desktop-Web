@@ -6,8 +6,10 @@
 
 - `env.development`：本地开发 bridge 环境变量。
 - `env.production`：正式环境 bridge 环境变量。
+- `env.standalone`：前后端同端口部署时使用的正式环境变量。
 - `runtime-config.development.js`：本地开发前端运行时配置。
 - `runtime-config.production.js`：正式环境前端运行时配置。
+- `runtime-config.standalone.js`：前后端同端口部署时使用的前端运行时配置。
 - `signal-web-bridge.service`：systemd 服务模板。
 - `nginx.production.conf`：Nginx 同域代理模板。
 
@@ -29,19 +31,18 @@ pnpm run web:dev
 
 ## 正式环境使用
 
-构建：
+构建单体 Web 服务：
 
 ```bash
 cd /opt/signal-web/Signal-Desktop
 pnpm install --frozen-lockfile
-pnpm run web:build
 pnpm run web:build:server
 ```
 
-上传静态页面和服务端产物：
+`web:build:server` 会同时构建前端和服务端，并将前端复制到
+`server-dist/web-dist`。只需要上传服务端产物：
 
 ```bash
-rsync -av --delete web-dist/ /opt/signal-web/web-dist/
 rsync -av --delete server-dist/ /opt/signal-web/server/
 cd /opt/signal-web/server
 pnpm install --prod
@@ -51,7 +52,7 @@ bridge 环境变量：
 
 ```bash
 sudo mkdir -p /etc/signal-web
-sudo cp deploy/web/env.production /etc/signal-web/bridge.env
+sudo cp deploy/web/env.standalone /etc/signal-web/bridge.env
 sudo editor /etc/signal-web/bridge.env
 ```
 
@@ -63,7 +64,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now signal-web-bridge
 ```
 
-Nginx：
+服务启动后直接访问：
+
+```text
+http://<服务器地址>:3100/
+```
+
+`env.standalone` 默认将 bridge 绑定到 `0.0.0.0`，从其他机器访问时需要在防火墙放行
+`SIGNAL_WEB_PROVISIONING_PORT` 对应端口。如需限制为本机访问，可改为：
+
+```bash
+SIGNAL_WEB_PROVISIONING_HOST=0.0.0.0
+SIGNAL_WEB_PROVISIONING_PORT=3100
+```
+
+默认 `env.production` 使用 `127.0.0.1`，适用于只通过 Nginx 暴露服务的部署。
+
+使用 Nginx 的可选部署方式：
 
 ```bash
 sudo cp deploy/web/nginx.production.conf /etc/nginx/conf.d/signal-web.conf
@@ -76,7 +93,7 @@ sudo systemctl reload nginx
 
 ### `SIGNAL_WEB_ALLOWED_ORIGINS`
 
-正式环境必须改为真实访问域名：
+跨域访问 bridge 时，必须改为真实访问来源，不要填写带路径的 URL：
 
 ```bash
 SIGNAL_WEB_ALLOWED_ORIGINS=https://signal.example.com
@@ -94,7 +111,8 @@ server_name signal.example.com;
 
 ### `root`
 
-`nginx.production.conf` 中的静态目录必须指向部署后的 `web-dist`：
+仅使用 Nginx 静态托管时，`nginx.production.conf` 中的静态目录指向部署后的
+`web-dist`。单体 Web 服务不需要配置此项：
 
 ```nginx
 root /opt/signal-web/web-dist;
@@ -191,9 +209,10 @@ CDN 地址覆盖项。普通部署保持为空。
 
 ## 前端运行时配置说明
 
-`runtime-config.js` 会被 `web/index.html` 和 `web-dist/index.html` 加载。
-执行 `pnpm run web:build` 时，`deploy/web/runtime-config.production.js`
-会被复制为 `web-dist/runtime-config.js`。
+`runtime-config.js` 会被 `web/index.html` 和构建后的 `index.html` 加载。
+执行 `pnpm run web:build:server` 时，
+`deploy/web/runtime-config.standalone.js` 会被复制为前端产物中的
+`runtime-config.js`，它会把 API 指向当前页面所在的 origin。
 
 生产环境需要对 `runtime-config.js` 和 `index.html` 禁用缓存。示例
 `nginx.production.conf` 已经为这两个文件设置了 `Cache-Control: no-store`；
@@ -202,13 +221,16 @@ CDN 地址覆盖项。普通部署保持为空。
 开发环境：
 
 ```js
-apiBaseUrl: "http://127.0.0.1:3100"
+apiBaseUrl: 'http://127.0.0.1:3100';
 ```
 
-正式同域部署：
+正式 Nginx 同域部署：
 
 ```js
-apiBaseUrl: ""
+apiBaseUrl: '';
 ```
 
-正式同域部署时，浏览器会请求当前域名下的 `/messages/*`、`/provisioning/*` 等接口，由反向代理转发给 bridge，因此没有端口跨域问题。
+正式 Nginx 同域部署时，浏览器会请求当前域名下的 `/messages/*`、`/provisioning/*`
+等接口，由反向代理转发给 bridge，因此没有端口跨域问题。
+
+单体 Web 服务部署时，页面和 bridge 使用同一个端口，不需要 Nginx 或单独的静态文件服务。
