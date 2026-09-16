@@ -8,7 +8,8 @@ import { join } from 'node:path';
 const root = process.cwd();
 const outDir = join(root, 'web-dist');
 const runtimeConfigPath =
-  process.env.SIGNAL_WEB_RUNTIME_CONFIG ?? join(root, 'web', 'runtime-config.js');
+  process.env.SIGNAL_WEB_RUNTIME_CONFIG ??
+  join(root, 'web', 'runtime-config.js');
 
 await mkdir(outDir, { recursive: true });
 await mkdir(join(outDir, 'stylesheets'), { recursive: true });
@@ -23,6 +24,10 @@ const indexHtml = await readFile(join(root, 'web', 'index.html'), 'utf8');
 await writeFile(
   join(outDir, 'index.html'),
   indexHtml
+    .replace(
+      './runtime-config.js?v=1.1.0',
+      `./runtime-config.js?v=${assetVersion}`
+    )
     .replace('./web.css"', `./web.css?v=${assetVersion}"`)
     .replace(
       './chrome108-fallback.css"',

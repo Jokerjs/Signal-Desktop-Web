@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import productionConfig from '../../../config/production.json';
+import {
+  getMyRenderRuntimeConfig,
+  getRenderApiBaseUrl,
+} from '../renderConfig.dom.ts';
 
 type Listener = (...args: ReadonlyArray<unknown>) => void;
 
@@ -18,15 +22,8 @@ function getListeners(channel: string): Set<Listener> {
 
 export const ipcRenderer = {
   sendSync: (channel: string): unknown => {
-    const renderConfig = (
-      window as typeof window & {
-        __MY_RENDER_CONFIG__?: {
-          apiBaseUrl?: string;
-          sfuUrl?: string;
-        };
-      }
-    ).__MY_RENDER_CONFIG__;
-    const apiBaseUrl = renderConfig?.apiBaseUrl || 'http://127.0.0.1:3100';
+    const renderConfig = getMyRenderRuntimeConfig();
+    const apiBaseUrl = getRenderApiBaseUrl();
 
     if (channel === 'get-user-data-path') {
       return '/signal-web';
@@ -44,7 +41,7 @@ export const ipcRenderer = {
         cdnUrl2: apiBaseUrl,
         cdnUrl3: apiBaseUrl,
         certificateAuthority: 'browser',
-        challengeUrl: productionConfig.challengeUrl,
+        challengeUrl: apiBaseUrl,
         ciForceUnprocessed: false,
         ciMode: false,
         contentProxyUrl: apiBaseUrl,
@@ -74,7 +71,7 @@ export const ipcRenderer = {
         preferredSystemLocales: ['zh-CN'],
         proxyUrl: undefined,
         reducedMotionSetting: false,
-        registrationChallengeUrl: productionConfig.registrationChallengeUrl,
+        registrationChallengeUrl: apiBaseUrl,
         resolvedTranslationsLocale: 'zh-CN',
         resolvedTranslationsLocaleDirection: 'ltr',
         resourcesUrl: apiBaseUrl,

@@ -4350,10 +4350,16 @@ export function setupWebGlobals({
       appStartInitialSpellcheckSetting: loadWebSettings().spellCheck,
       cdnBaseUrl: getRenderCdnBaseUrl(),
       disableScreenSecurity: true,
-      renderApiBaseUrl: getRenderApiBaseUrl(),
-      serverUrl: getRenderApiBaseUrl(),
+      get renderApiBaseUrl() {
+        return getRenderApiBaseUrl();
+      },
+      get serverUrl() {
+        return getRenderApiBaseUrl();
+      },
       sfuUrl: '',
-      updatesUrl: '',
+      get updatesUrl() {
+        return getRenderApiBaseUrl();
+      },
     },
     activeWindowService: {
       isActive: () => document.visibilityState === 'visible',

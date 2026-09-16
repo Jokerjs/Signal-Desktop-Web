@@ -42,6 +42,11 @@ export type WebAccount = Readonly<{
   avatarUrl?: string;
   avatarUrlPath?: string;
   color?: string;
+  usernameLink?: Readonly<{
+    entropyBase64: string;
+    serverIdBase64: string;
+    color?: number;
+  }>;
 }>;
 
 export type LinkedPayload = Readonly<{

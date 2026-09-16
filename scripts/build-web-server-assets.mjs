@@ -45,6 +45,7 @@ function getExternalPackageNames(code) {
     /\bimport(?:[^'"()]+?from)?["']([^"']+)["']/g,
     /\bexport[^'"()]+?from["']([^"']+)["']/g,
     /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
   ];
 
   for (const pattern of patterns) {

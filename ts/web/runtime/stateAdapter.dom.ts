@@ -29,6 +29,7 @@ import type { AciString } from '../../types/ServiceId.std.ts';
 import { isAciString } from '../../util/isAciString.std.ts';
 import { getTitle, getTitleNoDefault } from '../../util/getTitle.preload.ts';
 import { getDefaultAvatars } from '../../types/Avatar.std.ts';
+import { normalizeNoteToSelfMessage } from '../normalizeNoteToSelfMessage.std.ts';
 
 const log = createLogger('WebStateAdapter');
 const { isEqual } = lodash;
@@ -354,15 +355,27 @@ export function normalizeChatShellForLinkedSession(
   shell: ChatShellState,
   linkedSession: LinkedSessionRecord
 ): ChatShellState {
+  const ourConversationId =
+    linkedSession.credentials?.aci ?? linkedSession.account.aci;
+  let didChange = false;
+  const messages = shell.messages.map(message => {
+    const normalizedMessage = normalizeNoteToSelfMessage(
+      message,
+      ourConversationId
+    );
+    if (normalizedMessage !== message) {
+      didChange = true;
+    }
+    return normalizedMessage;
+  });
   const messageCountByConversation = new Map<string, number>();
-  for (const message of shell.messages) {
+  for (const message of messages) {
     messageCountByConversation.set(
       message.conversationId,
       (messageCountByConversation.get(message.conversationId) ?? 0) + 1
     );
   }
 
-  let didChange = false;
   const conversationLookup: Record<string, WebConversation> = {};
   for (const conversation of Object.values(shell.conversationLookup)) {
     const normalizedConversation = applyDesktopGroupMembershipState(
@@ -406,6 +419,7 @@ export function normalizeChatShellForLinkedSession(
   const nextShell = didChange
     ? {
         ...shell,
+        messages,
         selectedConversationId,
         conversationLookup,
       }
@@ -1328,6 +1342,7 @@ export function toDesktopConversation(
     phoneNumber: conversation.phoneNumber,
     pni: conversation.pni,
     profileKey: conversation.profileKey,
+    profileAvatarUrl: conversation.avatarUrl,
     profileName: conversation.profileName,
     profileSharing: conversation.profileSharing ?? true,
     remoteAvatarUrl: conversation.remoteAvatarUrl,

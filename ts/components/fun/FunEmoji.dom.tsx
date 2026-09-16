@@ -2,12 +2,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import classNames from 'classnames';
 import type { CSSProperties, JSX, SyntheticEvent } from 'react';
-import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import MANIFEST from '../../../build/jumbomoji.json';
 import type { FunImageAriaProps } from './types.dom.tsx';
 import { createLogger } from '../../logging/log.std.ts';
 import { Emoji } from '../../axo/emoji.std.ts';
-import { getRenderApiBaseUrl } from '../../web/renderConfig.dom.ts';
+import {
+  getRenderApiBaseUrlSnapshot,
+  subscribeToRenderApiBaseUrl,
+} from '../../web/renderConfig.dom.ts';
 
 const log = createLogger('FunEmoji');
 
@@ -18,30 +28,23 @@ const FUN_STATIC_EMOJI_TEXT_CLASS = 'FunStaticEmoji__Text';
 const KNOWN_JUMBOMOJI = new Set<string>(Object.values(MANIFEST).flat());
 const MIN_JUMBOMOJI_SIZE = 33;
 
-function canLoadEmojiProtocol(): boolean {
-  return (
-    window.location.protocol !== 'http:' &&
-    window.location.protocol !== 'https:'
-  );
-}
-
-function getWebEmojiJumboUrl(emoji: Emoji.Variant): string {
-  const url = new URL('emoji/jumbo', getRenderApiBaseUrl());
+function getWebEmojiJumboUrl(emoji: Emoji.Variant, apiBaseUrl: string): string {
+  const url = new URL('emoji/jumbo', apiBaseUrl);
   url.searchParams.set('emoji', emoji);
   return url.toString();
 }
 
 function getEmojiJumboUrl(
   emoji: Emoji.Variant,
-  size: number | undefined
+  size: number | undefined,
+  apiBaseUrl: string | undefined
 ): string | null {
-  const isWeb = !canLoadEmojiProtocol();
   if (size != null && size < MIN_JUMBOMOJI_SIZE) {
     return null;
   }
   if (KNOWN_JUMBOMOJI.has(emoji)) {
-    return isWeb
-      ? getWebEmojiJumboUrl(emoji)
+    return apiBaseUrl != null
+      ? getWebEmojiJumboUrl(emoji, apiBaseUrl)
       : `emoji://jumbo?emoji=${encodeURIComponent(emoji)}`;
   }
   return null;
@@ -97,8 +100,12 @@ export type FunStaticEmojiProps = FunImageAriaProps &
 export function FunStaticEmoji(props: FunStaticEmojiProps): JSX.Element {
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasFailed, setHasFailed] = useState(false);
+  const apiBaseUrl = useSyncExternalStore(
+    subscribeToRenderApiBaseUrl,
+    getRenderApiBaseUrlSnapshot
+  );
 
-  const jumboImage = getEmojiJumboUrl(props.emoji, props.size);
+  const jumboImage = getEmojiJumboUrl(props.emoji, props.size, apiBaseUrl);
 
   useEffect(() => {
     setIsLoaded(false);
@@ -194,12 +201,16 @@ export function FunInlineEmoji(props: FunInlineEmojiProps): JSX.Element {
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasFailed, setHasFailed] = useState(false);
   const jumboRef = useRef<HTMLSpanElement | null>(null);
+  const apiBaseUrl = useSyncExternalStore(
+    subscribeToRenderApiBaseUrl,
+    getRenderApiBaseUrlSnapshot
+  );
   const jumboImage = useMemo(() => {
     // Note: we don't pass size here because appearance of jumbomoji is decided
     // in css based on the parent svg container size.
-    return getEmojiJumboUrl(props.emoji, undefined);
-  }, [props.emoji]);
-  const isWebJumboImage = jumboImage != null && !canLoadEmojiProtocol();
+    return getEmojiJumboUrl(props.emoji, undefined, apiBaseUrl);
+  }, [apiBaseUrl, props.emoji]);
+  const isWebJumboImage = jumboImage != null && apiBaseUrl != null;
 
   useEffect(() => {
     setIsLoaded(false);

@@ -548,6 +548,9 @@ importers:
       postcss-loader:
         specifier: 8.2.1
         version: 8.2.1(postcss@8.5.15)(typescript@6.0.3)(webpack@5.96.1)
+      postject:
+        specifier: 1.0.0-alpha.6
+        version: 1.0.0-alpha.6
       prettier:
         specifier: 3.8.3
         version: 3.8.3

@@ -9,6 +9,7 @@ build/emoji-data.json
 stylesheets/*.css.map
 /dist
 /server-dist
+/server-executable-dist
 /web-dist
 .signal-web
 .DS_Store

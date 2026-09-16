@@ -1,7 +1,7 @@
 window.__MY_RENDER_CONFIG__ = Object.assign(
   {
-    // Electron replaces this fallback with the local bridge's random port.
-    apiBaseUrl: `http://127.0.0.1:3100`,
+    // The bridge serves both the page and its API from the same origin.
+    apiBaseUrl: `${window.location.origin}/`,
     cdnBaseUrl: '',
     sfuUrl: '',
   },

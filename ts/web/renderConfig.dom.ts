@@ -7,6 +7,14 @@ type RuntimeConfig = Readonly<{
   sfuUrl?: string;
 }>;
 
+type RenderApiBaseUrlListener = () => void;
+
+const RENDER_API_BASE_URL_POLL_INTERVAL_MS = 100;
+const renderApiBaseUrlListeners = new Set<RenderApiBaseUrlListener>();
+
+let renderApiBaseUrlPoll: number | undefined;
+let lastRenderApiBaseUrl: string | undefined;
+
 declare global {
   interface Window {
     __MY_RENDER_CONFIG__?: RuntimeConfig;
@@ -39,12 +47,51 @@ export function getMyRenderRuntimeConfig(): RuntimeConfig | undefined {
 }
 
 export function getRenderApiBaseUrl(): string {
-  const runtimeConfig = getMyRenderRuntimeConfig();
-  if (runtimeConfig?.apiBaseUrl) {
-    return runtimeConfig.apiBaseUrl;
+  const apiBaseUrl = getRenderApiBaseUrlSnapshot();
+  if (apiBaseUrl) {
+    return apiBaseUrl;
   }
 
   throw new Error('Missing runtime config apiBaseUrl');
+}
+
+export function getRenderApiBaseUrlSnapshot(): string | undefined {
+  return getMyRenderRuntimeConfig()?.apiBaseUrl;
+}
+
+function pollRenderApiBaseUrl(): void {
+  const apiBaseUrl = getRenderApiBaseUrlSnapshot();
+  if (apiBaseUrl === lastRenderApiBaseUrl) {
+    return;
+  }
+
+  lastRenderApiBaseUrl = apiBaseUrl;
+  for (const listener of renderApiBaseUrlListeners) {
+    listener();
+  }
+}
+
+export function subscribeToRenderApiBaseUrl(
+  listener: RenderApiBaseUrlListener
+): () => void {
+  renderApiBaseUrlListeners.add(listener);
+
+  if (renderApiBaseUrlPoll == null) {
+    lastRenderApiBaseUrl = getRenderApiBaseUrlSnapshot();
+    renderApiBaseUrlPoll = window.setInterval(
+      pollRenderApiBaseUrl,
+      RENDER_API_BASE_URL_POLL_INTERVAL_MS
+    );
+  }
+
+  return () => {
+    renderApiBaseUrlListeners.delete(listener);
+    if (renderApiBaseUrlListeners.size === 0 && renderApiBaseUrlPoll != null) {
+      window.clearInterval(renderApiBaseUrlPoll);
+      renderApiBaseUrlPoll = undefined;
+      lastRenderApiBaseUrl = undefined;
+    }
+  };
 }
 
 export function getRenderCdnBaseUrl(): string | undefined {

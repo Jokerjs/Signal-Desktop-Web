@@ -7,6 +7,7 @@ import { createRoot } from 'react-dom/client';
 import { bindActionCreators } from 'redux';
 import type { Store } from 'redux';
 import { Buffer } from 'buffer';
+import * as Bytes from '../Bytes.std.ts';
 
 import zhCNMessages from '../../_locales/zh-CN/messages.json';
 import { HourCyclePreference } from '../types/I18N.std.ts';
@@ -43,7 +44,12 @@ import {
   syncLinkedSessionUserStorage,
   WebDesktopApp,
 } from './runtime/WebDesktopApp.dom.tsx';
-import type { ChatShellState, WebAttachment, WebMessage } from './types.std.ts';
+import type {
+  ChatShellState,
+  ContactsBootstrap,
+  WebAttachment,
+  WebMessage,
+} from './types.std.ts';
 import {
   getLinkedSessionUserId,
   clearWebPersistence,
@@ -66,6 +72,24 @@ const EMPTY_SHELL: ChatShellState = {
   messages: [],
   pinnedMessages: [],
 };
+
+function getUsernameLinkItems(
+  account: ContactsBootstrap['account'] | undefined
+): Record<string, unknown> {
+  const usernameLink = account?.usernameLink;
+  if (!usernameLink) {
+    return {};
+  }
+  return {
+    usernameLink: {
+      entropy: Bytes.fromBase64(usernameLink.entropyBase64),
+      serverId: Bytes.fromBase64(usernameLink.serverIdBase64),
+    },
+    ...(usernameLink.color == null
+      ? null
+      : { usernameLinkColor: usernameLink.color }),
+  };
+}
 const WEB_BUILD_EXPIRATION = Date.now() + 30 * 24 * 60 * 60 * 1000;
 const _SIGNAL_SECRET = 'AHU3KOP4NBV1YCXD2GI3KOO42174FDFVBJKK';
 
@@ -360,6 +384,8 @@ async function buildInitialState(): Promise<{
       ),
       items: {
         ...baseState.items,
+        ...itemStorage.getItemsState(),
+        ...getUsernameLinkItems(contacts?.account),
         backupTier: storedSession
           ? BackupLevel.Paid
           : baseState.items.backupTier,

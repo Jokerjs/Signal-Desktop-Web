@@ -113,6 +113,7 @@ import type {
   WebUnpinMessageEvent,
 } from '../types.std.ts';
 import { isProtocolNamespaceForDevice } from '../protocolState.std.ts';
+import { normalizeNoteToSelfMessage } from '../normalizeNoteToSelfMessage.std.ts';
 
 export type WebSendLinkedPayload = Readonly<{
   account: Readonly<{
@@ -3801,15 +3802,18 @@ function convertContentToWebMessage({
       return undefined;
     }
     const dataMessageTimestamp = toNumber(dataMessage.timestamp) ?? timestamp;
-    return convertDataMessageToWebMessage({
-      id: `incoming:${sourceServiceId}:${dataMessageTimestamp}`,
-      conversationId: sourceServiceId,
-      dataMessage,
-      direction: 'incoming',
-      receivedAt: Date.now(),
-      sourceServiceId,
-      status: 'delivered',
-    });
+    return normalizeNoteToSelfMessage(
+      convertDataMessageToWebMessage({
+        id: `incoming:${sourceServiceId}:${dataMessageTimestamp}`,
+        conversationId: sourceServiceId,
+        dataMessage,
+        direction: 'incoming',
+        receivedAt: Date.now(),
+        sourceServiceId,
+        status: 'delivered',
+      }),
+      getLinkedAci(linkedPayload)
+    );
   }
 
   const sent = content.content?.syncMessage?.content?.sent;

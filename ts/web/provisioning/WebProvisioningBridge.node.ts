@@ -9,11 +9,15 @@ import https from 'node:https';
 import {
   createServer,
   type IncomingMessage,
+  type Server,
   type ServerResponse,
 } from 'node:http';
 import { createRequire } from 'node:module';
+import type { AddressInfo } from 'node:net';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PassThrough, Readable, Transform, Writable } from 'node:stream';
+import '@indutny/protopiler';
 import {
   ErrorCode as LibSignalErrorCode,
   LibSignalErrorBase,
@@ -597,7 +601,7 @@ type BackupMediaLocation = BackupArchiveInfo &
     cdnNumber: number;
   }>;
 
-const PORT = Number(process.env.SIGNAL_WEB_PROVISIONING_PORT ?? 3100);
+const PORT = Number(process.env.SIGNAL_WEB_PROVISIONING_PORT ?? 0);
 const HOST = process.env.SIGNAL_WEB_PROVISIONING_HOST ?? '0.0.0.0';
 const LINK_AND_SYNC = process.env.SIGNAL_WEB_LINK_AND_SYNC !== '0';
 const UPSTREAM_API_BASE_URL = process.env.SIGNAL_WEB_UPSTREAM_API_BASE_URL;
@@ -8604,10 +8608,17 @@ async function handleRequest(
   );
 
   if (req.method === 'GET' && url.pathname === '/health') {
+    const listeningAddress = server.address();
     sendJson(req, res, 200, {
-      host: HOST,
+      host:
+        listeningAddress && typeof listeningAddress !== 'string'
+          ? listeningAddress.address
+          : HOST,
       ok: true,
-      port: PORT,
+      port:
+        listeningAddress && typeof listeningAddress !== 'string'
+          ? listeningAddress.port
+          : PORT,
     });
     return;
   }
@@ -9044,17 +9055,92 @@ const server = createServer((req, res) => {
   });
 });
 
+export type WebProvisioningServerOptions = Readonly<{
+  host?: string;
+  port?: number;
+}>;
+
+export type WebProvisioningServer = Readonly<{
+  address: AddressInfo;
+  server: Server;
+}>;
+
+let serverStartPromise: Promise<WebProvisioningServer> | undefined;
+
+export function startWebProvisioningServer(
+  options: WebProvisioningServerOptions = {}
+): Promise<WebProvisioningServer> {
+  if (server.listening) {
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      return Promise.reject(
+        new Error('Signal Web bridge is listening without an address')
+      );
+    }
+    return Promise.resolve({ address, server });
+  }
+
+  serverStartPromise ??= new Promise<WebProvisioningServer>(
+    (resolveStart, rejectStart) => {
+      const port = options.port ?? PORT;
+      const host = options.host ?? HOST;
+      const handleError = (error: Error): void => {
+        server.off('listening', handleListening);
+        rejectStart(error);
+      };
+      const handleListening = (): void => {
+        server.off('error', handleError);
+        const address = server.address();
+        if (!address || typeof address === 'string') {
+          rejectStart(
+            new Error('Signal Web bridge started without an address')
+          );
+          return;
+        }
+        resolveStart({ address, server });
+      };
+
+      server.once('error', handleError);
+      server.once('listening', handleListening);
+      server.listen(port, host);
+    }
+  ).catch(error => {
+    serverStartPromise = undefined;
+    throw error;
+  });
+
+  return serverStartPromise;
+}
+
+type WebBridgeShutdownReason = NodeJS.Signals | 'parent-disconnect';
+
 let isShuttingDown = false;
-function shutdownWebBridge(signal: NodeJS.Signals): void {
+function shutdownWebBridge(reason: WebBridgeShutdownReason): void {
   if (isShuttingDown) {
     return;
   }
   isShuttingDown = true;
-  console.log(`Signal Web bridge received ${signal}, closing streams`);
+  console.log(`Signal Web bridge received ${reason}, closing streams`);
   for (const [sessionId, streamSession] of streamSessions) {
     disposeStreamSession(sessionId, streamSession);
   }
+  if (!server.listening) {
+    process.exit(0);
+    return;
+  }
+  if (reason === 'parent-disconnect') {
+    server.closeAllConnections();
+    process.exit(0);
+    return;
+  }
+
+  const forceExitTimer = setTimeout(() => {
+    console.warn('Signal Web bridge shutdown timed out');
+    process.exit(1);
+  }, 5_000);
+
   server.close(error => {
+    clearTimeout(forceExitTimer);
     if (error) {
       console.error('Signal Web bridge failed to close HTTP server', error);
       process.exit(1);
@@ -9062,14 +9148,14 @@ function shutdownWebBridge(signal: NodeJS.Signals): void {
     }
     process.exit(0);
   });
-  setTimeout(() => {
-    console.warn('Signal Web bridge shutdown timed out');
-    process.exit(1);
-  }, 5_000).unref();
+  server.closeAllConnections();
 }
 
 process.once('SIGTERM', shutdownWebBridge);
 process.once('SIGINT', shutdownWebBridge);
+process.once('disconnect', () => {
+  shutdownWebBridge('parent-disconnect');
+});
 
 void cleanupExpiredAttachmentTmpDirs().catch(error => {
   console.warn(
@@ -9094,6 +9180,21 @@ if (
   runtimeCleanupInterval.unref?.();
 }
 
-server.listen(PORT, HOST, () => {
-  console.log(`Signal Web bridge listening on http://${HOST}:${PORT}`);
-});
+const isMainModule =
+  process.argv[1] != null &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+
+if (isMainModule) {
+  void startWebProvisioningServer()
+    .then(({ address }) => {
+      console.log(`Signal Web bridge listening on ${JSON.stringify(address)}`);
+      process.send?.({
+        type: 'server-address',
+        address,
+      });
+    })
+    .catch(error => {
+      console.error('Signal Web bridge failed to start HTTP server', error);
+      process.exitCode = 1;
+    });
+}

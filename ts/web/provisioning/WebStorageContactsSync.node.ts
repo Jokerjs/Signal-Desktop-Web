@@ -292,7 +292,9 @@ function getContactConversation(
     ? Bytes.toBase64(contact.profileKey)
     : undefined;
   const accessKey = profileKey
-    ? Bytes.toBase64(deriveAccessKeyFromProfileKey(Bytes.fromBase64(profileKey)))
+    ? Bytes.toBase64(
+        deriveAccessKeyFromProfileKey(Bytes.fromBase64(profileKey))
+      )
     : undefined;
   return {
     acceptedMessageRequest: !contact.hidden && profileSharing,
@@ -1617,6 +1619,13 @@ export async function syncStorageContacts({
     profileFamilyName: accountRecord?.familyName || undefined,
     profileName: accountRecord?.givenName || undefined,
     title: accountTitle || linkedPayload.account.title,
+    usernameLink: accountRecord?.usernameLink
+      ? {
+          color: accountRecord.usernameLink.color ?? undefined,
+          entropyBase64: Bytes.toBase64(accountRecord.usernameLink.entropy),
+          serverIdBase64: Bytes.toBase64(accountRecord.usernameLink.serverId),
+        }
+      : linkedPayload.account.usernameLink,
     username: accountRecord?.username || undefined,
   };
   const generatedAt = Date.now();
