@@ -5553,6 +5553,7 @@ async function handleSendMessage(
           deleteForEveryone,
           destinationServiceId: checkedDestinationServiceId,
           destinationE164,
+          includeProfileKey: true,
           isViewOnce,
           linkedPayload: streamSession.linkedPayload,
           pinMessage,

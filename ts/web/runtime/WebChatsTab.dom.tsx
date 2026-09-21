@@ -970,6 +970,7 @@ function WebCompositionArea({
               lastMessageReceivedAtMs: timestamp,
               lastUpdated: timestamp,
               messageCount: (currentConversation.messageCount ?? 0) + 1,
+              profileSharing: true,
               sentMessageCount: (currentConversation.sentMessageCount ?? 0) + 1,
               snippet: previewText || currentConversation.snippet,
               timestamp,
@@ -1139,6 +1140,7 @@ function WebCompositionArea({
               messageCount:
                 (currentConversation.messageCount ?? 0) +
                 (didAlreadyCountMessage ? 0 : 1),
+              profileSharing: true,
               sentMessageCount:
                 (currentConversation.sentMessageCount ?? 0) +
                 (didAlreadyCountMessage ? 0 : 1),

@@ -129,6 +129,8 @@ import { SECOND } from '../../util/durations/index.std.ts';
 import type { ConversationType } from '../../state/ducks/conversations.preload.ts';
 import type { AvatarUpdateOptionsType } from '../../types/Avatar.std.ts';
 import { isSharingPhoneNumberWithEverybody } from '../../util/phoneNumberSharingMode.preload.ts';
+import { isKnownProtoEnumMember } from '../../util/isKnownProtoEnumMember.std.ts';
+import * as Bytes from '../../Bytes.std.ts';
 import { getDirectSendAccessKey } from '../directSendAccessKey.dom.ts';
 
 const VIDEO_THUMBNAIL_MAX_SIDE = 480;
@@ -881,6 +883,11 @@ export async function syncLinkedSessionUserStorage(
     return;
   }
 
+  const profileKeyBase64 = linkedSession?.linkedPayload.profileKeyBase64;
+  if (profileKeyBase64) {
+    await itemStorage.put('profileKey', Bytes.fromBase64(profileKeyBase64));
+  }
+
   if (credentials.pni && credentials.password) {
     await itemStorage.user.setCredentials({
       aci: credentials.aci as AciString,
@@ -902,6 +909,48 @@ export async function syncLinkedSessionUserStorage(
   );
   await itemStorage.user.setNumber(credentials.number);
   await Registration.markDone();
+}
+
+async function syncUsernameLinkItemsFromContactsBootstrap(
+  data: ContactsBootstrap | undefined
+): Promise<void> {
+  if (data?.source !== 'storage' || !data.account) {
+    return;
+  }
+
+  const usernameLink = data.account.usernameLink;
+  if (usernameLink) {
+    const entropy = Bytes.fromBase64(usernameLink.entropyBase64);
+    const serverId = Bytes.fromBase64(usernameLink.serverIdBase64);
+    if (Bytes.isNotEmpty(entropy) && Bytes.isNotEmpty(serverId)) {
+      const oldLink = itemStorage.get('usernameLink');
+      if (
+        itemStorage.get('usernameLinkCorrupted') &&
+        (!oldLink ||
+          !Bytes.areEqual(entropy, oldLink.entropy) ||
+          !Bytes.areEqual(serverId, oldLink.serverId))
+      ) {
+        await itemStorage.remove('usernameLinkCorrupted');
+      }
+
+      const color = isKnownProtoEnumMember(
+        Proto.AccountRecord.UsernameLink.Color,
+        usernameLink.color
+      )
+        ? usernameLink.color
+        : 0;
+      await Promise.all([
+        itemStorage.put('usernameLinkColor', color),
+        itemStorage.put('usernameLink', { entropy, serverId }),
+      ]);
+      return;
+    }
+  }
+
+  await Promise.all([
+    itemStorage.remove('usernameLinkColor'),
+    itemStorage.remove('usernameLink'),
+  ]);
 }
 
 function dispatchLinkedSessionUserState(
@@ -3937,6 +3986,7 @@ export function WebDesktopApp({
 
   const reloadLinkedSession = useCallback(async () => {
     const nextLinkedSession = await loadLinkedSessionRecordFromIndexedDb();
+    linkedSessionRef.current = nextLinkedSession;
     setLinkedSession(nextLinkedSession);
     setIsRelinkRequired(false);
     if (nextLinkedSession?.credentials?.aci) {
@@ -3959,6 +4009,7 @@ export function WebDesktopApp({
       const profileAwareContacts = contacts
         ? mergeContactsBootstrapWithLinkedProfile(contacts, nextLinkedSession)
         : contacts;
+      await syncUsernameLinkItemsFromContactsBootstrap(profileAwareContacts);
       if (profileAwareContacts?.source === 'storage') {
         storageContactsRef.current = profileAwareContacts;
       }
@@ -4053,37 +4104,35 @@ export function WebDesktopApp({
         latestProtocolStateRevision = 0;
         setMessageRuntimeSessionId(event.sessionId);
       } else if (event.type === 'linked-session-updated') {
-        setLinkedSession(current => {
-          if (!current) {
-            return current;
-          }
-          const account =
-            typeof current.account.localProfileUpdatedAt === 'number'
-              ? {
-                  ...event.linkedPayload.account,
-                  familyName: current.account.familyName,
-                  firstName: current.account.firstName,
-                  localProfileUpdatedAt: current.account.localProfileUpdatedAt,
-                  profileFamilyName: current.account.profileFamilyName,
-                  profileName: current.account.profileName,
-                  title: current.account.title,
-                }
-              : event.linkedPayload.account;
-          const next: LinkedSessionRecord = {
-            ...current,
+        const account =
+          typeof currentLinkedSession.account.localProfileUpdatedAt === 'number'
+            ? {
+                ...event.linkedPayload.account,
+                familyName: currentLinkedSession.account.familyName,
+                firstName: currentLinkedSession.account.firstName,
+                localProfileUpdatedAt:
+                  currentLinkedSession.account.localProfileUpdatedAt,
+                profileFamilyName:
+                  currentLinkedSession.account.profileFamilyName,
+                profileName: currentLinkedSession.account.profileName,
+                title: currentLinkedSession.account.title,
+              }
+            : event.linkedPayload.account;
+        const next: LinkedSessionRecord = {
+          ...currentLinkedSession,
+          account,
+          credentials: event.linkedPayload.credentials,
+          linkedPayload: {
+            ...event.linkedPayload,
             account,
-            credentials: event.linkedPayload.credentials,
-            linkedPayload: {
-              ...event.linkedPayload,
-              account,
-            },
-            lastUpdatedAt: Date.now(),
-            storageServiceKey: event.linkedPayload.storageServiceKey,
-          };
-          persistLinkedSessionToStorage(next);
-          void persistLinkedSessionRecordToIndexedDb(next);
-          return next;
-        });
+          },
+          lastUpdatedAt: Date.now(),
+          storageServiceKey: event.linkedPayload.storageServiceKey,
+        };
+        linkedSessionRef.current = next;
+        setLinkedSession(next);
+        persistLinkedSessionToStorage(next);
+        void persistLinkedSessionRecordToIndexedDb(next);
       } else if (event.type === 'protocol-state') {
         if (!runtimeSessionId || event.sessionId !== runtimeSessionId) {
           return;
@@ -4135,13 +4184,16 @@ export function WebDesktopApp({
             const contactsSyncPromise = syncContacts({
               runtimeSessionId: activeRuntimeSessionId,
             })
-              .then(data => {
+              .then(async data => {
                 const latestLinkedSession = getCurrentLinkedSession();
                 const profileAwareData =
                   mergeContactsBootstrapWithLinkedProfile(
                     data,
                     latestLinkedSession
                   );
+                await syncUsernameLinkItemsFromContactsBootstrap(
+                  profileAwareData
+                );
                 if (profileAwareData.source === 'storage') {
                   storageContactsRef.current = profileAwareData;
                 }
@@ -4150,6 +4202,7 @@ export function WebDesktopApp({
                   profileAwareData.account
                 );
                 if (syncedLinkedSession !== latestLinkedSession) {
+                  linkedSessionRef.current = syncedLinkedSession;
                   setLinkedSession(syncedLinkedSession);
                   persistLinkedSessionToStorage(syncedLinkedSession);
                   void persistLinkedSessionRecordToIndexedDb(
@@ -4212,6 +4265,7 @@ export function WebDesktopApp({
           event.data,
           currentLinkedSession
         );
+        await syncUsernameLinkItemsFromContactsBootstrap(profileAwareData);
         if (profileAwareData.source === 'storage') {
           storageContactsRef.current = profileAwareData;
         }
@@ -4220,6 +4274,7 @@ export function WebDesktopApp({
           profileAwareData.account
         );
         if (syncedLinkedSession !== currentLinkedSession) {
+          linkedSessionRef.current = syncedLinkedSession;
           setLinkedSession(syncedLinkedSession);
           persistLinkedSessionToStorage(syncedLinkedSession);
           void persistLinkedSessionRecordToIndexedDb(syncedLinkedSession);

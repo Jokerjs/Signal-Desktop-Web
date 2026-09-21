@@ -135,6 +135,7 @@ export type WebSendLinkedPayload = Readonly<{
   pniSignedPreKeyRecordBase64?: string;
   aciPqLastResortPreKeyRecordBase64?: string;
   pniPqLastResortPreKeyRecordBase64?: string;
+  profileKeyBase64?: string;
   protocolPersistenceVersion?: 1;
   protocol?: ProtocolState;
 }>;
@@ -177,6 +178,7 @@ type DirectTextSendOptions = Readonly<{
   expireTimer?: number;
   expireTimerVersion?: number;
   flags?: number;
+  includeProfileKey?: boolean;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
   unpinMessage?: WebUnpinMessage;
@@ -1373,6 +1375,21 @@ function getLinkedAci(linkedPayload: WebSendLinkedPayload): string {
   return aci;
 }
 
+function getLinkedProfileKey(
+  linkedPayload: WebSendLinkedPayload
+): Uint8Array<ArrayBuffer> | undefined {
+  if (!linkedPayload.profileKeyBase64) {
+    return undefined;
+  }
+  const profileKey = Bytes.fromBase64(linkedPayload.profileKeyBase64);
+  if (profileKey.byteLength !== 32) {
+    throw new Error(
+      `getLinkedProfileKey: expected 32 bytes, got ${profileKey.byteLength}`
+    );
+  }
+  return profileKey;
+}
+
 function getLinkedLocalDeviceKey(linkedPayload: WebSendLinkedPayload): string {
   const aci = getLinkedAci(linkedPayload);
   const deviceId = linkedPayload.credentials?.deviceId;
@@ -2217,7 +2234,7 @@ function createQuote(
   };
 }
 
-function createDataMessage({
+export function createDataMessage({
   attachments = [],
   body,
   deleteForEveryone,
@@ -2227,6 +2244,7 @@ function createDataMessage({
   groupV2,
   isViewOnce = false,
   pinMessage,
+  profileKey,
   quote,
   sticker,
   timestamp,
@@ -2241,6 +2259,7 @@ function createDataMessage({
   groupV2?: Proto.GroupContextV2.Params;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
+  profileKey?: Uint8Array<ArrayBuffer>;
   quote?: WebMessage['quote'];
   sticker?: WebMessage['sticker'];
   timestamp: number;
@@ -2270,7 +2289,7 @@ function createDataMessage({
     pollTerminate: null,
     expireTimer: expireTimer ?? null,
     expireTimerVersion: expireTimerVersion ?? null,
-    profileKey: null,
+    profileKey: profileKey ?? null,
     isViewOnce,
     requiredProtocolVersion: 0,
     payment: null,
@@ -2323,7 +2342,8 @@ function createTextContent(
     expireTimer?: number;
     expireTimerVersion?: number;
     flags?: number;
-  }>
+  }>,
+  profileKey?: Uint8Array<ArrayBuffer>
 ): Uint8Array<ArrayBuffer> {
   return padMessage(
     Proto.Content.encode({
@@ -2338,6 +2358,7 @@ function createTextContent(
           groupV2,
           isViewOnce,
           pinMessage,
+          profileKey,
           quote,
           sticker,
           timestamp,
@@ -2385,10 +2406,12 @@ function createReactionContent(
 
 function createEditContent({
   body,
+  profileKey,
   targetTimestamp,
   timestamp,
 }: Readonly<{
   body: string;
+  profileKey?: Uint8Array<ArrayBuffer>;
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
@@ -2396,7 +2419,7 @@ function createEditContent({
     Proto.Content.encode({
       content: {
         editMessage: {
-          dataMessage: createDataMessage({ body, timestamp }),
+          dataMessage: createDataMessage({ body, profileKey, timestamp }),
           targetSentTimestamp: BigInt(targetTimestamp),
         },
       },
@@ -2418,6 +2441,7 @@ function createSentSyncContent({
   groupV2,
   isViewOnce = false,
   pinMessage,
+  profileKey,
   quote,
   sticker,
   timestamp,
@@ -2434,6 +2458,7 @@ function createSentSyncContent({
   groupV2?: Proto.GroupContextV2.Params;
   isViewOnce?: boolean;
   pinMessage?: WebPinMessage;
+  profileKey?: Uint8Array<ArrayBuffer>;
   quote?: WebMessage['quote'];
   sticker?: WebMessage['sticker'];
   timestamp: number;
@@ -2465,6 +2490,7 @@ function createSentSyncContent({
                 groupV2,
                 isViewOnce,
                 pinMessage,
+                profileKey,
                 quote,
                 sticker,
                 timestamp,
@@ -2553,12 +2579,14 @@ function createSentEditSyncContent({
   body,
   destinationE164,
   destinationServiceId,
+  profileKey,
   targetTimestamp,
   timestamp,
 }: Readonly<{
   body: string;
   destinationE164?: string;
   destinationServiceId: string;
+  profileKey?: Uint8Array<ArrayBuffer>;
   targetTimestamp: number;
   timestamp: number;
 }>): Uint8Array<ArrayBuffer> {
@@ -2575,7 +2603,7 @@ function createSentEditSyncContent({
               destinationServiceId: null,
               destinationServiceIdBinary: destination.getServiceIdBinary(),
               editMessage: {
-                dataMessage: createDataMessage({ body, timestamp }),
+                dataMessage: createDataMessage({ body, profileKey, timestamp }),
                 targetSentTimestamp: BigInt(targetTimestamp),
               },
               expirationStartTimestamp: null,
@@ -6583,6 +6611,7 @@ export async function sendDirectTextMessage({
   expireTimer,
   expireTimerVersion,
   flags,
+  includeProfileKey,
   isViewOnce,
   linkedPayload,
   pinMessage,
@@ -6595,6 +6624,9 @@ export async function sendDirectTextMessage({
   WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
 > {
   const ourAci = getLinkedAci(linkedPayload);
+  const profileKey = includeProfileKey
+    ? getLinkedProfileKey(linkedPayload)
+    : undefined;
   const plaintext = createTextContent(
     body,
     timestamp,
@@ -6606,7 +6638,8 @@ export async function sendDirectTextMessage({
     isViewOnce,
     undefined,
     sticker,
-    { expireTimer, expireTimerVersion, flags }
+    { expireTimer, expireTimerVersion, flags },
+    profileKey
   );
   let messages = await encryptForDestination({
     accessKey,
@@ -6723,6 +6756,7 @@ export async function sendDirectTextMessage({
             flags,
             isViewOnce,
             pinMessage,
+            profileKey,
             quote,
             sticker,
             timestamp,
@@ -7005,6 +7039,7 @@ export async function sendGroupTextMessage({
   WebMessage & { attachments?: ReadonlyArray<WebAttachment> }
 > {
   const ourAci = getLinkedAci(linkedPayload);
+  const profileKey = getLinkedProfileKey(linkedPayload);
   const groupContext = createGroupContextV2(groupV2);
   const plaintext = createTextContent(
     body,
@@ -7016,7 +7051,9 @@ export async function sendGroupTextMessage({
     unpinMessage,
     isViewOnce,
     groupContext,
-    sticker
+    sticker,
+    undefined,
+    profileKey
   );
   const recipientServiceIds = Array.from(new Set(recipients)).filter(
     recipient => recipient !== ourAci
@@ -7131,6 +7168,7 @@ export async function sendGroupTextMessage({
         groupV2: groupContext,
         isViewOnce,
         pinMessage,
+        profileKey,
         quote,
         sticker,
         timestamp,
@@ -7462,8 +7500,10 @@ export async function sendDirectEditMessage({
   unauthChat,
 }: DirectEditSendOptions): Promise<{ ok: true; timestamp: number }> {
   const ourAci = getLinkedAci(linkedPayload);
+  const profileKey = getLinkedProfileKey(linkedPayload);
   const plaintext = createEditContent({
     body,
+    profileKey,
     targetTimestamp,
     timestamp,
   });
@@ -7537,6 +7577,7 @@ export async function sendDirectEditMessage({
           body,
           destinationE164,
           destinationServiceId,
+          profileKey,
           targetTimestamp,
           timestamp,
         }),
